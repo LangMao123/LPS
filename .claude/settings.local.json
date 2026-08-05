@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build *)",
+      "Bash(grep -E \"\\\\.\\(md|sql|csv\\)$\")",
+      "Bash(dotnet list *)",
+      "Bash(dotnet add *)",
+      "Bash(dotnet run *)",
+      "Bash(powershell -Command \"[System.Text.Encoding]::GetEncoding\\('gb2312'\\).GetString\\([System.IO.File]::ReadAllBytes\\('sp_ValidateAndPromoteOrders.sql'\\)\\)\")",
+      "Bash(powershell -Command \"[System.Text.Encoding]::Unicode.GetString\\([System.IO.File]::ReadAllBytes\\('sp_ValidateAndPromoteOrders.sql'\\)\\)\")",
+      "Bash(powershell -Command \"[System.Text.Encoding]::GetEncoding\\(936\\).GetString\\([System.IO.File]::ReadAllBytes\\('sp_ValidateAndPromoteOrders.sql'\\)\\)\")",
+      "Bash(powershell -Command '& { $bytes = [System.IO.File]::ReadAllBytes\\('\\\\''sp_ValidateAndPromoteOrders.sql'\\\\''\\); $hex = [BitConverter]::ToString\\($bytes[130..180]\\); Write-Host $hex }')",
+      "Bash(powershell -Command \"[System.Text.Encoding]::GetEncoding\\('GB2312'\\).GetString\\([System.IO.File]::ReadAllBytes\\('副本仓库代码 库存规则.csv'\\)\\)\")",
+      "Bash(xargs grep -l \"Production\\\\|Report\\\\|Output\")",
+      "Bash(xargs grep -l \"AddSchedulingServices\\\\|AddApplicationServices\\\\|AddBusinessRuleServices\")",
+      "Bash(xargs grep -l \"class ScheduleRun\\\\|DbSet.*ScheduleRun\")",
+      "Bash(xargs grep -l \"class ScheduleRun\")",
+      "Bash(awk '{print $9, $5}')",
+      "Bash(cd /d/CODE/LPS && find . -name \"SchedulingOrchestrator.cs\" -type f 2>/dev/null)",
+      "Read(//d/d/CODE/**)",
+      "Bash(git -C D:/CODE/LPS diff --name-only HEAD)",
+      "Bash(git -C D:/CODE/LPS status --short)"
+    ]
+  }
+}
