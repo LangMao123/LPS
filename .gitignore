@@ -31,6 +31,7 @@ TestResults/
 # ===== 敏感配置（千万别传，里面有密码）=====
 appsettings.Development.json
 appsettings.Local.json
+appsettings.Test.Local.json
 settings.json.claude
 .env
 .env.local

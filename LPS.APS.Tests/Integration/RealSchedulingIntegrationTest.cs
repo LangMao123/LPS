@@ -53,6 +53,7 @@ public class RealSchedulingIntegrationTest
         // 加载测试配置
         var configuration = new ConfigurationBuilder()
             .AddJsonFile("appsettings.Test.json", optional: false)
+            .AddJsonFile("appsettings.Test.Local.json", optional: true)
             .Build();
 
         services.AddSingleton<IConfiguration>(configuration);
