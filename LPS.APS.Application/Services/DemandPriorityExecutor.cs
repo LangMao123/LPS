@@ -7,20 +7,32 @@ namespace LPS.APS.Application.Services;
 /// <summary>
 /// 需求优先级执行器（2号位职责 — 消费3号位的DemandPriorityConfig）
 ///
-/// 执行算法（PM冻结口径）：
-/// 1. 按CalculationLayer分层
-/// 2. 每层内按SegmentOrder升序遍历Segment
-/// 3. 每个Demand从第一个Segment开始匹配
-/// 4. 命中第一条后停止，不再进入其它Segment（First Match）
-/// 5. 每个Segment内部按SortFields依次排序
-/// 6. 最后StableTieBreak确保确定性（最终兜底：DemandKey ASC）
+/// 执行算法（PM冻结口径，方案A：外部按层调用）：
+/// 1. PeggingOrchestrator 逐层形成「当前层 Demand 集合」
+/// 2. PeggingOrchestrator 从 Frozen DemandPriority 取「当前层 Segments」后调用本执行器
+/// 3. 本执行器只排序单个计算层：按 SegmentOrder 升序遍历 Segment
+/// 4. 每个 Demand 从第一个 Segment 开始匹配
+/// 5. 命中第一条后停止，不再进入其它 Segment（First Match）
+/// 6. 每个 Segment 内部按 SortFields 依次排序
+/// 7. 最后 StableTieBreak 确保确定性（最终兜底：DemandKey ASC）
 ///
 /// 职责边界：
-/// - 3号位负责策略冻结，输出FrozenStrategySnapshot.DemandPriority
-/// - 2号位负责执行器实现，消费策略并生成DemandSequence
+/// - 3号位负责策略冻结，输出 FrozenStrategySnapshot.DemandPriority
+/// - 2号位负责执行器实现，消费策略并生成 DemandSequence
+/// - 本执行器只排序「单个计算层」的 Demand；分层编排由 PeggingOrchestrator 负责
 /// </summary>
 public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
 {
+    /// <summary>
+    /// 当前执行器支持的业务字段白名单（大小写不敏感）。
+    /// 3号位配置中出现白名单外的 FieldName 属于策略配置错误（P1-02），必须显式报错，不得静默当作空值继续排。
+    /// </summary>
+    private static readonly HashSet<string> KnownFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ORDERTYPE", "DELAYSTATUS", "CUSTOMERTIER", "DUEDATE",
+        "ISSUEDATE", "PROTECTIONSTATUS", "DEMANDKEY"
+    };
+
     private readonly ILogger<DemandPriorityExecutor> _logger;
 
     public DemandPriorityExecutor(ILogger<DemandPriorityExecutor> logger)
@@ -29,9 +41,9 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
     }
 
     /// <summary>
-    /// 执行Demand排序（按3号位策略）
+    /// 执行「单个计算层」的 Demand 排序（config 已由 PeggingOrchestrator 收敛为当前层 Segments）。
     ///
-    /// 返回：有序的Demand列表，已赋值DemandSequence = 1, 2, 3...
+    /// 返回：有序的 Demand 列表，已赋值 DemandSequence = 1, 2, 3...
     /// </summary>
     public List<UpstreamDemand> ExecutePrioritySort(
         IEnumerable<UpstreamDemand> demands,
@@ -45,81 +57,61 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
 
         var segments = config.Segments
             .Where(s => s.IsEnabled)
-            .OrderBy(s => s.CalculationLayer)
-            .ThenBy(s => s.SegmentOrder)
+            .OrderBy(s => s.SegmentOrder)
             .ToList();
 
         if (segments.Count == 0)
         {
-            _logger.LogWarning("DemandPriorityConfig has no enabled segments, returning original order");
-            StampDemandSequence(demandList);
-            return demandList;
+            // P1-01：当前层无启用 Segment 时，不按调用方原始集合顺序，改用稳定 DemandKey ASC 兜底（确定性）
+            _logger.LogWarning(
+                "DemandPriority 当前层无启用 Segment，按稳定 DemandKey ASC 兜底（共 {Count} 条）",
+                demandList.Count);
+            var fallback = demandList.OrderBy(d => d.DemandKey, StringComparer.Ordinal).ToList();
+            StampDemandSequence(fallback);
+            return fallback;
         }
 
-        // 按CalculationLayer分组
-        var layerGroups = segments.GroupBy(s => s.CalculationLayer).OrderBy(g => g.Key);
+        // P1-02：未知 FieldName 显式报错，不允许静默吞掉3号位拼写错误
+        ValidateConfigFields(segments);
 
-        var sortedDemands = new List<UpstreamDemand>();
+        var sortedDemands = new List<UpstreamDemand>(demandList.Count);
+        var assigned = new HashSet<UpstreamDemand>();
 
-        foreach (var layerGroup in layerGroups)
+        foreach (var segment in segments)
         {
-            var layerSegments = layerGroup.OrderBy(s => s.SegmentOrder).ToList();
-            var remainingDemands = demandList.Except(sortedDemands).ToList();
-
-            if (remainingDemands.Count == 0)
+            var matched = new List<UpstreamDemand>();
+            foreach (var demand in demandList)
             {
-                break;
-            }
-
-            // 每个Segment收集匹配的Demand
-            var segmentBuckets = new List<(PrioritySegmentConfig Segment, List<UpstreamDemand> Demands)>();
-
-            foreach (var segment in layerSegments)
-            {
-                var matchedDemands = new List<UpstreamDemand>();
-
-                foreach (var demand in remainingDemands)
+                if (!assigned.Contains(demand) && IsMatchSegment(demand, segment))
                 {
-                    if (IsMatchSegment(demand, segment))
-                    {
-                        matchedDemands.Add(demand);
-                    }
-                }
-
-                if (matchedDemands.Count > 0)
-                {
-                    segmentBuckets.Add((segment, matchedDemands));
+                    matched.Add(demand);
                 }
             }
 
-            // First Match原则：每个Demand只进入第一个匹配的Segment
-            var assignedDemands = new HashSet<UpstreamDemand>();
-
-            foreach (var (segment, candidates) in segmentBuckets)
+            if (matched.Count == 0)
             {
-                var actualMatches = candidates.Where(d => !assignedDemands.Contains(d)).ToList();
-
-                if (actualMatches.Count > 0)
-                {
-                    // Segment内排序
-                    var sortedInSegment = SortWithinSegment(actualMatches, segment);
-                    sortedDemands.AddRange(sortedInSegment);
-
-                    foreach (var demand in actualMatches)
-                    {
-                        assignedDemands.Add(demand);
-                    }
-                }
+                continue;
             }
 
-            // 未匹配任何Segment的Demand，放到该Layer末尾（按DemandKey兜底）
-            var unmatchedInLayer = remainingDemands.Except(assignedDemands).OrderBy(d => d.DemandKey).ToList();
-            if (unmatchedInLayer.Count > 0)
+            foreach (var demand in SortWithinSegment(matched, segment))
             {
-                _logger.LogWarning("Layer {Layer} has {Count} unmatched demands, appending with DemandKey sort",
-                    layerGroup.Key, unmatchedInLayer.Count);
-                sortedDemands.AddRange(unmatchedInLayer);
+                sortedDemands.Add(demand);
+                assigned.Add(demand);
             }
+        }
+
+        // 未命中任何 Segment 的 Demand：稳定 DemandKey ASC 兜底（确定性）
+        var unmatched = demandList
+            .Where(d => !assigned.Contains(d))
+            .OrderBy(d => d.DemandKey, StringComparer.Ordinal)
+            .ToList();
+
+        if (unmatched.Count > 0)
+        {
+            _logger.LogWarning(
+                "DemandPriority 当前层 {Count} 条 Demand 未命中任何 Segment，按稳定 DemandKey ASC 兜底",
+                unmatched.Count);
+            sortedDemands.AddRange(unmatched);
         }
 
         StampDemandSequence(sortedDemands);
@@ -131,6 +123,36 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
         for (var i = 0; i < sorted.Count; i++)
         {
             sorted[i].DemandSequence = i + 1;
+        }
+    }
+
+    private void ValidateConfigFields(IReadOnlyList<PrioritySegmentConfig> segments)
+    {
+        foreach (var segment in segments)
+        {
+            foreach (var condition in segment.MatchConditions)
+            {
+                EnsureKnownField(condition.FieldName);
+            }
+
+            foreach (var sortField in segment.SortFields)
+            {
+                EnsureKnownField(sortField.FieldName);
+            }
+
+            foreach (var tieBreakField in segment.StableTieBreakFields)
+            {
+                EnsureKnownField(tieBreakField);
+            }
+        }
+    }
+
+    private void EnsureKnownField(string fieldName)
+    {
+        if (!KnownFields.Contains(fieldName))
+        {
+            throw new InvalidOperationException(
+                $"DemandPriority 配置错误：未知字段名 '{fieldName}'。允许的字段：{string.Join(", ", KnownFields.OrderBy(f => f, StringComparer.OrdinalIgnoreCase))}");
         }
     }
 
@@ -174,7 +196,7 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
     {
         var query = demands.AsEnumerable();
 
-        // 依次按SortFields排序
+        // 依次按 SortFields 排序
         if (segment.SortFields.Count > 0)
         {
             IOrderedEnumerable<UpstreamDemand>? orderedQuery = null;
@@ -215,9 +237,9 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             query = orderedQuery ?? query;
         }
 
-        // 最终兜底：DemandKey ASC
-        var finalOrdered = (query as IOrderedEnumerable<UpstreamDemand>)?.ThenBy(d => d.DemandKey)
-                           ?? query.OrderBy(d => d.DemandKey);
+        // 最终兜底：DemandKey ASC（稳定、文化无关）
+        var finalOrdered = (query as IOrderedEnumerable<UpstreamDemand>)?.ThenBy(d => d.DemandKey, StringComparer.Ordinal)
+                           ?? query.OrderBy(d => d.DemandKey, StringComparer.Ordinal);
 
         return finalOrdered.ToList();
     }
@@ -233,7 +255,7 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             "ISSUEDATE" => demand.IssueDate?.ToString("O") ?? string.Empty,
             "PROTECTIONSTATUS" => demand.ProtectionStatus ?? string.Empty,
             "DEMANDKEY" => demand.DemandKey,
-            _ => string.Empty
+            _ => throw UnknownFieldError(fieldName)
         };
     }
 
@@ -248,9 +270,12 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             "DELAYSTATUS" => demand.DelayStatus ?? string.Empty,
             "CUSTOMERTIER" => demand.CustomerTier ?? string.Empty,
             "PROTECTIONSTATUS" => demand.ProtectionStatus ?? string.Empty,
-            _ => string.Empty
+            _ => throw UnknownFieldError(fieldName)
         };
     }
+
+    private static InvalidOperationException UnknownFieldError(string fieldName)
+        => new($"DemandPriority 配置错误：未知字段名 '{fieldName}'");
 
     private int CompareNumericOrDate(string value1, string value2)
     {

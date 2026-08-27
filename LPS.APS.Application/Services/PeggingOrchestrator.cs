@@ -17,7 +17,6 @@ namespace LPS.APS.Application.Services;
 public class PeggingOrchestrator : IPeggingOrchestrator
 {
     private readonly IPeggingRuleService _peggingRuleService;
-    private readonly IPeggingSupplyAllocationRepository _allocationRepo;
     private readonly IDemandSupplyHardLockRepository _lockRepo;
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<PeggingOrchestrator> _logger;
@@ -27,7 +26,6 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
     public PeggingOrchestrator(
         IPeggingRuleService peggingRuleService,
-        IPeggingSupplyAllocationRepository allocationRepo,
         IDemandSupplyHardLockRepository lockRepo,
         DatabaseConnectionManager connectionManager,
         ILogger<PeggingOrchestrator> logger,
@@ -36,7 +34,6 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         IDemandPriorityConfigProvider demandPriorityConfigProvider)
     {
         _peggingRuleService = peggingRuleService ?? throw new ArgumentNullException(nameof(peggingRuleService));
-        _allocationRepo     = allocationRepo     ?? throw new ArgumentNullException(nameof(allocationRepo));
         _lockRepo           = lockRepo           ?? throw new ArgumentNullException(nameof(lockRepo));
         _connectionManager  = connectionManager  ?? throw new ArgumentNullException(nameof(connectionManager));
         _logger             = logger             ?? throw new ArgumentNullException(nameof(logger));
@@ -214,52 +211,6 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         }
 
         return results;
-    }
-
-    /// <summary>
-    /// ⚠️ v5.1.2架构整改后已废弃
-    /// 原因：不再预先构建TaskDrafts，改为直接传递LogicalProductionDemands给1号位Solver
-    /// FinalTask由1号位生成（含拆批/合批决策），2号位负责持久化
-    /// </summary>
-    [Obsolete("v5.1.2架构整改：不再预先构建TaskDrafts，改为传递LogicalProductionDemands")]
-    public IReadOnlyList<Core.Dto.TaskDraft> BuildTaskDraftsFromVoucher(PeggingResultVoucher voucher)
-    {
-        if (voucher.LogicalProductionDemands.Count == 0)
-        {
-            _logger.LogDebug("[Pegging] BuildTaskDraftsFromVoucher: LogicalProductionDemands 为空");
-            return Array.Empty<Core.Dto.TaskDraft>();
-        }
-
-        var drafts = voucher.LogicalProductionDemands
-            .Select(lpd => new Core.Dto.TaskDraft
-            {
-                DraftId = lpd.LogicalDemandKey,
-                MaterialId = lpd.MaterialId,
-                StageCode = lpd.StartStageCode ?? string.Empty,
-                OperationCode = string.Empty,
-                RouteKey = string.Empty,
-                ProductionInstructionNo = lpd.ProductionInstructionNo,
-                Quantity = lpd.NetOutputQty,
-                UOM = string.Empty,
-                FactoryCode = string.Empty,
-                Department = null,
-                ProductFamilyId = 0,
-                EarliestAvailableTime = lpd.RequiredAvailableTime,
-                DueTime = lpd.RequiredAvailableTime,
-                TaskPlanningMode = "OPERATION_FINITE",
-                Priority = lpd.DemandSequence,
-                UpstreamDraftIds = new List<string>(),
-                IsVirtual = false,
-                ExistingMESPlanReleaseId = null,
-                ExecutionLockId = null
-            })
-            .ToList();
-
-        _logger.LogInformation(
-            "[Pegging] 从LogicalProductionDemands构建TaskDrafts: {Count} 个",
-            drafts.Count);
-
-        return drafts;
     }
 
     /// <summary>
@@ -582,84 +533,6 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             db: DatabaseId.APS);
     }
 
-    /// <summary>
-    /// 按 UpstreamDraftIds 做 DFS 后序拓扑排序，确保上游草稿排在下游之前。
-    /// </summary>
-    private static IEnumerable<Core.Dto.TaskDraft> TopologicalSortDrafts(
-        IReadOnlyList<Core.Dto.TaskDraft> drafts)
-    {
-        var byId    = drafts.ToDictionary(d => d.DraftId, StringComparer.Ordinal);
-        var visited = new HashSet<string>(StringComparer.Ordinal);
-        var result  = new List<Core.Dto.TaskDraft>(drafts.Count);
-
-        void Visit(Core.Dto.TaskDraft d)
-        {
-            if (!visited.Add(d.DraftId)) return;
-            foreach (var upId in d.UpstreamDraftIds)
-                if (byId.TryGetValue(upId, out var upstream))
-                    Visit(upstream);
-            result.Add(d);
-        }
-
-        foreach (var d in drafts) Visit(d);
-        return result;
-    }
-
-
-    /// <inheritdoc />
-    // ⚠️ 此方法已不在主链调用：PeggingSupplyAllocation 已由 PersistDomainAndPeggingInTransactionAsync 的 B6 步统一写入。
-    // 若再次调用会撞唯一索引 UX_PSA_AllocationSequence(PlanVersionId, AllocationSequence)。保留仅为接口契约兼容。
-    public async System.Threading.Tasks.Task<int> PersistSupplyAllocationAsync(
-        PeggingResultVoucher voucher,
-        CancellationToken cancellationToken = default)
-    {
-        var allocations = MapVoucherToSupplyAllocations(voucher);
-        if (allocations.Count == 0) return 0;
-
-        var count = await _allocationRepo.BulkInsertAsync(allocations, cancellationToken);
-
-        return count;
-    }
-
-    [Obsolete("V1.2 退出主链：不再实现 FrozenZoneSnapshot 平台", false)]
-    public async System.Threading.Tasks.Task<int> UpdateFrozenZoneSnapshotAsync(
-        int planVersionId,
-        DateTime frozenWindowStart,
-        DateTime frozenWindowEnd,
-        CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("[Pegging] UpdateFrozenZoneSnapshotAsync 已废弃，跳过执行");
-        return 0;
-    }
-
-    /// <inheritdoc />
-    [Obsolete("V1.2 退出主链：VirtualInventoryBalance 不再实现", false)]
-    public async System.Threading.Tasks.Task<int> PropagateVirtualInventoryAsync(
-        int planVersionId,
-        int sourceProductFamilyId,
-        int targetProductFamilyId,
-        CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("[Pegging] PropagateVirtualInventoryAsync 已废弃，跳过执行");
-        await System.Threading.Tasks.Task.CompletedTask;
-        return 0;
-    }
-
-    /// <inheritdoc />
-    [Obsolete("V1.2 退出主链：FrozenZoneSnapshot 和 VirtualInventoryBalance 不再实现", false)]
-    public async System.Threading.Tasks.Task RollbackPeggingWorkflowAsync(
-        int planVersionId,
-        long orderId,
-        CancellationToken cancellationToken = default)
-    {
-        _logger.LogWarning(
-            "[Pegging] 回滚: PlanVersionId={PlanVersionId}, OrderId={OrderId}",
-            planVersionId, orderId);
-
-        // V1.2 退出主链：只回滚 Allocation，不再回滚 FrozenZoneSnapshot 和 VirtualInventoryBalance
-        await _allocationRepo.DeleteByPlanVersionIdAsync(planVersionId, cancellationToken);
-    }
-
     /// <inheritdoc />
     public async System.Threading.Tasks.Task<(bool IsValid, List<string> ValidationErrors)> ValidateWorkflowConsistencyAsync(
         PeggingOrchestrationResult result,
@@ -682,37 +555,6 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     // ─────────────────────────────────────────────────────────────────────────
     // 私有辅助方法
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// 将 Voucher 中的供应分配映射为 PeggingSupplyAllocation 实体
-    ///
-    /// NEW_REQUIREMENT 不写 PeggingSupplyAllocation：
-    ///   该类型对应"需新排产"，最终通过 Task 实例化 + 物理 Pegging 表记录 Task-to-Task 血缘
-    /// </summary>
-    private static List<Core.Entities.APS.PeggingSupplyAllocation> MapVoucherToSupplyAllocations(
-        PeggingResultVoucher voucher)
-    {
-        var now = DateTime.Now;
-
-        return voucher.SupplyAllocations
-            .Where(a => a.SourceType != Core.Enum.SupplySourceType.NEW_REQUIREMENT)
-            .Select(alloc => new Core.Entities.APS.PeggingSupplyAllocation
-            {
-                PlanVersionId        = voucher.PlanVersionId,
-                ScheduleRunId        = 0, // 需从PlanVersion查询
-                AllocationSequence   = alloc.AllocationSequence,
-                MaterialId           = alloc.SupplyMaterialId,
-                MaterialCode         = string.Empty, // 需从Material表查询
-                DemandQty            = voucher.DemandQuantity,
-                AllocatedQty         = alloc.AllocatedQuantity,
-                SupplyType           = alloc.SourceType.ToString(),
-                DemandFactoryCode    = alloc.FactoryCode,
-                SupplyFactoryCode    = alloc.FactoryCode,
-                KnownAvailableTime   = alloc.AvailableAt,
-                SupplyDocumentNo     = alloc.SourceReference,
-                CreatedAt            = now
-            }).ToList();
-    }
 
     private sealed record BomEdge(
         string ParentCode,
@@ -1295,7 +1137,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // ── Demand 优先级排序（2号位消费3号位 DemandPriorityConfig）──
         // 位置：LoadOrdersForPeggingAsync 之后、Pegging 循环之前（PM 冻结口径，不进 SQL 排序）
         // 结果：OrderId → DemandSequence，决定订单处理顺序，并透传给 LogicalProductionDemand
-        var demandSequenceByOrder = await BuildDemandSequenceMapAsync(orders, ct);
+        var demandSequenceByOrder = await BuildDemandSequenceMapAsync(orders, request, ct);
 
         var firstOrder = orders.FirstOrDefault();
         var voucher = new PeggingResultVoucher
@@ -1343,6 +1185,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// </summary>
     private async Task<Dictionary<long, int>> BuildDemandSequenceMapAsync(
         IReadOnlyList<OrderPeggingRow> orders,
+        PeggingExecutionRequest request,
         CancellationToken ct)
     {
         var demands = orders.Select(o => new UpstreamDemand
@@ -1352,13 +1195,30 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             CustomerTier = o.CustomerTier,
             DueDate      = o.DueDate,
             IssueDate    = o.IssueDate,
-            // DelayStatus / ProtectionStatus：Order 表暂无对应列，待5号位事实标准化后接入
+            // DelayStatus / ProtectionStatus：Order 表暂无对应列，保持 null（不造假），待5号位事实标准化后接入
             SourceDemand = o
         }).ToList();
 
-        // TODO: strategyProfileVersionId 应从 PeggingExecutionRequest/ScheduleRun 透传（当前 Fixture 忽略该参数）
-        var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(0L, ct);
-        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, config);
+        // 4.1：策略版本必须取自本 Run 冻结上下文，不再固定传 0；缺失即视为运行上下文不完整，禁止静默回退 Fixture
+        var strategyProfileVersionId = request.SchedulingContext?.StrategyProfileVersionId;
+        if (!strategyProfileVersionId.HasValue || strategyProfileVersionId.Value <= 0)
+        {
+            throw new InvalidOperationException(
+                "DemandPriority 策略上下文不完整：SchedulingContext.StrategyProfileVersionId 为空。正式运行必须有冻结策略版本，禁止静默回退 Fixture。");
+        }
+
+        var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(strategyProfileVersionId.Value, ct);
+
+        // 方案A：外部按 CalculationLayer 调用 Executor —— 只对「第一层：顶层独立需求（订单）」取当前层 Segments
+        const int currentCalculationLayer = 1;
+        var layerConfig = new DemandPriorityConfig
+        {
+            Segments = config.Segments
+                .Where(s => s.CalculationLayer == currentCalculationLayer)
+                .ToList()
+        };
+
+        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, layerConfig);
 
         var map = new Dictionary<long, int>();
         foreach (var demand in sorted)

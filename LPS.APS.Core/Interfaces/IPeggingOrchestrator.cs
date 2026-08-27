@@ -34,44 +34,6 @@ public interface IPeggingOrchestrator
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 步骤2.6：从 Voucher 中提取 TaskDraft 列表（纯内存，按拓扑序排列，不写库）
-    /// </summary>
-    IReadOnlyList<TaskDraft> BuildTaskDraftsFromVoucher(PeggingResultVoucher voucher);
-
-    /// <summary>
-    /// 步骤2.8：持久化供应分配表（非 Task 供应）
-    /// </summary>
-    Task<int> PersistSupplyAllocationAsync(
-        PeggingResultVoucher voucher,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// 更新冻结区快照
-    /// </summary>
-    Task<int> UpdateFrozenZoneSnapshotAsync(
-        int planVersionId,
-        DateTime frozenWindowStart,
-        DateTime frozenWindowEnd,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// 虚拟库存传播（跨域依赖）
-    /// </summary>
-    Task<int> PropagateVirtualInventoryAsync(
-        int planVersionId,
-        int sourceProductFamilyId,
-        int targetProductFamilyId,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// 回滚 Pegging 流程（事务失败时）
-    /// </summary>
-    Task RollbackPeggingWorkflowAsync(
-        int planVersionId,
-        long orderId,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
     /// 验证 Pegging 结果的一致性（事务提交前）
     /// </summary>
     Task<(bool IsValid, List<string> ValidationErrors)> ValidateWorkflowConsistencyAsync(

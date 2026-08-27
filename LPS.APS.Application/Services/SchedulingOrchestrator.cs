@@ -118,6 +118,12 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     public async Task<SchedulingRunResult> RunSchedulingAsync(int planVersionId, CancellationToken cancellationToken = default)
         => await RunSchedulingAsync(planVersionId, scheduleRunId: 0, dataCutoffTime: null, strategyProfileVersionId: null, cancellationToken);
 
+    /// <summary>
+    /// 手动/联调入口：显式指定策略包版本（测试/联调场景，绕过 RunSchedulingAutoAsync 的自动领取与版本绑定）。
+    /// </summary>
+    public Task<SchedulingRunResult> RunSchedulingAsync(int planVersionId, long strategyProfileVersionId, CancellationToken cancellationToken = default)
+        => RunSchedulingAsync(planVersionId, scheduleRunId: 0, dataCutoffTime: null, strategyProfileVersionId, cancellationToken);
+
     private async Task<SchedulingRunResult> RunSchedulingAsync(
         int planVersionId,
         int scheduleRunId,
@@ -321,10 +327,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             PlanHorizonEnd   = planVersion.PlanHorizonEnd
         };
 
-        // 1.1 + 1.3：订单 + 物料属性（一次 JOIN 取全）
-        var orders = await LoadOrdersAsync(planVersion.Id, cancellationToken);
-        _logger.LogInformation("[{PlanVersionId}] 1.1 订单加载: {Count}", planVersion.Id, orders.Count);
-
         // 1.4 资源 + 日历
         await LoadResourcesAndCalendarAsync(context, cancellationToken);
         _logger.LogInformation("[{PlanVersionId}] 1.4 资源加载: {Count}", planVersion.Id, context.Resources.Count);
@@ -336,7 +338,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
         // 1.6 Task 拆批 → V1.2 已废弃：Task由2号位Pegging在供需挂钩后生成，不再预拆批
         // v5.1.2冻结设计（§3.1）：DefaultBatchSplitter调用次数=0，批次拆分由1号位IFiniteCapacityScheduler执行
-        // await GenerateAndPersistTasksAsync(planVersion.Id, orders, context, cancellationToken);
         _logger.LogInformation("[{PlanVersionId}] 1.6 跳过预拆批（Task将由Pegging生成）", planVersion.Id);
 
         // 1.7 MES 进度快照装载（按 ScheduleRunId 从 StageProgressSnapshot 读 RemainingQty）
@@ -375,34 +376,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         }
     }
 
-
-    private async Task<List<OrderLoadDto>> LoadOrdersAsync(int planVersionId, CancellationToken ct)
-    {
-        var rows = await _connectionManager.QueryAsync<OrderLoadDto>(
-            @"SELECT
-                o.Id                AS OrderId,
-                o.OrderNo,
-                o.MaterialId,
-                o.MaterialCode,
-                o.ProductFamilyId,
-                o.FactoryId,
-                o.Quantity,
-                o.UOM,
-                o.CustomerDueDate,
-                o.Priority,
-                o.PriorityScore,
-                o.CustomerTier,
-                m.LowLevelCode      AS LLC
-              FROM [Order] o
-              INNER JOIN Material m ON m.Id = o.MaterialId
-              WHERE o.PlanVersionId = @PlanVersionId
-                AND o.Status IN ('Open', 'Released')
-              ORDER BY o.Priority DESC, o.CustomerDueDate ASC",
-            new { PlanVersionId = planVersionId },
-            db: DatabaseId.APS);
-
-        return rows.ToList();
-    }
 
     /// <summary>
     /// 1.4 加载资源 + 日历
@@ -523,55 +496,8 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     // ═══════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // 阶段4 结果落盘
+    // 阶段4 结果落盘 — 已废弃：Task 落盘已移入 Pegging 阶段（PersistDomainAndPeggingInTransactionAsync）
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// 阶段4: 将 SchedulingContext.Tasks 中 1号位填充好的 PlannedStartTime/EndTime/ResourceId
-    /// 批量 UPDATE 回 [Task] 表
-    /// 策略：临时表 + MERGE（Dapper 对 SqlServer 的 TVP 支持较弱，用 #Temp）
-    /// </summary>
-    private async System.Threading.Tasks.Task PersistSchedulingResultAsync(
-        int planVersionId,
-        SchedulingContext context,
-        CancellationToken cancellationToken)
-    {
-        var scheduledTasks = context.Tasks
-            .Where(t => t.PlannedStartTime.HasValue && t.PlannedEndTime.HasValue)
-            .Select(t => new
-            {
-                Id               = long.Parse(t.TaskId),
-                PlannedStartTime = t.PlannedStartTime!.Value,
-                PlannedEndTime   = t.PlannedEndTime!.Value,
-                ResourceId       = string.IsNullOrEmpty(t.ResourceId) ? (int?)null : int.Parse(t.ResourceId),
-                IsLocked         = t.IsLocked
-            })
-            .ToList();
-
-        if (scheduledTasks.Count == 0)
-        {
-            _logger.LogWarning("[{PlanVersionId}] 无已排程任务需要落盘", planVersionId);
-            return;
-        }
-
-        // 批量 UPDATE（Dapper 对 List 参数展开，SqlServer 对单条 UPDATE 逐行执行）
-        // 规模超 1 万时建议改 SqlBulkCopy → #Temp → MERGE；V1 先走朴素版
-        var updateSql = $@"
-            UPDATE [Task]
-            SET PlannedStartTime = @PlannedStartTime,
-                PlannedEndTime   = @PlannedEndTime,
-                ResourceId       = @ResourceId,
-                IsLocked         = @IsLocked,
-                Status           = 'Scheduled',
-                UpdatedAt        = GETDATE()
-            WHERE Id = @Id AND PlanVersionId = {planVersionId}";
-
-        var affected = await _connectionManager.ExecuteAsync(updateSql, scheduledTasks, db: DatabaseId.APS);
-
-        _logger.LogInformation(
-            "[{PlanVersionId}] 落盘完成: 已排 {Scheduled}/{Total}, 影响行数={Affected}",
-            planVersionId, scheduledTasks.Count, context.Tasks.Count, affected);
-    }
 
     private async Task LoadStrategyConfigAsync(SchedulingContext context, long strategyProfileVersionId, CancellationToken ct)
     {
@@ -740,23 +666,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     // ═══════════════════════════════════════════════════════════════════════════
     // 内部 DTO（仅本类 Dapper 投影使用，不对外暴露）
     // ═══════════════════════════════════════════════════════════════════════════
-
-    private class OrderLoadDto
-    {
-        public long OrderId { get; set; }
-        public string OrderNo { get; set; } = string.Empty;
-        public int MaterialId { get; set; }
-        public string MaterialCode { get; set; } = string.Empty;
-        public int ProductFamilyId { get; set; }
-        public int FactoryId { get; set; }
-        public decimal Quantity { get; set; }
-        public string UOM { get; set; } = string.Empty;
-        public DateTime CustomerDueDate { get; set; }
-        public int Priority { get; set; }
-        public decimal? PriorityScore { get; set; }
-        public string? CustomerTier { get; set; }
-        public int? LLC { get; set; }
-    }
 
     private class ResourceLoadDto
     {

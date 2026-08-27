@@ -6,12 +6,14 @@ using System.Threading.Tasks;
 using Dapper;
 using Xunit;
 using LPS.APS.Application.Services;
+using LPS.APS.Application.Services.Fixtures;
 using LPS.APS.Application.Extensions;
 using LPS.APS.BusinessRules.Extensions;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Extensions;
 using LPS.APS.Scheduling.Extensions;
 using LPS.APS.Core.Dto;
+using LPS.APS.Core.Interfaces;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 
@@ -63,6 +65,8 @@ public class RealSchedulingIntegrationTest
         services.AddSchedulingServices();
         services.AddBusinessRuleServices();
         services.AddApplicationServices();
+        // 联调专用：DemandPriority 策略源使用 Fixture（3号位真实 FrozenStrategySnapshot 尚未接通，Fixture 仅用于测试，不得进入生产 DI）
+        services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         services.AddLogging();
 
         // 集成测试需要直接访问具体类
@@ -472,6 +476,7 @@ public class RealSchedulingIntegrationTest
         // 执行排程
         var result = await _schedulingOrchestrator.RunSchedulingAsync(
             _actualPlanVersionId,
+            1L, // 联调：Fixture 忽略该版本号，仅需非空以通过策略上下文完整性校验
             CancellationToken.None);
 
         var duration = DateTime.Now - startTime;
@@ -713,6 +718,7 @@ public class RealSchedulingIntegrationTest
         Console.WriteLine("  重新执行排程流程...");
         await _schedulingOrchestrator.RunSchedulingAsync(
             _actualPlanVersionId,
+            1L, // 联调：Fixture 忽略该版本号，仅需非空以通过策略上下文完整性校验
             CancellationToken.None);
 
         // 第二次运行后的记录数
