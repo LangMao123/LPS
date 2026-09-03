@@ -1,13 +1,15 @@
+using LPS.APS.Core.Enum;
+
 namespace LPS.APS.Core.Dto;
 
 /// <summary>
 /// 位置切片（PI Position的一个物理位置片段）
 ///
-/// 位置类型（PositionType）:
-/// - STAGE: 在某个工艺段
-/// - XC: 跨单元在途
-/// - INTERPLANT_IN_TRANSIT: 跨厂在途
-/// - WAITING: 等待状态（已完工但未入库）
+/// 位置类型（PositionType，v5.1.5）:
+/// - FIRST_STAGE_PENDING: 首工序待开始
+/// - STAGE_WAITING: Stage等待（在某Stage等待加工，或已投料未实际加工）
+/// - XC: 生产指示级XC位置（线边仓）
+/// - INTERPLANT_TRANSIT: 跨厂途中位置（已发出未到达）
 /// - UNLOCATED: 位置不明（需要保守排程）
 ///
 /// 冻结约束：
@@ -18,9 +20,9 @@ public sealed class PositionSlice
 {
     /// <summary>
     /// 位置类型
-    /// STAGE / XC / INTERPLANT_IN_TRANSIT / WAITING / UNLOCATED
+    /// FIRST_STAGE_PENDING / STAGE_WAITING / XC / INTERPLANT_TRANSIT / UNLOCATED
     /// </summary>
-    public string PositionType { get; init; } = default!;
+    public PositionType PositionType { get; init; } = default!;
 
     /// <summary>
     /// 工艺段代码（PositionType=STAGE时必填）
@@ -38,7 +40,7 @@ public sealed class PositionSlice
     public decimal Quantity { get; init; }
 
     /// <summary>
-    /// 可用时间（Transit/Waiting类型会有预计到达时间）
+    /// 可用时间（INTERPLANT_TRANSIT / XC 等有预计到达时间）
     /// </summary>
     public DateTime? AvailableTime { get; init; }
 

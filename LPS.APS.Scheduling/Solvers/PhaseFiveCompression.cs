@@ -84,10 +84,14 @@ internal class PhaseFiveCompression
         {
             if (!repairResult.RepairedTasks.Any(t => t.SourceDraftId == demandKey))
             {
+                // 最小B：缺失生产部门 Context 的需求，Reason 单独标识
+                var missingDept = IsMissingDepartmentContext(demandKey, request, constraints);
                 unscheduledTasks.Add(new UnscheduledTaskResult
                 {
                     DraftId = demandKey,
-                    Reason = "Phase 2 初始排程失败，Phase 4 修复未成功"
+                    Reason = missingDept
+                        ? "MISSING_PRODUCTION_DEPARTMENT_CONTEXT"
+                        : "Phase 2 初始排程失败，Phase 4 修复未成功"
                 });
             }
         }
@@ -128,6 +132,25 @@ internal class PhaseFiveCompression
                 UsedRoughCut = false
             }
         };
+    }
+
+    /// <summary>
+    /// 判断某 Demand 是否因缺失生产部门 Context 而被排除（最小B）。
+    /// 部门锁定在 Phase 1 完成，缺失 Context 的 Material 记入 constraints.MissingDepartmentContextMaterialIds；
+    /// 此处按 LogicalDemandKey → MaterialId 反查，给 Unscheduled 结果补正确的 Reason。
+    /// </summary>
+    private bool IsMissingDepartmentContext(
+        string demandKey,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        var demand = request.LogicalProductionDemands
+            .FirstOrDefault(d => d.LogicalDemandKey == demandKey);
+        if (demand == null)
+        {
+            return false;
+        }
+        return constraints.MissingDepartmentContextMaterialIds.Contains(demand.MaterialId);
     }
 
     /// <summary>

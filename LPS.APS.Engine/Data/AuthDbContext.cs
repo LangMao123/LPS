@@ -24,6 +24,7 @@ public class AuthDbContext : DbContext
     public DbSet<ApprovalNode> ApprovalNodes { get; set; } = null!;
     public DbSet<ApprovalRecord> ApprovalRecords { get; set; } = null!;
     public DbSet<ApprovalRule> ApprovalRules { get; set; } = null!;
+    public DbSet<GovernanceAuditLog> GovernanceAuditLogs { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -125,6 +126,18 @@ public class AuthDbContext : DbContext
             entity.HasKey(e => e.Id);
             entity.Property(e => e.RuleType).IsRequired().HasMaxLength(50);
             entity.HasIndex(e => e.FlowId);
+        });
+
+        // ==================== GovernanceAuditLog（治理审计，3号位 A-7） ====================
+        modelBuilder.Entity<GovernanceAuditLog>(entity =>
+        {
+            entity.ToTable("GovernanceAuditLog");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.OperationType).IsRequired().HasMaxLength(50);
+            entity.Property(e => e.EntityType).IsRequired().HasMaxLength(50);
+            entity.Property(e => e.VersionCode).HasMaxLength(100);
+            entity.HasIndex(e => new { e.EntityType, e.EntityId });
+            entity.HasIndex(e => e.OperatedAt);
         });
     }
 

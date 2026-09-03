@@ -24,12 +24,22 @@ public sealed class ProductionInstructionPositionResult
     public decimal TotalRemainingQty { get; init; }
 
     /// <summary>
-    /// 位置切片列表（Stage/XC/Transit/Waiting/Unlocated）
+    /// 位置切片列表（FIRST_STAGE_PENDING / STAGE_WAITING / XC / INTERPLANT_TRANSIT / UNLOCATED）
     /// </summary>
-    public IReadOnlyList<PositionSlice> Positions { get; init; } = [];
+    public IReadOnlyList<PositionSlice> Positions { get; init; } = Array.Empty<PositionSlice>();
 
     /// <summary>
     /// 位置计算问题记录
     /// </summary>
-    public IReadOnlyList<PositionIssue> Issues { get; init; } = [];
+    public IReadOnlyList<PositionIssue> Issues { get; init; } = Array.Empty<PositionIssue>();
+
+    /// <summary>
+    /// 是否计算成功（总量是否闭合）
+    /// </summary>
+    public bool IsSuccess { get; init; }
+
+    /// <summary>
+    /// 失败原因（如果IsSuccess=false）
+    /// </summary>
+    public string? FailureReason { get; init; }
 }

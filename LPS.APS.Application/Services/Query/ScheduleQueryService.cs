@@ -33,13 +33,26 @@ public class ScheduleQueryService : IScheduleQueryService
     {
         var rows = await _connectionManager.QueryAsync<PlanVersionSummaryDto>(
             @"SELECT TOP (@Take)
-                Id, VersionCode, VersionCategory,
-                PlanHorizonStart, PlanHorizonEnd,
-                Status, ComputedAt,
-                TotalTasks, CreatedAt
-              FROM PlanVersion
-              WHERE ArchivedAt IS NULL
-              ORDER BY CreatedAt DESC",
+                pv.Id, pv.VersionCode, pv.VersionCategory,
+                pv.DomainKey,
+                pv.PlanHorizonStart, pv.PlanHorizonEnd,
+                pv.Status, pv.ComputedAt,
+                pv.TotalTasks, pv.CreatedAt,
+                pv.SourceScheduleRunId, pv.ActivatedAt,
+                CASE WHEN pv.VersionCategory = 'CANDIDATE' OR pv.Status = 'ARCHIVED'
+                     THEN (
+                         SELECT TOP 1 b.Id
+                         FROM PlanVersion b
+                         WHERE b.DomainKey = pv.DomainKey
+                           AND b.Status = 'ARCHIVED'
+                           AND b.ActivatedAt <= pv.CreatedAt
+                         ORDER BY b.ActivatedAt DESC, b.Id DESC
+                     )
+                     ELSE NULL
+                END AS BasePlanVersionId
+              FROM PlanVersion pv
+              WHERE pv.ArchivedAt IS NULL
+              ORDER BY pv.CreatedAt DESC",
             new { Take = take },
             db: DatabaseId.APS);
 
@@ -64,21 +77,33 @@ public class ScheduleQueryService : IScheduleQueryService
         }
 
         // 2. 资源行（仅返回该版本里被 Task 使用到的资源，减少前端噪声）
+        //    G2-b 档①：DomainKey = 'FACTORY_{FactoryId}'（单工厂域，与 LogicalProductionDemand 一致）
+        //              factoryName / productionDepartmentName / stage 由域主数据 JOIN 投影
         var resources = await _connectionManager.QueryAsync<GanttResourceDto>(
             @"SELECT DISTINCT
                 r.Id AS ResourceId,
                 r.ResourceCode,
                 r.ResourceName,
                 r.FactoryId,
-                r.ProductionDepartmentId
+                r.ProductionDepartmentId,
+                'FACTORY_' + CAST(r.FactoryId AS NVARCHAR(10)) AS DomainKey,
+                f.Name AS FactoryName,
+                pd.DeptName AS ProductionDepartmentName,
+                pd.StageCode AS Stage
               FROM Resource r
               INNER JOIN [Task] t ON t.ResourceId = r.Id
+              LEFT JOIN Factory f ON f.Id = r.FactoryId
+              LEFT JOIN ProductionDepartment pd ON pd.Id = r.ProductionDepartmentId
               WHERE t.PlanVersionId = @Id
               ORDER BY r.FactoryId, r.ProductionDepartmentId, r.ResourceCode",
             new { Id = planVersionId },
             db: DatabaseId.APS);
 
         // 3. 任务条
+        //    G2-b 档①：DomainKey = COALESCE(Order.DomainKey, PlanVersion.DomainKey)
+        //              netQty = Task.Quantity（落盘即净合格产出 NetOutputQty）
+        //              plannedProcessQty / mesEligible / crossDomainBlocked 无落盘来源，返回 null / 保守默认
+        //              （详见 v1.2 §二 2.3 与 §七 事实来源待对齐清单）
         var tasks = await _connectionManager.QueryAsync<GanttTaskDto>(
             @"SELECT
                 t.Id                AS TaskId,
@@ -101,10 +126,18 @@ public class ScheduleQueryService : IScheduleQueryService
                      AND o.CustomerDueDate IS NOT NULL
                      AND t.PlannedEndTime > o.CustomerDueDate
                     THEN 1 ELSE 0
-                END AS BIT) AS IsDelayed
+                END AS BIT) AS IsDelayed,
+                COALESCE(o.DomainKey, pv.DomainKey) AS DomainKey,
+                t.Quantity          AS NetQty,
+                CAST(NULL AS DECIMAL(18,4)) AS PlannedProcessQty,
+                CAST(0 AS BIT)      AS MesEligible,
+                CAST(NULL AS NVARCHAR(4000)) AS MesIneligibleReasons,
+                CAST(0 AS BIT)      AS CrossDomainBlocked,
+                CAST(NULL AS NVARCHAR(4000)) AS CrossDomainBlockReason
               FROM [Task] t
               LEFT JOIN [Order] o ON o.Id = t.OrderId
               LEFT JOIN Material m ON m.Id = t.MaterialId
+              LEFT JOIN PlanVersion pv ON pv.Id = @Id
               WHERE t.PlanVersionId = @Id
               ORDER BY t.ResourceId, t.PlannedStartTime",
             new { Id = planVersionId },
@@ -170,4 +203,162 @@ public class ScheduleQueryService : IScheduleQueryService
 
         return summary ?? new ScheduleSummaryDto { PlanVersionId = planVersionId };
     }
+
+    /// <inheritdoc />
+    public async Task<CandidateComparisonDto> GetCandidateComparisonAsync(
+        int candidatePlanVersionId,
+        int basePlanVersionId,
+        CancellationToken cancellationToken = default)
+    {
+        // 1. 双版本概要 + 存在性/状态校验（缺失 → 404；候选非 CANDIDATE → 400）
+        var versions = (await _connectionManager.QueryAsync<PlanVersionBriefDto>(
+            @"SELECT Id AS PlanVersionId, VersionCode, VersionCategory, Status, ComputedAt
+              FROM PlanVersion
+              WHERE Id IN (@CandidateId, @BaseId)",
+            new { CandidateId = candidatePlanVersionId, BaseId = basePlanVersionId },
+            db: DatabaseId.APS)).ToList();
+
+        var candidateSummary = versions.FirstOrDefault(v => v.PlanVersionId == candidatePlanVersionId)
+            ?? throw new KeyNotFoundException($"候选计划版本不存在：{candidatePlanVersionId}");
+        var baseSummary = versions.FirstOrDefault(v => v.PlanVersionId == basePlanVersionId)
+            ?? throw new KeyNotFoundException($"基础计划版本不存在：{basePlanVersionId}");
+
+        if (!string.Equals(candidateSummary.VersionCategory, "CANDIDATE", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"候选版本身份非 CANDIDATE（当前：{candidateSummary.VersionCategory}）");
+        }
+
+        var parameters = new { CandidateId = candidatePlanVersionId, BaseId = basePlanVersionId };
+
+        // 2. 任务变化汇总（主键差集：OrderId+MaterialId+OperationSeq+OperationCode+RouteCode+PathId）
+        var added = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM [Task] t_c
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND NOT EXISTS (
+                   SELECT 1 FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})",
+            parameters);
+
+        var removed = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM [Task] t_b
+               WHERE t_b.PlanVersionId = @BaseId
+                 AND NOT EXISTS (
+                   SELECT 1 FROM [Task] t_c
+                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})",
+            parameters);
+
+        var timeShifted = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM [Task] t_c
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND EXISTS (
+                   SELECT 1 FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                     AND (
+                       (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
+                       OR t_c.PlannedStartTime <> t_b.PlannedStartTime
+                       OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
+                       OR t_c.PlannedEndTime <> t_b.PlannedEndTime))",
+            parameters);
+
+        var resourceChanged = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM [Task] t_c
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND EXISTS (
+                   SELECT 1 FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                     AND (
+                       (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
+                       OR t_c.ResourceId <> t_b.ResourceId))",
+            parameters);
+
+        var impactedOrders = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM (
+                 SELECT DISTINCT OrderId FROM (
+                   SELECT t_c.OrderId
+                   FROM [Task] t_c
+                   WHERE t_c.PlanVersionId = @CandidateId
+                     AND (
+                       NOT EXISTS (
+                         SELECT 1 FROM [Task] t_b
+                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})
+                       OR EXISTS (
+                         SELECT 1 FROM [Task] t_b
+                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                           AND (
+                             (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
+                             OR t_c.PlannedStartTime <> t_b.PlannedStartTime
+                             OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
+                             OR t_c.PlannedEndTime <> t_b.PlannedEndTime
+                             OR (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
+                             OR t_c.ResourceId <> t_b.ResourceId))
+                     )
+                   UNION
+                   SELECT t_b.OrderId
+                   FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId
+                     AND NOT EXISTS (
+                       SELECT 1 FROM [Task] t_c
+                       WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})
+                 ) changed
+               ) cnt",
+            parameters);
+
+        var newDelays = await CountScalarAsync(
+            $@"SELECT COUNT(*)
+               FROM [Task] t_c
+               INNER JOIN [Order] o ON o.Id = t_c.OrderId
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND t_c.PlannedEndTime IS NOT NULL
+                 AND o.CustomerDueDate IS NOT NULL
+                 AND t_c.PlannedEndTime > o.CustomerDueDate
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM [Task] t_b
+                   INNER JOIN [Order] ob ON ob.Id = t_b.OrderId
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                     AND t_b.PlannedEndTime IS NOT NULL
+                     AND ob.CustomerDueDate IS NOT NULL
+                     AND t_b.PlannedEndTime > ob.CustomerDueDate)",
+            parameters);
+
+        // 3. 汇总组装（crossDomain 计数未落盘，保守返 0；estimatedOnlyCount 归 2号位 返 null —— v1.2 §三 3.3 / §九-b）
+        return new CandidateComparisonDto
+        {
+            TaskChangeSummary = new TaskChangeSummaryDto
+            {
+                Added = added,
+                Removed = removed,
+                TimeShifted = timeShifted,
+                ResourceChanged = resourceChanged,
+                CrossDomainBlocked = 0
+            },
+            ImpactSummary = new ImpactSummaryDto
+            {
+                ImpactedOrderCount = impactedOrders,
+                NewDelayCount = newDelays,
+                CrossDomainImpacted = 0,
+                EstimatedOnlyCount = null
+            },
+            BaseSummary = baseSummary,
+            CandidateSummary = candidateSummary
+        };
+    }
+
+    /// <summary>跨版本 Task 自然主键匹配片段（H1 差集判定：OrderId+MaterialId+OperationSeq+OperationCode+RouteCode+PathId）</summary>
+    private const string TaskKeyMatchFragment = @"
+        AND t_b.OrderId       = t_c.OrderId
+        AND t_b.MaterialId    = t_c.MaterialId
+        AND t_b.OperationSeq  = t_c.OperationSeq
+        AND t_b.OperationCode = t_c.OperationCode
+        AND t_b.RouteCode     = t_c.RouteCode
+        AND t_b.PathId        = t_c.PathId";
+
+    /// <summary>标量 COUNT 查询（只读 APS_Production；T=int 无约束时 T? 仅为注解，须显式 int? 类型参数才能 ?? 0 兜底）</summary>
+    private async Task<int> CountScalarAsync(string sql, object parameters)
+        => await _connectionManager.QueryFirstOrDefaultAsync<int?>(sql, parameters, db: DatabaseId.APS) ?? 0;
 }

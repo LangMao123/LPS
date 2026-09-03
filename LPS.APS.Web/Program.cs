@@ -47,6 +47,9 @@ builder.Services.AddSharedServices(builder.Configuration);
 builder.Services.AddDatabaseServices(builder.Configuration);
 builder.Services.AddDatabaseHealthCheck();
 
+// 注册治理仓储（3号位：RuleSetVersion / ParameterSetVersion，阶段 A-3）
+builder.Services.AddGovernanceRepositories();
+
 // 注册排程算法服务（1号位：纯内存计算引擎）
 builder.Services.AddSchedulingServices();
 

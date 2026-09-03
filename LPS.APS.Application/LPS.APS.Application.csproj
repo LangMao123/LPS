@@ -6,6 +6,10 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<PackageReference Include="Hangfire.Core" Version="1.8.9" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<ProjectReference Include="..\LPS.APS.Core\LPS.APS.Core.csproj" />
 		<ProjectReference Include="..\LPS.APS.Engine\LPS.APS.Engine.csproj" />
 		<ProjectReference Include="..\LPS.APS.BusinessRules\LPS.APS.BusinessRules.csproj" />

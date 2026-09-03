@@ -4,15 +4,18 @@ using Microsoft.Extensions.Logging;
 namespace LPS.APS.Application.Services;
 
 /// <summary>
-/// 跨厂Pegging处理器（2号位职责 — 消费5号位的跨厂供给事实）
+/// 跨厂Pegging处理器（2号位职责）
 ///
-/// 职责边界：
-/// - 5号位负责计算跨厂Transit/Received事实（数量、可用时间、去重）
-/// - 2号位负责Pegging消费和Quantity-Time传播
+/// 职责边界（PM 2026-09-01 两类跨厂裁决）：
+/// - STAGE_HANDOFF（大工艺接续型，PI级）：同一个 PI 沿大工艺跨厂继续生产，
+///   跨厂在途（Interplant Transit）= PI Position 的一种当前位置，不是独立 Supply。
+///   该链由 ProductionInstructionPositionCalculator.CalculateTransitPositions 处理
+///   （TransitFacts → PositionSlice(INTERPLANT_IN_TRANSIT)），不经过本 handler。
+/// - INTER_FACTORY_ORDER（厂间出荷指示型，SH级）：目标厂需求 → BS/KS 库存 → 具体 SH 承接，
+///   同 SH 内部按「Transit → Received → 未生产」闭合，未生产才进源厂生产需求。
+///   本 handler 的 Consume* 方法服务于该 SH 级履行闭合。
 ///
-/// PM冻结口径两类跨厂订单：
-/// 1. STAGE_HANDOFF: 同SH的多段消费（Transit → Received → 未生产）
-/// 2. INTER_FACTORY_ORDER: 跨厂采购单（上游完成时间 + LT = 下游可用时间）
+/// 5号位职责：提供 Transit/Received 事实（数量、可用时间、SH No 绑定）；2号位职责：Pegging 消费与 Quantity-Time 传播。
 /// </summary>
 public sealed class CrossFactoryPeggingHandler
 {
@@ -24,48 +27,48 @@ public sealed class CrossFactoryPeggingHandler
     }
 
     /// <summary>
-    /// 消费同一Stage Handoff的跨厂供给（防止重复计数）
+    /// 消费同一 SH 的厂间出荷履行（防止重复计数）
     ///
-    /// PM冻结口径：
-    /// - SH内部Transit、Received、未生产属于同一SH履行状态
-    /// - 不能拆成多个外部Supply重复入池
-    /// - 按顺序消费：Transit → Received → 未生产份额
+    /// PM 冻结口径（INTER_FACTORY_ORDER，SH级）：
+    /// - SH 内部 Transit、Received、未生产属于同一 SH 履行状态
+    /// - 不能拆成多个外部 Supply 重复入池
+    /// - 按顺序消费：Transit → Received → 剩余份额 = 未生产（触发源厂生产 Demand）
     /// </summary>
-    public StageHandoffConsumption ConsumeStageHandoff(
-        string stageHandoffNo,
-        decimal shRemainingQty,
+    public InterFactoryShipmentConsumption ConsumeInterFactoryShipment(
+        string shipmentNo,
+        decimal shipmentRemainingQty,
         IEnumerable<SupplyFact> transitSupplies,
         IEnumerable<SupplyFact> receivedSupplies)
     {
-        var remaining = shRemainingQty;
+        var remaining = shipmentRemainingQty;
 
-        // 1. 消费同SH的Transit
+        // 1. 消费同 SH 的 Transit
         var transitQty = transitSupplies
-            .Where(s => s.SourceKey == stageHandoffNo)
+            .Where(s => s.SourceKey == shipmentNo)
             .Sum(s => s.AvailableQuantity);
 
         var consumedTransit = Math.Min(remaining, transitQty);
         remaining -= consumedTransit;
 
-        // 2. 消费同SH的Received
+        // 2. 消费同 SH 的 Received
         var receivedQty = receivedSupplies
-            .Where(s => s.SourceKey == stageHandoffNo)
+            .Where(s => s.SourceKey == shipmentNo)
             .Sum(s => s.AvailableQuantity);
 
         var consumedReceived = Math.Min(remaining, receivedQty);
         remaining -= consumedReceived;
 
-        // 3. 剩余部分 = SH未生产份额（触发上游工厂生产Demand）
+        // 3. 剩余部分 = SH 未生产份额（触发源厂生产 Demand）
         var unproducedQty = remaining;
 
         _logger.LogInformation(
-            "Stage Handoff {SH} consumption: Total={Total}, Transit={Transit}, Received={Received}, Unproduced={Unproduced}",
-            stageHandoffNo, shRemainingQty, consumedTransit, consumedReceived, unproducedQty);
+            "Inter-factory shipment {SH} consumption: Total={Total}, Transit={Transit}, Received={Received}, Unproduced={Unproduced}",
+            shipmentNo, shipmentRemainingQty, consumedTransit, consumedReceived, unproducedQty);
 
-        return new StageHandoffConsumption
+        return new InterFactoryShipmentConsumption
         {
-            StageHandoffNo = stageHandoffNo,
-            TotalRemainingQty = shRemainingQty,
+            ShipmentNo = shipmentNo,
+            TotalRemainingQty = shipmentRemainingQty,
             ConsumedTransitQty = consumedTransit,
             ConsumedReceivedQty = consumedReceived,
             UnproducedQty = unproducedQty
@@ -73,28 +76,28 @@ public sealed class CrossFactoryPeggingHandler
     }
 
     /// <summary>
-    /// 计算跨厂Supply的下游可用时间
+    /// 计算跨厂 Supply 的下游可用时间
     ///
-    /// PM冻结口径：
-    /// - 已存在的Transit/Received：直接使用5号位提供的AvailableTime
-    /// - 本次Solver刚排出的上游新增生产：1号位FinalTask完成时间 + 5号位提供的LT = 下游AvailableTime
+    /// PM 冻结口径：
+    /// - 已存在的 Transit/Received：直接使用 5号位提供的 AvailableTime
+    /// - 本次 Solver 刚排出的源厂新增生产：1号位 FinalTask 完成时间 + 跨厂 LT = 下游 AvailableTime
+    /// 跨厂 LT = Transport + Inspection + Transfer 三元组（由 5号位跨厂事实提供，经 CrossFactoryLeadTime 传入）。
     /// </summary>
     public DateTime CalculateDownstreamAvailableTime(
         DateTime upstreamCompletionTime,
         CrossFactoryLeadTime leadTime)
     {
-        // INTEGRATION TODO: 5号位应提供标准化的跨厂LT（TransportLT + InspectionLT + TransferLT）
-        // 当前使用简化计算
         var totalLeadTimeDays = leadTime.TransportDays + leadTime.InspectionDays + leadTime.TransferDays;
         return upstreamCompletionTime.AddDays(totalLeadTimeDays);
     }
 
     /// <summary>
-    /// 去重检查（防止Transit和Received重复计数）
+    /// 去重检查（防止 Transit 和 Received 重复计数）
     ///
-    /// PM冻结口径：
-    /// - Transit/Received自身按PhysicalSourceKey、SourceDocument、SourceLine去重
-    /// - 防止一批货到货后同时还留在Transit里
+    /// PM 冻结口径：
+    /// - Transit/Received 自身按 SourceKey + MaterialId + FactoryId 去重
+    /// - 防止一批货到货后同时还留在 Transit 里
+    /// - 同一物理批次优先取 Received（已到货），其次 Transit（在途）
     /// </summary>
     public List<SupplyFact> DeduplicateCrossFactorySupplies(IEnumerable<SupplyFact> supplies)
     {
@@ -108,7 +111,7 @@ public sealed class CrossFactoryPeggingHandler
             })
             .Select(g =>
             {
-                // 优先取Received（已到货），其次Transit（在途）
+                // 优先取 Received（已到货），其次 Transit（在途）
                 var received = g.FirstOrDefault(s => s.SupplyType?.Contains("RECEIVED", StringComparison.OrdinalIgnoreCase) == true);
                 if (received != null)
                 {
@@ -137,11 +140,11 @@ public sealed class CrossFactoryPeggingHandler
 }
 
 /// <summary>
-/// Stage Handoff消费结果
+/// 厂间出荷（Inter-factory Shipment）履行消费结果
 /// </summary>
-public sealed class StageHandoffConsumption
+public sealed class InterFactoryShipmentConsumption
 {
-    public string StageHandoffNo { get; init; } = default!;
+    public string ShipmentNo { get; init; } = default!;
     public decimal TotalRemainingQty { get; init; }
     public decimal ConsumedTransitQty { get; init; }
     public decimal ConsumedReceivedQty { get; init; }
@@ -149,7 +152,7 @@ public sealed class StageHandoffConsumption
 }
 
 /// <summary>
-/// 跨厂前置期（INTEGRATION TODO: 应由5号位标准化提供）
+/// 跨厂前置期（Transport/Inspection/Transfer 三元组，由 5号位跨厂事实提供）
 /// </summary>
 public sealed class CrossFactoryLeadTime
 {
