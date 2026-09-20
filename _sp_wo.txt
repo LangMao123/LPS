@@ -1,0 +1,141 @@
+
+CREATE PROCEDURE [dbo].[Sp_syncmesworkordersnapshot] @ScheduleRunId  INT,
+                                                    @DataCutoffTime DATETIME,
+                                                    @RowsAffected   INT OUTPUT
+AS
+  BEGIN
+      SET NOCOUNT ON;
+
+      DECLARE @ErrorMessage NVARCHAR(2000);
+      DECLARE @DeletedOld INT = 0;
+      DECLARE @sql NVARCHAR(MAX);
+      DECLARE @CutoffStr NVARCHAR(30) = CONVERT(NVARCHAR(30), @DataCutoffTime, 120);
+
+      SET @RowsAffected = 0;
+
+      -- Step 1: 幂等清除 + 全量同步（单事务）
+      BEGIN TRY
+          BEGIN TRANSACTION;
+
+          DELETE FROM [dbo].[MESWorkOrderSnapshot]
+          WHERE  ScheduleRunId = @ScheduleRunId;
+
+          -- 预建临时表（外层作用域，动态 SQL 可写入）
+          CREATE TABLE #WorkOrderRaw
+            (
+               ProductionInstructionNo BIGINT NULL,
+               MESWorkOrderNo          NVARCHAR(50) NULL,
+               MaterialCode            NVARCHAR(80) NULL,
+               PlannedQty              DECIMAL(18, 2) NULL,
+               WorkOrderStatus         NVARCHAR(50) NULL,
+               SourceUpdatedAt         DATETIME2(7) NOT NULL
+            );
+
+          -- 动态 SQL：将 @DataCutoffTime 转为字面量，OLE DB 可在远端识别并过滤
+          SET @sql = N'
+            INSERT INTO #WorkOrderRaw
+                (ProductionInstructionNo, MESWorkOrderNo, MaterialCode,
+                 PlannedQty, WorkOrderStatus, SourceUpdatedAt)
+            SELECT v.ProductionInstructionNo, v.MESWorkOrderNo, v.MaterialCode,
+                   v.PlannedQty, v.WorkOrderStatus, v.SourceUpdatedAt
+            FROM [dbo].[ext_MES_APS_WorkOrder_View] v
+            WHERE v.SourceUpdatedAt <= '''
+                     + @CutoffStr + N'''';
+
+          EXEC Sp_executesql
+            @sql;
+
+          -- 本地转换后写入快照表
+          INSERT INTO [dbo].[MESWorkOrderSnapshot]
+                      (ScheduleRunId,
+                       ProductionInstructionNo,
+                       MESWorkOrderNo,
+                       MaterialCode,
+                       PlannedQty,
+                       WorkOrderStatus,
+                       SourceUpdatedAt,
+                       DataCutoffTime,
+                       CreatedAt)
+          SELECT @ScheduleRunId,
+                 Cast(r.ProductionInstructionNo AS NVARCHAR(100)),
+                 r.MESWorkOrderNo,
+                 r.MaterialCode,
+                 r.PlannedQty,
+                 r.WorkOrderStatus,
+                 r.SourceUpdatedAt,
+                 @DataCutoffTime,
+                 Getdate()
+          FROM   #WorkOrderRaw r;
+
+          SET @RowsAffected = @@ROWCOUNT;
+
+          COMMIT TRANSACTION;
+
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESWorkOrderSnapshot',
+                       Concat(N'rows=', @RowsAffected, N' cutoff=', @CutoffStr),
+                       N'SUCCESS',
+                       Getdate());
+      END TRY
+      BEGIN CATCH
+          IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+          SET @ErrorMessage = LEFT(Error_message(), 2000);
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESWorkOrderSnapshot',
+                       @ErrorMessage,
+                       N'FAILED',
+                       Getdate());
+          THROW;
+      END CATCH;
+
+      -- Step 2: 历史快照清理（保留最近 2 个 ScheduleRunId，主事务外独立执行）
+      BEGIN TRY
+          DELETE FROM [dbo].[MESWorkOrderSnapshot]
+          WHERE  ScheduleRunId NOT IN (SELECT TOP 2 ScheduleRunId
+                                       FROM   [dbo].[MESWorkOrderSnapshot]
+                                       GROUP  BY ScheduleRunId
+                                       ORDER  BY Max(CreatedAt) DESC);
+
+          SET @DeletedOld = @@ROWCOUNT;
+
+          IF @DeletedOld > 0
+            INSERT INTO [dbo].[APS_ETL_Log]
+                        (BatchNo,
+                         Step,
+                         Message,
+                         Status,
+                         CreatedAt)
+            VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                         N'sp_SyncMESWorkOrderSnapshot',
+                         Concat(N'purged old rows=', @DeletedOld),
+                         N'INFO',
+                         Getdate());
+      END TRY
+      BEGIN CATCH
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESWorkOrderSnapshot',
+                       Concat(N'purge failed: ', LEFT(Error_message(), 500)),
+                       N'WARN',
+                       Getdate());
+      END CATCH;
+  END; 
+

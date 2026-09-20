@@ -22,7 +22,7 @@ public class PublishedVersionAndStrategyProfileDiffTests
     private readonly Mock<IParameterSetVersionRepository> _parameterSetRepo = new();
     private readonly Mock<IStrategyProfileRepository> _strategyProfileRepo = new();
     private readonly Mock<IStrategyProfileVersionRepository> _strategyProfileVersionRepo = new();
-    private readonly Mock<IGovernanceAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IAuditLogRepository> _auditRepo = new();
     private readonly GovernanceVersionService _service;
 
     public PublishedVersionAndStrategyProfileDiffTests()

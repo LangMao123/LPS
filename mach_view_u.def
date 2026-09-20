@@ -1,0 +1,12 @@
+definition                                                                                                                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+CREATE   VIEW [dbo].[MES_APS_OperationProgress_Mach_View] AS
+WITH
+-- Step 1: 跨所有开工记录预聚合报工数量（一次扫描，不逐行关联）
+ReportAgg AS (
+    SELECT
+        w.ProcessNo,
+        w.WorkOrder,
+        w.Model,
+        w.ProcessName,
+        SUM(r.AmountByManual)        AS Good

@@ -48,9 +48,16 @@ public sealed class LogicalProductionDemand
     public int FactoryId { get; init; }
 
     /// <summary>
-    /// 从哪里开始继续生产（工序代码）
+    /// 从哪里开始继续生产（大工艺阶段码，机加工/氧化级，对应 RoutingOperation.StageCode）。
+    /// 2号位在 PeggingLoop 后据 Routing 有向图「无入边源结点」回填（原 init 改为 set 以支持回填，见 PeggingOrchestrator.FillStartStageCodes）。
     /// </summary>
-    public string StartStageCode { get; init; } = string.Empty;
+    public string StartStageCode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 续排起点工序码（工序级，比 StartStageCode 更细，对应 5号位 的 NextOperation/StartOperation）
+    /// 2号位 Pegging 不扩展 Operation，此字段由 5号位 按执行进度交付；null = 尚无工序级起点（新单从第一道工序起 / 未接 5号位交付）。
+    /// </summary>
+    public string? StartOperationCode { get; init; }
 
     /// <summary>
     /// 净产出数量
@@ -61,6 +68,12 @@ public sealed class LogicalProductionDemand
     /// 计划加工数量
     /// </summary>
     public decimal PlannedProcessQty { get; init; }
+
+    /// <summary>
+    /// 数量单位（P1-08 方案a）：来自需求侧订单 Order.UOM，2号位装载时透传；
+    /// 1号位 FinalTaskDraft.UOM 据此原样回填，2号位落盘不再反查订单补 UOM。null = 无单位来源（旧订单/无 Order 场景）。
+    /// </summary>
+    public string? UOM { get; init; }
 
     /// <summary>
     /// 下游要求的可用时间
@@ -82,4 +95,24 @@ public sealed class LogicalProductionDemand
     /// 是否未定位（PI Position为UNLOCATED）
     /// </summary>
     public bool IsUnlocated { get; init; }
+
+    /// <summary>
+    /// 软偏好资源（P1-11）：上一 ACTIVE Task 的 ResourceId。非硬锁——1号位在合法资源集内优先尝试，
+    /// 不满足则回落其它合法资源；硬锁走 ExecutionConstraint。null = 无上一 ACTIVE 资源偏好（自由/新单）。
+    /// </summary>
+    public int? PreferredResourceId { get; init; }
+
+    /// <summary>
+    /// 备选软偏好资源（P1-11）：PreferredResourceId 不可用时的次优偏好。null = 无。
+    /// </summary>
+    public int? FallbackResourceId { get; init; }
+
+    /// <summary>
+    /// 是否连续份额（跨版本连续性的输入标记）。
+    /// true        = 逐工单连续份额（B类 已有APS Task连续 / C类 无TaskNo外部MES连续），
+    ///               1号位 Solver 走「不拆合(P0-07) + 连续先行/单活跃资源(P0-08)」语义；
+    /// false/缺省  = 普通自由需求（A类硬约束 / D类自由），行为不变。
+    /// 连续份额的身份（旧TaskNo / 旧MES工单）复用 LogicalDemandKey 承载，不另设 ContinuationKey 字段。
+    /// </summary>
+    public bool IsContinuation { get; init; }
 }

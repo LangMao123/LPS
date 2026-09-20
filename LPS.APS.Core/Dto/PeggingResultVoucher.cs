@@ -83,6 +83,12 @@ public class PeggingResult
     public List<LogicalProductionDemand> LogicalProductionDemands { get; set; } = new();
 
     /// <summary>
+    /// 多层 BOM「任务喂任务」血缘输入（PM 2026-09-10 裁决 R2）：父需求 → 子需求运行时关系。
+    /// PeggingLoop 遍历 BOM 时产出，随 LogicalProductionDemands 一起透传 1号位。
+    /// </summary>
+    public List<MaterialRequirementLink> MaterialRequirementLinks { get; set; } = new();
+
+    /// <summary>
     /// 生成的 TaskDraft 列表（待1号位排程，SourceType = NEW_REQUIREMENT 的供给对应此列表）
     /// V1.2：已废弃，使用LogicalProductionDemands代替
     /// </summary>
@@ -141,6 +147,12 @@ public class SupplyAllocationItem
     /// 需求键（用于AllocationLineage关联LogicalProductionDemand）
     /// </summary>
     public string DemandKey { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 该分配对应的需求节点总需求量（DemandBalance.RequiredQty）。
+    /// 同一 DemandKey 被多笔供给拆分覆盖时，多行会重复该值；真实覆盖量以 AllocatedQuantity 为准。
+    /// </summary>
+    public decimal DemandQuantity { get; set; }
 
     public int SupplyMaterialId { get; set; }
     public long? SupplySourceId { get; set; }

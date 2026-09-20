@@ -181,6 +181,24 @@ public class BOMResultPullService : IBOMResultPullService
         }
     }
 
+    /// <inheritdoc />
+    public async Task<BOMIntakeResult> IntakeLatestReadyBatchAsync(IReadOnlyList<int> planVersionIds, CancellationToken cancellationToken = default)
+    {
+        var batchNo = await FindReadyBatchAsync(cancellationToken);
+
+        if (batchNo == null)
+        {
+            _logger.LogWarning("独立接货：未找到 READY 状态的 BOM 批次，跳过接货");
+            return new BOMIntakeResult { BatchNo = null, PulledCount = 0 };
+        }
+
+        _logger.LogInformation("独立接货：定位到 READY 批次 BatchNo={BatchNo}，开始接货", batchNo);
+        var pulledCount = await PullBOMResultFromODSAsync(batchNo, planVersionIds, cancellationToken);
+        _logger.LogInformation("独立接货完成: BatchNo={BatchNo}, 行数={PulledCount}", batchNo, pulledCount);
+
+        return new BOMIntakeResult { BatchNo = batchNo, PulledCount = pulledCount };
+    }
+
     /// <summary>
     /// 拉取 StageDetail 阶段路径数据到 APS_BOM_STAGE_PATH_RAW（v5.0.7新增，与 APS_BOM_RAW 同批次）
     /// 数据来源：ODS库 MES_APS_BOM_Workset_StageDetail（含 EDGE + ROOT 两类记录）
@@ -373,16 +391,17 @@ public class BOMResultPullService : IBOMResultPullService
             worksetMap.TryGetValue(detail.RequestDetailId, out var workset);
             orderMap.TryGetValue(detail.OrderCanonicalId, out var order);
 
-            string linkStatus;
-            string? errorMessage = null;
-
+            // SKIPPED = 该 Order 未装入本批任一 PlanVersion 的 [Order] 表。
+            // OrderBomRequestLink.PlanVersionId / OrderId 列均 NOT NULL，无法落库；仅计数记日志，不写行。
             if (order == null)
             {
-                linkStatus = "SKIPPED";
-                errorMessage = "Order not loaded into this PlanVersion";
                 skippedCount++;
+                continue;
             }
-            else if (workset?.ResolvedBOMNO != null)
+
+            string linkStatus;
+
+            if (workset?.ResolvedBOMNO != null)
             {
                 linkStatus = "RESOLVED";
                 resolvedCount++;
@@ -394,9 +413,9 @@ public class BOMResultPullService : IBOMResultPullService
             }
 
             dataTable.Rows.Add(
-                order != null ? (object)(long)order.PlanVersionId : DBNull.Value,
+                (long)order.PlanVersionId,
                 batchNo,
-                order != null ? (object)order.OrderId : DBNull.Value,
+                order.OrderId,
                 detail.OrderCanonicalId,
                 (object?)detail.OrderNo ?? DBNull.Value,
                 (object?)detail.SourceSystem ?? DBNull.Value,
@@ -406,11 +425,15 @@ public class BOMResultPullService : IBOMResultPullService
                 (object?)workset?.ResolvedBOMNO ?? DBNull.Value,
                 workset?.RepWorksetId != null ? (object)workset.RepWorksetId : DBNull.Value,
                 linkStatus,
-                (object?)errorMessage ?? DBNull.Value,
+                DBNull.Value,   // ErrorMessage：SKIPPED 已不落库，其余行无错误
                 now);
         }
 
-        await _connectionManager.BulkInsertAsync(dataTable, "OrderBomRequestLink", DatabaseId.APS);
+        // 全部 SKIPPED（无任何 Order 命中本批 PlanVersion）时表为空，跳过写入以避免空 DataTable 的 BulkCopy 边界。
+        if (dataTable.Rows.Count > 0)
+        {
+            await _connectionManager.BulkInsertAsync(dataTable, "OrderBomRequestLink", DatabaseId.APS);
+        }
 
         _logger.LogInformation(
             "OrderBomRequestLink生成完成: BatchNo={BatchNo}, 总数={Total}, RESOLVED={Resolved}, NO_BOM={NoBom}, SKIPPED={Skipped}",

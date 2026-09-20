@@ -29,7 +29,7 @@ public class GovernanceVersionCrudTests
             _paramRepo.Object,
             Mock.Of<IStrategyProfileRepository>(),
             Mock.Of<IStrategyProfileVersionRepository>(),
-            Mock.Of<IGovernanceAuditLogRepository>());
+            Mock.Of<IAuditLogRepository>());
     }
 
     // ==================== P0-02：CRUD 状态机绕过测试 ====================

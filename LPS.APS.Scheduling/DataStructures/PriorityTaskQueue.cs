@@ -3,7 +3,12 @@ namespace LPS.APS.Scheduling.DataStructures;
 /// <summary>
 /// 优先级任务队列
 /// 按优先级降序排列，支持换型优化时的局部微调
-/// 【1号位核心数据结构】
+///
+/// 【遗留死代码】本类仅被 FiniteCapacitySolver 的死代码方法 Solve()（BuildPriorityQueue）和
+/// Reschedule() 使用（见 FiniteCapacitySolver.cs 头注释）。
+/// 生产五阶段流程（SolveAsync → Phase1-5）不经过本类：Phase2 主循环按 CrossMaterialOrder 分层遍历，
+/// 不再使用基于 Priority 的优先级队列。
+/// 保留本类仅为历史参考，请勿据此判断生产排程顺序。
 /// </summary>
 /// <typeparam name="T">任务类型</typeparam>
 public class PriorityTaskQueue<T>

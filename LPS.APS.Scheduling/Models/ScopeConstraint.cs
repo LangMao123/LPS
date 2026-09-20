@@ -3,6 +3,11 @@ namespace LPS.APS.Scheduling.Models;
 /// <summary>
 /// 局部重排范围约束（对应文档二 LOCAL_RESCHEDULE 模式的 ScopeJson）
 /// 定义哪些资源可调度、哪些Task必须冻结、哪些Task可移动
+///
+/// 【遗留死代码】本类仅被 FiniteCapacitySolver 的死代码方法 Reschedule() 使用（见 FiniteCapacitySolver.cs 头注释）。
+/// 生产五阶段流程（SolveAsync → Phase1-5）的局部修复由 PhaseFourLocalRepair 完成，
+/// 它用 PhaseOneConstraintBuilder 产出的 LockedTaskConstraint 来识别不可移动任务，而非本类。
+/// 保留本类仅为历史参考，请勿据此判断生产局部修复的冻结/可移动判定口径。
 /// </summary>
 public class ScopeConstraint
 {

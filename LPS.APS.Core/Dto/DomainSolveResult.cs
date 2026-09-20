@@ -42,6 +42,13 @@ public sealed class FinalTaskDraft
     public int FactoryId { get; init; }
     public string StageCode { get; init; } = string.Empty;
     public string OperationCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 工序顺序号。DAG 路由（RoutingOperation/RoutingDependency v5.0）已废弃线性 OperationSeq，无客观"顺序号"；
+    /// 排程顺序由 RoutingDependency 承载，与本字段无关。默认 0（落库 Task.OperationSeq=0 列兼容），
+    /// 1号位可选透传 MES 源工序号，不强制填。
+    /// </summary>
+    public int OperationSeq { get; init; }
     public string TaskType { get; init; } = "NEW_REQUIREMENT";
     public int ResourceId { get; init; }
     public string ResourceCode { get; init; } = string.Empty;

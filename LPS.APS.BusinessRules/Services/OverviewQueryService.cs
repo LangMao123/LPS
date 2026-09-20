@@ -23,9 +23,10 @@ public class OverviewQueryService
     /// </summary>
     public async Task<OverviewActivePlanDto?> GetActivePlanAsync(
         string? domainKey = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedDomains = null)
     {
-        return await _repository.GetActivePlanAsync(domainKey, ct);
+        return await _repository.GetActivePlanAsync(domainKey, ct, allowedDomains);
     }
 
     /// <summary>

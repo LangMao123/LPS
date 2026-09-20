@@ -5,7 +5,12 @@ namespace LPS.APS.Scheduling.Algorithms;
 /// <summary>
 /// 时间线段树（Interval Tree）
 /// 用于极速检索设备日历中的空闲时间槽，支持 O(log n + k) 查询
-/// 【1号位核心数据结构】
+///
+/// 【遗留死代码】本类仅被 TimeSlotFinder.FindForwardSlot 使用（Line 198 `tree.BuildFrom`），
+/// 而 TimeSlotFinder 本身是死代码（见 TimeSlotFinder.cs 头注释）。
+/// 生产五阶段流程中的正排寻址（Phase2/Phase4 各自的 FindForwardSlot 副本）使用各自内联的
+/// 线性间隙扫描（occupiedSlots.OrderBy(...)），并不复用本类。
+/// 保留本类仅为历史参考，请勿据此判断生产寻址性能/行为。
 /// </summary>
 public class IntervalTree
 {

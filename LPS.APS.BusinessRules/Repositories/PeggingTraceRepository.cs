@@ -26,7 +26,8 @@ public class PeggingTraceRepository : IPeggingTraceRepository
         string? supplyDocumentNo = null,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         var sql = @"
 SELECT
@@ -68,6 +69,7 @@ WHERE PlanVersionId = @PlanVersionId
     AND (@CommitmentStatus IS NULL OR CommitmentStatus = @CommitmentStatus)
     AND (@OrderNo IS NULL OR RootOrderNo LIKE '%' + @OrderNo + '%' OR CurrentOrderNo LIKE '%' + @OrderNo + '%')
     AND (@SupplyDocumentNo IS NULL OR SupplyDocumentNo LIKE '%' + @SupplyDocumentNo + '%')
+    AND (@AllowedFactories IS NULL OR DemandFactoryCode IN @AllowedFactories)
 ORDER BY AllocationSequence
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -79,6 +81,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             CommitmentStatus = commitmentStatus,
             OrderNo = orderNo,
             SupplyDocumentNo = supplyDocumentNo,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };

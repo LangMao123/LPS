@@ -44,6 +44,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     private long _testStrategyProfileVersionId;
     private long _testRuleSetVersionId;
     private long _testParameterSetVersionId;
+    private int _testActorUserId;
     private readonly string _uniqueSuffix;
     private readonly DateTime _now;
 
@@ -78,7 +79,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     }
 
     /// <summary>构造审计仓储（Auth 库 EF Core；库不可达时构造成功、首次写入时失败→测试 Skip 条件先行探测）</summary>
-    private static GovernanceAuditLogRepository CreateAuditRepository(ILoggerFactory loggerFactory)
+    private static AuditLogRepository CreateAuditRepository(ILoggerFactory loggerFactory)
     {
         var configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -90,16 +91,14 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         var options = new DbContextOptionsBuilder<AuthDbContext>()
             .UseSqlServer(authConn)
             .Options;
-        return new GovernanceAuditLogRepository(
-            new AuthDbContext(options),
-            loggerFactory.CreateLogger<GovernanceAuditLogRepository>());
+        return new AuditLogRepository(new AuthDbContext(options));
     }
 
     [SkippableFact]
     public async Task 发布闭环_规则集参数集策略包全链路_校验发布解析追溯()
     {
-        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasGovernanceAuditLogTable(),
-            "测试环境缺 APS_Auth 库、ContentSnapshotJson 列或 GovernanceAuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
+        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasAuditLogTable(),
+            "测试环境缺 APS_Auth 库、ContentSnapshotJson 列或 AuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
 
         await SetupBaseVersionsAsync();
 
@@ -110,13 +109,13 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         paramSetValidation.IsValid.Should().BeTrue();
 
         // 发布：规则集/参数集 DRAFT → PUBLISHED（策略包引用版本须先 PUBLISHED 才能通过 REF_NOT_PUBLISHED，P0-06）
-        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
-        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest");
+        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
+        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest", _testActorUserId);
 
         // 策略包：引用已 PUBLISHED → 校验通过 → 发布
         var spvValidation = await _service.ValidateStrategyProfileVersionForPublishAsync(_testStrategyProfileVersionId);
         spvValidation.IsValid.Should().BeTrue();
-        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest");
+        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
 
         var publishedRuleSet = await _ruleSetVersionRepo.GetByIdAsync(_testRuleSetVersionId);
         publishedRuleSet!.Status.Should().Be("PUBLISHED");
@@ -163,7 +162,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         var validation = await _service.ValidateRuleSetVersionForPublishAsync(_testRuleSetVersionId);
         validation.IsValid.Should().BeFalse();
 
-        var act = async () => await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
+        var act = async () => await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
         await act.Should().ThrowAsync<InvalidOperationException>()
             .WithMessage("*发布前校验失败*");
 
@@ -210,8 +209,8 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     {
         // P1-01 方案 A 真实持久化端到端链（ContentSnapshotJson 唯一内容真相）：
         // Create → Reload → Update → Validate → Publish → Reload → Snapshot 六块值 → 历史重放
-        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasGovernanceAuditLogTable(),
-            "测试库缺 APS_Auth 库、ContentSnapshotJson 列或 GovernanceAuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
+        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasAuditLogTable(),
+            "测试库缺 APS_Auth 库、ContentSnapshotJson 列或 AuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
 
         await SetupBaseVersionsAsync();
 
@@ -265,12 +264,12 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         (await _service.ValidateParameterSetVersionForPublishAsync(_testParameterSetVersionId)).IsValid.Should().BeTrue();
 
         // ④ Publish 规则集 + 参数集（DRAFT → PUBLISHED）
-        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
-        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest");
+        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
+        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest", _testActorUserId);
 
         // ⑤ Validate + Publish 策略包（引用已 PUBLISHED → 校验通过；P0-06 正式发布强制校验）
         (await _service.ValidateStrategyProfileVersionForPublishAsync(_testStrategyProfileVersionId)).IsValid.Should().BeTrue();
-        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest");
+        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
 
         // ⑥ Reload 验证 PUBLISHED
         var pubRuleSet = await _ruleSetVersionRepo.GetByIdAsync(_testRuleSetVersionId);
@@ -314,6 +313,13 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     /// <summary>创建 RuleSet/ParameterSet/StrategyProfile 父记录 + 三版本（均 DRAFT），互相引用合法 JSON</summary>
     private async Task SetupBaseVersionsAsync()
     {
+        // 审计操作者：dbo.[User]（Auth 库）须存在对应 Id，否则 AuditLog.UserId 外键（FK__AuditLog__UserId）插入冲突。
+        // User.Id 为 IDENTITY(1,1) 不自增显式指定，取 SCOPE_IDENTITY() 作为本测试操作者 actorUserId（替换原硬编码 1001）。
+        _testActorUserId = await _cm.QueryFirstOrDefaultAsync<int>(
+            "INSERT INTO dbo.[User] (LoginName, DisplayName, PasswordHash) VALUES (@Login, @Display, @Pwd); SELECT CAST(SCOPE_IDENTITY() AS INT);",
+            new { Login = $"TEST-USER-{_uniqueSuffix}", Display = "集成测试操作者", Pwd = "integration-test-hash" },
+            db: DatabaseId.Auth);
+
         // 父表：RuleSet
         _testRuleSetId = await _cm.QueryFirstOrDefaultAsync<long>(
             "INSERT INTO [dbo].[RuleSet] ([RuleSetCode], [RuleSetName], [Description], [IsActive], [CreatedAt], [CreatedBy]) VALUES (@Code, @Name, @Description, 1, @CreatedAt, @CreatedBy); SELECT CAST(SCOPE_IDENTITY() AS BIGINT);",

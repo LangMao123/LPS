@@ -623,30 +623,31 @@ public class RealSchedulingIntegrationTest
 
         Console.WriteLine($"  PeggingSupplyAllocation记录数: {allocations.Count}");
 
-        // v5.1.2: PeggingSupplyAllocation INSERT暂时注释，记录数为0是预期的
+        // 若无非 Task 直接供给（如库存工厂不匹配导致全转生产），PSA 可为 0，此时不阻塞主流程
         if (allocations.Count == 0)
         {
-            Console.WriteLine("  ⚠ PeggingSupplyAllocation暂无数据（INSERT已注释，待表结构对齐后恢复）");
+            Console.WriteLine("  ⚠ PeggingSupplyAllocation本轮无非 Task 供给（全转生产），记录数为 0");
             return;
         }
 
-        // 验证AllocationSequence连续性
+        // AllocationSequence 为跨 PSA/ATS 共享的全局单调计数器，PSA 侧允许跳号，只断言唯一且为正
         var sequences = allocations.Select(a => (int)a.AllocationSequence).ToList();
-        for (int i = 0; i < sequences.Count; i++)
+        if (sequences.Distinct().Count() != sequences.Count)
         {
-            if (sequences[i] != i + 1)
-            {
-                throw new Exception($"AllocationSequence不连续！期望{i + 1}，实际{sequences[i]}");
-            }
+            throw new Exception("AllocationSequence存在重复！");
+        }
+        if (sequences.Any(s => s <= 0))
+        {
+            throw new Exception("AllocationSequence存在非正数！");
         }
 
-        Console.WriteLine($"  ✓ AllocationSequence连续: 1 ~ {sequences.Count}");
+        Console.WriteLine($"  ✓ AllocationSequence唯一且为正: {sequences.Count} 条");
 
         foreach (var alloc in allocations)
         {
             Console.WriteLine($"  - Seq: {alloc.AllocationSequence}, " +
                             $"MaterialId: {alloc.MaterialId}, Qty: {alloc.AllocatedQty}, " +
-                            $"SupplyType: {alloc.SupplyType}, BomLevel: {alloc.BomLevel}");
+                            $"SupplyType: {alloc.SupplyType}");
 
             // 验证必填字段
             if (alloc.AllocatedQty <= 0) throw new Exception($"AllocatedQty无效: {alloc.AllocatedQty}");
@@ -720,7 +721,7 @@ public class RealSchedulingIntegrationTest
         Console.WriteLine("  重新执行排程流程...");
         await _schedulingOrchestrator.RunSchedulingAsync(
             _actualPlanVersionId,
-            1L, // 联调：Fixture 忽略该版本号，仅需非空以通过策略上下文完整性校验
+            251L, // 与首次一致：真实策略包 SP-DEMO-V2.0，保证幂等基线与首跑同源
             CancellationToken.None);
 
         // 第二次运行后的记录数

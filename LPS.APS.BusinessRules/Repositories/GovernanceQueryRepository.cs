@@ -58,7 +58,8 @@ ORDER BY Id DESC";
     public async Task<List<DomainDependencyDto>> QueryDomainDependenciesAsync(
         string? domainCode = null,
         string? direction = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedDomains = null)
     {
         string sql;
 
@@ -74,6 +75,7 @@ SELECT
     ScannedAt
 FROM Domain_Dependency
 WHERE DownstreamDomainCode = @DomainCode
+    AND (@AllowedDomains IS NULL OR DownstreamDomainCode IN @AllowedDomains)
 ORDER BY UpstreamDomainCode";
         }
         else if (direction == "downstream")
@@ -88,6 +90,7 @@ SELECT
     ScannedAt
 FROM Domain_Dependency
 WHERE UpstreamDomainCode = @DomainCode
+    AND (@AllowedDomains IS NULL OR UpstreamDomainCode IN @AllowedDomains)
 ORDER BY DownstreamDomainCode";
         }
         else
@@ -105,12 +108,16 @@ WHERE 1=1
     AND (@DomainCode IS NULL
          OR UpstreamDomainCode = @DomainCode
          OR DownstreamDomainCode = @DomainCode)
+    AND (@AllowedDomains IS NULL
+         OR UpstreamDomainCode IN @AllowedDomains
+         OR DownstreamDomainCode IN @AllowedDomains)
 ORDER BY UpstreamDomainCode, DownstreamDomainCode";
         }
 
         var parameters = new
         {
-            DomainCode = domainCode
+            DomainCode = domainCode,
+            AllowedDomains = allowedDomains
         };
 
         var results = await _connectionManager.QueryAsync<DomainDependencyDto>(

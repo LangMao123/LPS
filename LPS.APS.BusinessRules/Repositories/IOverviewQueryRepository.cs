@@ -12,7 +12,8 @@ public interface IOverviewQueryRepository
     /// </summary>
     Task<OverviewActivePlanDto?> GetActivePlanAsync(
         string? domainKey = null,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedDomains = null);
 
     /// <summary>
     /// 查询任务状态摘要

@@ -26,7 +26,8 @@ public class SupplyFactTraceRepository : ISupplyFactTraceRepository
         bool activeOnly = true,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         var sql = @"
 SELECT
@@ -57,6 +58,7 @@ WHERE 1=1
     AND (@FactoryCode IS NULL OR FactoryCode = @FactoryCode)
     AND (@SupplyType IS NULL OR SupplyType = @SupplyType)
     AND (@SourceDocumentNo IS NULL OR SourceDocumentNo = @SourceDocumentNo)
+    AND (@AllowedFactories IS NULL OR FactoryCode IN @AllowedFactories)
 ORDER BY SyncedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -68,6 +70,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             FactoryCode = factoryCode,
             SupplyType = supplyType,
             SourceDocumentNo = sourceDocumentNo,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };
@@ -87,7 +90,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         bool activeOnly = true,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         // 从APS包装视图读取Received事实
         var sql = @"
@@ -119,6 +123,7 @@ WHERE 1=1
     AND (@FactoryCode IS NULL OR FactoryCode = @FactoryCode)
     AND (@DocumentType IS NULL OR DocumentType = @DocumentType)
     AND (@DocumentNo IS NULL OR DocumentNo = @DocumentNo)
+    AND (@AllowedFactories IS NULL OR FactoryCode IN @AllowedFactories)
 ORDER BY LastReceivedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -130,6 +135,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             FactoryCode = factoryCode,
             DocumentType = documentType,
             DocumentNo = documentNo,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };
@@ -150,7 +156,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         bool activeOnly = true,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         var allFacts = new List<SupplyFactTraceDto>();
 
@@ -159,7 +166,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var pipelineFacts = await QueryPipelineAsync(
                 materialCode, materialId, factoryCode, supplyType, sourceDocumentNo,
-                activeOnly, take: take, ct: ct);
+                activeOnly, take: take, ct: ct, allowedFactories: allowedFactories);
             allFacts.AddRange(pipelineFacts);
         }
 
@@ -180,7 +187,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
             var receivedFacts = await QueryReceivedAsync(
                 materialCode, materialId, factoryCode, documentType, sourceDocumentNo,
-                activeOnly, take: take, ct: ct);
+                activeOnly, take: take, ct: ct, allowedFactories: allowedFactories);
             allFacts.AddRange(receivedFacts);
         }
 

@@ -21,6 +21,7 @@ public sealed class FrozenStrategySnapshot
     public ProcurementBlock Procurement { get; set; } = new();          // ④ 采购/良率参数（含 PlanningYield，C2-5）
     public SolverStrategyBlock SolverStrategy { get; set; } = new();    // ⑤ Solver 策略
     public CandidateGuardrailBlock CandidateGuardrail { get; set; } = new(); // ⑥ Candidate 技术 Guardrail
+    public List<SetupTransitionRuleSnapshot> SetupTransitionRules { get; set; } = []; // ⑦ 产品转换换型规则本 Run 冻结内容（v1.2 §九/§十；0号位 裁决项2）
 }
 
 /// <summary>
@@ -191,11 +192,21 @@ public sealed class PlanningYieldRule
 public sealed class SolverStrategyBlock
 {
     public SolverStrategyMode Mode { get; set; }          // FORWARD / BACKWARD / MIXED（冻结 E1）
-    public DynamicBottleneckMode BottleneckMode { get; set; }
+    public bool AllowMerge { get; set; } = false;         // 是否允许合批（1号位 PhaseTwoInitialScheduler.cs:158 消费；3号位 2026-09-04 补源）
+    public DynamicBottleneckMode BottleneckMode { get; set; }   // 选「哪个资源当瓶颈锚点」的枚举（Auto/PreferAnchor/ForceAnchor/NotAnchor）
+    public string? AnchorResourceCode { get; set; }        // 锚点资源编码（业务编码，非 int ResourceId）；BottleneckMode=PreferAnchor/ForceAnchor/NotAnchor 时生效，Auto 忽略；空=未指定→等价 Auto。P1-02 归 3号位 冻结、2号位 传入、1号位 消费
     public OnTimeTargetParams OnTimeTarget { get; set; } = new();
     public SplitParams Split { get; set; } = new();
     public SetupParams Setup { get; set; } = new();
     public StageOverlapParams StageOverlap { get; set; } = new();
+
+    // P1-02 补充（2026-09-14，2号位 出字段 / 3号位 冻结参数值 / 1号位 换读）：
+    // BottleneckMode 只定「选哪个锚点」，不覆盖「利用率超多少判瓶颈」的百分比阈值——这是两个可调旋钮。
+    // 0.85 判瓶颈资源（1号位 PhaseThreeDiagnostics.cs:92，填 BottleneckResourceIds，影响展示）；
+    // 0.90 判延期根因 RESOURCE_CAPACITY_SHORTAGE（PhaseThreeDiagnostics.cs:170，影响产能短缺责任归属）。
+    // 拆两个独立阈值（目标不同、可单独调）。归 3号位 冻结。
+    public decimal BottleneckUtilizationThreshold { get; set; } = 0.85m;           // 利用率 > 此值 → 判瓶颈资源
+    public decimal CapacityShortageUtilizationThreshold { get; set; } = 0.90m;     // 利用率 > 此值 → 判延期根因产能短缺
 }
 
 public enum SolverStrategyMode { Forward, Backward, Mixed }
@@ -212,15 +223,21 @@ public sealed class SplitParams
 {
     public int MaxOptimizationSplitCount { get; set; } = 3;   // 如 3（清单 31）
     public bool LimitMandatorySplit { get; set; }
-    public decimal MinBatchQty { get; set; }                  // 不限无限拆分
+    public decimal MinBatchQty { get; set; } = 0.1m;          // 拆分下限（每批最小数量）；P1-02 由 0→0.1
 }
 
 public sealed class SetupParams
 {
-    /// <summary>冻结换型维度：Mold / Tool / Material / Color（清单 32；不做全局 TSP 权重矩阵平台）</summary>
-    public IReadOnlyList<string> Dimensions { get; set; } = [];
+    // 2026-09-16 v1.2 废止属性式换型维度（Mold/Tool/Material/Color，原 Dimensions 字段）：
+    // 换型规则改走 RuleSetVersion 的 SetupTransitionRule（EXACT/DEFAULT），本块不再承载换型维度。
+    // 以下两个算法数值后续随 §六.1 契约对齐迁移到 ParameterSetVersion，暂留以保编译。
     public double DefaultSetupMinutes { get; set; } = 30;
     public int SetupLookAheadSize { get; set; } = 5;
+
+    // 三预算参数（2026-09-20 1号位 提值，3号位 落 ParameterSetVersion 治理槽位）：
+    // 均为「次数」量纲，非毫秒——保证输入+同种子 → 同搜索轨迹 → 结果可重放（审计/回归依赖确定性）。
+    public int SetupSearchBudget { get; set; } = 500;              // 有界搜索预算：单「可移动段」邻域算子总尝试次数上限，允许范围 [100, 5000]
+    public int SetupMaxNeighborhoodTries { get; set; } = 50;       // 最大邻域尝试次数：连续无改善（Level 3 目标未下降）上限，活跃改善即清零重计，允许范围 [10, 500]
 }
 
 public sealed class StageOverlapParams
@@ -244,4 +261,23 @@ public sealed class CandidateGuardrailBlock
     public int SplitAlternatives { get; set; } = 3;
     /// <summary>红线（清单 35）：MaxImpactedOrders 超阈值仅 Warning + 人工确认，不得停止传播返回伪可行结果</summary>
     public bool WarnOnlyOnMaxImpacted { get; set; } = true;
+}
+
+/// <summary>
+/// ⑦ 产品转换换型规则快照（SetupTransitionRuleSnapshot）——本 Run 冻结内容（v1.2 §九/§十）
+/// 由 2号位 从 RuleSetVersion 已发布的 SetupTransitionRule 投影填充（3号位 出字段，2号位 接投影）；
+/// 2号位 按 Domain（ProductionDepartmentId + StageCode）裁剪建内存索引，1号位 DomainSolveRequest 消费。
+/// 仅业务键 + 分钟 + 类型，不含审计字段（Id/Created/Updated/IsActive——装载时只取有效规则）。
+/// 红线：Solver 不得运行中逐 Task 查 3号位规则库（0号位 裁决项2）。
+/// </summary>
+public sealed class SetupTransitionRuleSnapshot
+{
+    public int ProductionDepartmentId { get; set; }         // 生产部门（业务范围）
+    public string StageCode { get; set; } = "";              // 大工艺阶段码
+    public string OperationCode { get; set; } = "";          // 当前小工序
+    public int ResourceId { get; set; }                      // 当前设备
+    public int? FromMaterialId { get; set; }                 // 前产品（EXACT 明确；DEFAULT 为 null）
+    public int? ToMaterialId { get; set; }                   // 后产品（EXACT 明确；DEFAULT 为 null）
+    public string RuleType { get; set; } = "DEFAULT";       // "EXACT" / "DEFAULT"（v1.2 §九）
+    public decimal SetupMinutes { get; set; }                // 换型分钟（真实资源占用，非负）
 }

@@ -146,6 +146,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 MaterialCode,
                 BOMNO,
                 FactoryCode,
+                SourceWarehouseProcessCode,
                 Quantity,
                 UOM,
                 DueDate,
@@ -205,6 +206,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
         dataTable.Columns.Add("OrderType", typeof(string));
         dataTable.Columns.Add("MaterialCode", typeof(string));
         dataTable.Columns.Add("FactoryCode", typeof(string));
+        dataTable.Columns.Add("SourceWarehouseProcessCode", typeof(string));
         dataTable.Columns.Add("Quantity", typeof(decimal));
         dataTable.Columns.Add("UOM", typeof(string));
         dataTable.Columns.Add("DueDate", typeof(DateTime));
@@ -237,6 +239,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 order.OrderType,
                 order.MaterialCode,
                 order.FactoryCode,
+                order.SourceWarehouseProcessCode,
                 order.Quantity,
                 order.UOM,
                 order.DueDate,

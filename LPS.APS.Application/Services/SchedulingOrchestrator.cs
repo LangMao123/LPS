@@ -298,6 +298,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             await _connectionManager.ExecuteAsync(
                 @"DELETE FROM PeggingSupplyAllocation WHERE PlanVersionId = @Id;
                   DELETE FROM [Pegging]               WHERE PlanVersionId = @Id;
+                  DELETE FROM AllocationTaskShare     WHERE PlanVersionId = @Id;
                   DELETE FROM [Task]                  WHERE PlanVersionId = @Id;",
                 new { Id = planVersionId },
                 db: DatabaseId.APS);
@@ -309,6 +310,9 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             var contextStopwatch = System.Diagnostics.Stopwatch.StartNew();
             var context = await LoadSchedulingContextAsync(planVersion, scheduleRunId, cancellationToken);
             context.StrategyProfileVersionId = strategyProfileVersionId;
+            // P0-03：DataCutoffTime 是本 Run 冻结事实时点（ScheduleRun.DataCutoffTime），落到 context 供下游
+            // Pegging 供给快照 + DomainSolveRequest.DataCutoffTime 使用；手动入口为 null 时下游回退 Now。
+            context.DataCutoffTime = dataCutoffTime;
             if (strategyProfileVersionId.HasValue)
                 await LoadStrategyConfigAsync(context, strategyProfileVersionId.Value, cancellationToken);
             contextStopwatch.Stop();
@@ -327,7 +331,22 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 "SELECT Id FROM [Order] WHERE PlanVersionId = @PlanVersionId",
                 new { PlanVersionId = demandSourcePlanVersionId },
                 db: DatabaseId.APS)).ToList();
-            var peggingRequest = BuildPeggingRequest(planVersionId, planVersion.DomainKey, allOrderIds, context, upstreamResourceBlocks);
+
+            // P0-04：Candidate 判定 = 本次 Run 冻结了 BasePlanVersionId（sourcePlanVersionId != null）。
+            // Candidate 场景装载「其它 Domain 当前 ACTIVE 在共享 Resource 上的占用」作为 ExternalDomainResourceBlocks（§11）。
+            var isCandidate = sourcePlanVersionId.HasValue;
+            IReadOnlyList<ResourceBlock>? externalDomainResourceBlocks = null;
+            if (isCandidate)
+            {
+                externalDomainResourceBlocks = await LoadExternalDomainResourceBlocksAsync(
+                    planVersion.DomainKey, context, sourcePlanVersionId!.Value, planVersionId, cancellationToken);
+                _logger.LogInformation(
+                    "[{PlanVersionId}] Candidate 外部 Domain 占用块: {Count} 条", planVersionId, externalDomainResourceBlocks.Count);
+            }
+
+            var peggingRequest = BuildPeggingRequest(
+                planVersionId, planVersion.DomainKey, allOrderIds, context, upstreamResourceBlocks,
+                isCandidate, sourcePlanVersionId, externalDomainResourceBlocks);
             var peggingResults = (await _peggingOrchestrator.ExecuteBatchPeggingWorkflowAsync(
                 peggingRequest, cancellationToken)).ToList();
 
@@ -589,10 +608,16 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 IsAvailable      = true
             });
 
-            // V1 日历：计划期内 7x24 连续可用
+            // 0号位裁决（2026-09-12）：取需求窗口 ≠ 排成窗口（PlanningEnd 非硬墙）。
+            // V1 合成日历即「排成窗口」：末端不再截到 PlanHorizonEnd，而是往后预留排程延伸余量，
+            // 保证正排即使在需求窗口末期（如第90天）接到长周期订单（如300天）也能排到第390天。
+            // 1号位已去掉 Phase2/Phase4 FindForwardSlot 对 planningEnd 的 break/clamp，只认本日历窗口边界，
+            // 故此处延长末端即可放开正排的末期限制；PlanHorizonEnd 仍保留用于「取数截止」（如管线供给 ETA 过滤）。
+            // TODO(配置化)：730 → 待 0号位/3号位 提供「排成窗口天数」策略参数后改读配置。
+            var schedulingWindowEnd = context.PlanHorizonStart.AddDays(730);
             context.ResourceCalendars[resIdStr] = new List<TimeWindow>
             {
-                new TimeWindow(context.PlanHorizonStart, context.PlanHorizonEnd)
+                new TimeWindow(context.PlanHorizonStart, schedulingWindowEnd)
             };
         }
     }
@@ -740,7 +765,10 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         string domainKey,
         List<long> allOrderIds,
         SchedulingContext context,
-        IReadOnlyList<ResourceBlock>? upstreamResourceBlocks)
+        IReadOnlyList<ResourceBlock>? upstreamResourceBlocks,
+        bool isCandidate,
+        int? basePlanVersionId,
+        IReadOnlyList<ResourceBlock>? externalDomainResourceBlocks)
     {
         var now = DateTime.Now;
         var orderIds = allOrderIds;
@@ -750,7 +778,9 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             PlanVersionId     = planVersionId,
             DomainKey         = domainKey,
             OrderIds          = orderIds,
-            SnapshotAt        = now,
+            // P0-03：SnapshotAt（供给快照基准）改用 ScheduleRun 冻结 DataCutoffTime，不再 DateTime.Now；
+            // 手动入口 DataCutoffTime 为 null 时回退 now。
+            SnapshotAt        = context.DataCutoffTime ?? now,
             FrozenWindowStart = now,
             FrozenWindowEnd   = now.AddHours(2),   // §2.3 滑动冻结窗口
             AllowCrossFactory = false,
@@ -763,7 +793,11 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             UpstreamResourceBlocks = upstreamResourceBlocks,
             MaxBomDepth       = 10,
             TimeoutSeconds    = 300,
-            ExecutionMode     = "FULL_RUN",
+            // P0-04：Candidate 模式（sourcePlanVersionId != null）→ CANDIDATE；否则 FULL_RUN。
+            ExecutionMode     = isCandidate ? "CANDIDATE" : "FULL_RUN",
+            IsCandidate       = isCandidate,
+            BasePlanVersionId = basePlanVersionId,
+            ExternalDomainResourceBlocks = externalDomainResourceBlocks,
             SchedulingContext = context  // V1.2：传递完整沙盘上下文供1号位使用
         };
     }
@@ -794,6 +828,80 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             }
         }
         return blocks;
+    }
+
+    /// <summary>
+    /// P0-04 §11：装载「其它 Domain 当前 ACTIVE 在共享 Resource 上的不可移动占用」作为 Candidate 的 ExternalDomainResourceBlocks。
+    /// 语义与 FULL 的 UpstreamDomainResourceBlocks 不同：这里不看 Quantity-Time，只看已排 Task 的 ResourceId + 起止时间。
+    /// 排除自身候选 PlanVersion（尚未生成终态）与 Base PlanVersion（比较基线，非外部 Domain）。
+    /// </summary>
+    private async Task<IReadOnlyList<ResourceBlock>> LoadExternalDomainResourceBlocksAsync(
+        string currentDomainKey,
+        SchedulingContext context,
+        int basePlanVersionId,
+        int currentPlanVersionId,
+        CancellationToken cancellationToken)
+    {
+        var resourceIds = context.Resources.Select(r => r.ResourceId).Distinct().ToList();
+        if (resourceIds.Count == 0)
+            return Array.Empty<ResourceBlock>();
+
+        // VersionCategory = 'ACTIVE' 为身份口径（D7 词表：身份看 VersionCategory），Status 只表达执行进度。
+        var rows = await _connectionManager.QueryAsync<ExternalDomainBlockRow>(
+            @"SELECT t.ResourceId, t.PlannedStartTime, t.PlannedEndTime, pv.DomainKey, pv.Id AS SourcePlanVersionId
+              FROM [Task] t
+              JOIN PlanVersion pv ON pv.Id = t.PlanVersionId
+              WHERE pv.VersionCategory = 'ACTIVE'
+                AND pv.Id NOT IN (@CurrentPlanVersionId, @BasePlanVersionId)
+                AND pv.DomainKey <> @CurrentDomainKey
+                AND t.ResourceId IN @ResourceIds
+                AND t.PlannedStartTime IS NOT NULL
+                AND t.PlannedEndTime IS NOT NULL",
+            new
+            {
+                CurrentPlanVersionId = currentPlanVersionId,
+                BasePlanVersionId    = basePlanVersionId,
+                CurrentDomainKey     = currentDomainKey,
+                ResourceIds          = resourceIds,
+            },
+            db: DatabaseId.APS);
+
+        // D8/R17/T18 双保险：SQL WHERE 已排除本域/自身版本/基线版本，此处再以纯函数兜底过滤，
+        // 保证「同TaskNo/本域旧块」在任何情况下都不作为外部 ResourceBlock 阻挡自己（供 T18 单测覆盖）。
+        return rows
+            .Where(r => !IsSelfOrBaselineExternalBlock(
+                r.DomainKey,
+                r.SourcePlanVersionId,
+                currentDomainKey,
+                currentPlanVersionId,
+                basePlanVersionId))
+            .Select(r => new ResourceBlock
+            {
+                ResourceId          = r.ResourceId,
+                StartTime           = r.PlannedStartTime,
+                EndTime             = r.PlannedEndTime,
+                Reason              = "EXTERNAL_DOMAIN_ACTIVE",
+                SourceDomainKey     = r.DomainKey,
+                SourcePlanVersionId = r.SourcePlanVersionId,
+                Immutable           = true,
+            })
+            .ToList();
+    }
+
+    /// <summary>
+    /// D8/R17/T18（同TaskNo自阻挡）：判定某外部 ACTIVE 块是否为「本域 / 自身版本 / 基线版本」旧块。
+    /// 三类必须从 ExternalDomainResourceBlocks 排除——本域旧块应走锚点（ExecutionConstraint）而非外部阻挡，
+    /// 自身/基线版本是当前求解与比较基线、非外部域。返回 true = 排除（不得作为外部块）。
+    /// </summary>
+    internal static bool IsSelfOrBaselineExternalBlock(
+        string blockDomainKey, int blockSourcePlanVersionId,
+        string currentDomainKey, int currentPlanVersionId, int basePlanVersionId)
+    {
+        if (string.Equals(blockDomainKey, currentDomainKey, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (blockSourcePlanVersionId == currentPlanVersionId || blockSourcePlanVersionId == basePlanVersionId)
+            return true;
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1000,6 +1108,15 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     {
         public string UpstreamDomainCode { get; set; } = string.Empty;
         public string DownstreamDomainCode { get; set; } = string.Empty;
+    }
+
+    private class ExternalDomainBlockRow
+    {
+        public int ResourceId { get; set; }
+        public DateTime PlannedStartTime { get; set; }
+        public DateTime PlannedEndTime { get; set; }
+        public string DomainKey { get; set; } = string.Empty;
+        public int SourcePlanVersionId { get; set; }
     }
 
     private class MESProgressLoadDto

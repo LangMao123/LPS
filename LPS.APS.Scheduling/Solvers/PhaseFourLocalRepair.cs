@@ -5,7 +5,7 @@ namespace LPS.APS.Scheduling.Solvers;
 
 /// <summary>
 /// Phase 4: 有界局部修复
-/// 文档：《APS_V1_1号位有限产能排程开发实施包_v1.0_20260814.md》§六 Phase 4
+/// 文档：《APS_V1_1号位有限产能排程开发实施包_v1.2_20260906_PI_Position执行起点上下文冻结对齐版.md》§六 Phase 4
 ///
 /// 职责：
 /// - 资源切换（在合格资源列表中尝试其他资源）
@@ -102,8 +102,9 @@ internal class PhaseFourLocalRepair
 
         // 2. 传播Guardrail（文档§十三 13.4）
         // 第8轮P0-02修复：30%是警戒线而非硬截断，修复小规模场景Bug
-        int maxPropagationRounds = 10;
-        decimal maxAffectedRatio = 0.3m; // 30%警戒线
+        // P1-02：轮数/警戒线改读冻结参数（B 组整块透传，零行为变化：默认 10 / 30%）
+        int maxPropagationRounds = request.StrategySnapshot.Parameters.MaxPropagationRounds;
+        decimal maxAffectedRatio = request.StrategySnapshot.Parameters.ImpactedTaskWarningPercent / 100m; // 30%警戒线
         int totalScheduledTasks = scheduleResult.ScheduledTasks.Count;
 
         // 修复小规模场景Bug：至少允许1个任务受影响，避免0阈值导致传播无法进入
@@ -152,11 +153,15 @@ internal class PhaseFourLocalRepair
                 if (task == null) continue;
 
                 // 核心修复：真正重新安排Task位置
+                // P0-02修复：Task占用从Setup开始（与BuildResourceOccupancy口径一致），移除时也要算上Setup
+                var taskSetup = TimeSpan.FromMinutes((double)task.SetupTime);
+                var taskOccupancyStart = task.PlannedStartTime - taskSetup;
+
                 // 1. 从resourceOccupancy中移除当前Task占用
                 if (resourceOccupancy.TryGetValue(task.ResourceId, out var occupiedWindows))
                 {
                     occupiedWindows.RemoveAll(w =>
-                        w.Start == task.PlannedStartTime && w.End == task.PlannedEndTime);
+                        w.Start == taskOccupancyStart && w.End == task.PlannedEndTime);
                 }
 
                 // 2. 计算该Task的工序约束时间窗
@@ -164,7 +169,9 @@ internal class PhaseFourLocalRepair
                     .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
 
                 DateTime earliestStart = task.PlannedStartTime; // 默认保持原位置
-                DateTime latestEnd = task.PlannedEndTime;
+                // P0-02修复：latestEnd 不再默认等于原结束时间（那会人为锁死Task位置），
+                // 改为 DateTime.MaxValue，仅由后继约束（如有）收紧。
+                DateTime latestEnd = DateTime.MaxValue;
 
                 if (demand != null && constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
                 {
@@ -212,36 +219,22 @@ internal class PhaseFourLocalRepair
                     }
                 }
 
-                // 3. 在资源上寻找可用时间窗（简化实现：尝试向前或向后移动）
+                // 3. P0-02修复：用日历感知的 FindForwardSlot 寻找可用时间窗（含Setup占用），
+                // 修复此前朴素 gap 扫描不遵守 Resource Calendar / Setup occupancy 的问题。
                 var duration = task.PlannedEndTime - task.PlannedStartTime;
-                DateTime newStart = earliestStart;
-                DateTime newEnd = earliestStart + duration;
+                var totalDuration = duration + taskSetup;
 
-                // 检查资源占用冲突，尝试找到无冲突的时间段
-                bool foundSlot = false;
-                if (resourceOccupancy.TryGetValue(task.ResourceId, out var windows))
-                {
-                    var sortedWindows = windows.OrderBy(w => w.Start).ToList();
+                var slot = FindForwardSlot(
+                    earliestStart,
+                    totalDuration,
+                    task.ResourceId,
+                    constraints,
+                    resourceOccupancy,
+                    request.PlanningEnd);
 
-                    // 尝试在现有占用窗口之间插入
-                    for (int i = 0; i <= sortedWindows.Count; i++)
-                    {
-                        DateTime slotStart = (i == 0) ? earliestStart : sortedWindows[i - 1].End;
-                        DateTime slotEnd = (i == sortedWindows.Count) ? latestEnd : sortedWindows[i].Start;
-
-                        if (slotStart + duration <= slotEnd && slotStart + duration <= latestEnd)
-                        {
-                            newStart = slotStart;
-                            newEnd = slotStart + duration;
-                            foundSlot = true;
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    foundSlot = true; // 资源空闲
-                }
+                bool foundSlot = slot.HasValue && slot.Value.End <= latestEnd;
+                DateTime newStart = foundSlot ? slot!.Value.Start + taskSetup : task.PlannedStartTime;
+                DateTime newEnd = foundSlot ? slot!.Value.End : task.PlannedEndTime;
 
                 // 4. 如果找到新位置且与原位置不同，创建新FinalTaskDraft替换
                 if (foundSlot && (newStart != task.PlannedStartTime || newEnd != task.PlannedEndTime))
@@ -255,6 +248,7 @@ internal class PhaseFourLocalRepair
                         FactoryId = task.FactoryId,
                         StageCode = task.StageCode,
                         OperationCode = task.OperationCode,
+                        OperationSeq = task.OperationSeq,   // P1-05顺手修复：此前重建漏拷贝 OperationSeq（init-only 默认归零）
                         TaskType = task.TaskType,
                         ResourceId = task.ResourceId,
                         ResourceCode = task.ResourceCode,
@@ -286,7 +280,8 @@ internal class PhaseFourLocalRepair
                     {
                         resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
                     }
-                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(newStart, newEnd));
+                    // P0-02修复：占用窗口含Setup（newStart已是Setup之后的加工开始，需回退Setup）
+                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(newStart - taskSetup, newEnd));
                 }
                 else if (foundSlot)
                 {
@@ -295,7 +290,8 @@ internal class PhaseFourLocalRepair
                     {
                         resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
                     }
-                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+                    // P0-02修复：占用窗口含Setup
+                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(taskOccupancyStart, task.PlannedEndTime));
                 }
 
 
@@ -490,29 +486,17 @@ internal class PhaseFourLocalRepair
         // 4. 第9轮P0-03修复：Fallback兜底 - 调用同一Solver对本Domain全部可移动任务重排
         if (shouldTriggerFallback || affectedTasks.Count > maxAffectedTasks)
         {
-            // 构建Fallback重排请求：保留不可移动约束，重排全部可移动任务
+            // 构建Fallback重排请求：Phase2 Schedule 会重新继承所有 LockedTasks（原地保留不可移动部分）
             var fallbackScheduler = new PhaseTwoInitialScheduler();
-
-            // 重新构建初始排程，此时constraints.LockedTasks已包含所有不可移动任务
-            // ExternalDomainResourceBlocks也已在resourceOccupancy中预填充
             var fallbackResult = fallbackScheduler.Schedule(request, constraints);
 
-            // 第9轮P0-03.2修复：Fallback结果替换语义，不追加到原计划
-            // 从ScheduledTasks中移除所有可移动Task（保留immovableTasks）
-            var immovableScheduledTasks = scheduleResult.ScheduledTasks
-                .Where(t => immovableTasks.Contains(t.FinalDraftId))
-                .ToList();
-
-            // 清空原计划，保留不可移动部分
-            scheduleResult.ScheduledTasks.Clear();
-            scheduleResult.ScheduledTasks.AddRange(immovableScheduledTasks);
-
-            // 用Fallback完整结果替换可移动部分
-            scheduleResult.ScheduledTasks.AddRange(fallbackResult.ScheduledTasks);
-
-            // 将Fallback结果同样体现在RepairResult中（Phase5会合并）
-            result.RepairedTasks.AddRange(fallbackResult.ScheduledTasks);
-            result.StillUnscheduledKeys.AddRange(fallbackResult.UnscheduledDemandKeys);
+            // P0-03修复：Fallback结果直接替换语义，避免同一批Task进入 final set 两次。
+            // fallbackResult.ScheduledTasks 已含 LockedTasks 继承（Phase2 Schedule 内部处理），
+            // 因此无需再手动保留 immovableTasks；result.RepairedTasks 保持为空，
+            // Phase5 只合并 scheduleResult.ScheduledTasks 一次。
+            scheduleResult.ScheduledTasks = fallbackResult.ScheduledTasks;
+            scheduleResult.UnscheduledDemandKeys = fallbackResult.UnscheduledDemandKeys;
+            scheduleResult.AllocationTaskShare = fallbackResult.AllocationTaskShare;
 
             return result;
         }
@@ -522,6 +506,14 @@ internal class PhaseFourLocalRepair
             .Concat(scheduleResult.UnscheduledDemandKeys.Except(affectedDemands))
             .ToList();
 
+        // 块4（任务喂任务）：修复路径遵守子件完成下界。
+        var demandCompletion = scheduleResult.ScheduledTasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime));
+
+        // P0-08：从已排 Task 反推各 PI 连续份额的完成时间，供修复路径的自由份额做下界。
+        var continuityCompletionByPI = BuildContinuityCompletionByPI(request.LogicalProductionDemands, scheduleResult.ScheduledTasks);
+
         foreach (var demandKey in orderedDemandKeys)
         {
             var demand = request.LogicalProductionDemands
@@ -529,16 +521,42 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
+            var dynamicMaterialFloor = GetDynamicMaterialFloor(
+                demandKey, constraints, demandCompletion, out bool childUnavailable);
+            if (childUnavailable)
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
+            // P0-08：同 PI 自由份额不得排到连续份额之前（也不得与其时间重叠）。
+            if (!demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo)
+                && continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var contEnd)
+                && contEnd > dynamicMaterialFloor)
+            {
+                dynamicMaterialFloor = contEnd;
+            }
+
             // 尝试资源切换
             var repairedTasks = TryResourceSwitch(
                 demand,
                 constraints,
                 resourceOccupancy,
-                request);
+                request,
+                dynamicMaterialFloor);
 
             if (repairedTasks.Count > 0)
             {
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
+                if (demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo))
+                {
+                    var repairEnd = repairedTasks.Max(t => t.PlannedEndTime);
+                    if (!continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
+                        continuityCompletionByPI[demand.ProductionInstructionNo!] = repairEnd;
+                }
 
                 // 更新资源占用
                 foreach (var task in repairedTasks)
@@ -571,6 +589,14 @@ internal class PhaseFourLocalRepair
     {
         var result = new RepairResult();
 
+        // 块4（任务喂任务）：从已排 Task 反推每个 demand 的完成时间，修复路径据此遵守子件完成下界。
+        var demandCompletion = scheduleResult.ScheduledTasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime));
+
+        // P0-08：从已排 Task 反推各 PI 连续份额的完成时间，供修复路径的自由份额做下界。
+        var continuityCompletionByPI = BuildContinuityCompletionByPI(request.LogicalProductionDemands, scheduleResult.ScheduledTasks);
+
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
             var demand = request.LogicalProductionDemands
@@ -578,16 +604,42 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
+            var dynamicMaterialFloor = GetDynamicMaterialFloor(
+                demandKey, constraints, demandCompletion, out bool childUnavailable);
+            if (childUnavailable)
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
+            // P0-08：同 PI 自由份额不得排到连续份额之前（也不得与其时间重叠）。
+            if (!demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo)
+                && continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var contEnd)
+                && contEnd > dynamicMaterialFloor)
+            {
+                dynamicMaterialFloor = contEnd;
+            }
+
             // 尝试资源切换
             var repairedTasks = TryResourceSwitch(
                 demand,
                 constraints,
                 resourceOccupancy,
-                request);
+                request,
+                dynamicMaterialFloor);
 
             if (repairedTasks.Count > 0)
             {
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
+                if (demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo))
+                {
+                    var repairEnd = repairedTasks.Max(t => t.PlannedEndTime);
+                    if (!continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
+                        continuityCompletionByPI[demand.ProductionInstructionNo!] = repairEnd;
+                }
 
                 // 更新资源占用
                 foreach (var task in repairedTasks)
@@ -616,8 +668,9 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// 识别不可移动任务（Execution/Firm/Frozen/Protection）
     /// 文档：§四 4.8 ImmovableFacts
+    /// P1-05：internal static 供 Phase5 Gap Compaction 复用（同一套不可移动语义，不另建）。
     /// </summary>
-    private HashSet<string> IdentifyImmovableTasks(
+    internal static HashSet<string> IdentifyImmovableTasks(
         DomainSolveRequest request,
         List<FinalTaskDraft> scheduledTasks)
     {
@@ -660,8 +713,9 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// 构建资源占用图
     /// P0-06修复：重建occupancy时也要加入ExternalDomain ResourceBlocks
+    /// P1-05：internal static 供 Phase5 Gap Compaction 复用。
     /// </summary>
-    private Dictionary<int, List<TimeWindow>> BuildResourceOccupancy(
+    internal static Dictionary<int, List<TimeWindow>> BuildResourceOccupancy(
         List<FinalTaskDraft> tasks,
         ConstraintContext constraints)
     {
@@ -705,7 +759,8 @@ internal class PhaseFourLocalRepair
         LogicalProductionDemand demand,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
-        DomainSolveRequest request)
+        DomainSolveRequest request,
+        DateTime dynamicMaterialFloor)
     {
         // 获取工艺路线
         if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
@@ -718,9 +773,21 @@ internal class PhaseFourLocalRepair
             return new List<FinalTaskDraft>();
         }
 
-        var operations = routingGraph.Operations.Values
-            .OrderBy(op => op.OperationCode)
-            .ToList();
+        // P0-01修复：复用 Phase2 的 GetOperationsFromStage，
+        // 保证 Phase4 与 Phase2 使用同一套 Kahn 拓扑排序 + StartOperationCode/StartStageCode 裁剪逻辑，
+        // 修复此前按 OperationCode 字典序（非拓扑序）遍历导致 StartOperationCode 裁剪被绕过的问题。
+        var operations = PhaseTwoInitialScheduler.GetOperationsFromStage(
+            demand.StartStageCode,
+            demand.StartOperationCode,
+            routingGraph,
+            constraints,
+            out var startFailureReason);
+
+        if (operations.Count == 0)
+        {
+            // StartStageCode/StartOperationCode 非法，或 Routing 有环，无法修复
+            return new List<FinalTaskDraft>();
+        }
 
         var tasks = new List<FinalTaskDraft>();
         // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
@@ -737,13 +804,21 @@ internal class PhaseFourLocalRepair
             return new List<FinalTaskDraft>(); // 物料总量不足
         }
 
+        // 块4（任务喂任务）：修复路径也必须遵守子件完成时间下界，父件不得早于子件完成。
+        if (dynamicMaterialFloor > earliestStart)
+        {
+            earliestStart = dynamicMaterialFloor;
+        }
+
         // P0-17修复：改为for循环以便访问下一道工序，应用Routing LagTime
         for (int i = 0; i < operations.Count; i++)
         {
             var operation = operations[i];
 
-            // 获取合格资源列表
-            var eligibleResources = GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints);
+            // 获取合格资源列表（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
+            var eligibleResources = OrderResourcesByPreference(
+                demand,
+                GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints));
 
             FinalTaskDraft? scheduledTask = null;
 
@@ -775,7 +850,7 @@ internal class PhaseFourLocalRepair
                 {
                     // Task的PlannedStartTime是加工开始时间（Setup之后）
                     var taskStart = slot.Value.Start + setupDuration;
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End, constraints);
 
                     // 临时占用：从Setup开始
                     if (!resourceOccupancy.ContainsKey(resourceId))
@@ -799,7 +874,8 @@ internal class PhaseFourLocalRepair
             if (scheduledTask == null)
             {
                 // 第4轮Split修复：当前工序无法在任何资源找到完整时间槽时，尝试有限Split
-                if (request.StrategySnapshot.Parameters.AllowSplit && demand.PlannedProcessQty > 1.0m)
+                // P0-07：连续份额不可被普通 Split 破坏逐工单身份，禁止拆分。
+                if (request.StrategySnapshot.Parameters.AllowSplit && !demand.IsContinuation && demand.PlannedProcessQty > 1.0m)
                 {
                     var splitTasks = TrySplitOperation(
                         demand,
@@ -808,7 +884,9 @@ internal class PhaseFourLocalRepair
                         earliestStart,
                         constraints,
                         resourceOccupancy,
-                        request.PlanningEnd);
+                        request.PlanningEnd,
+                        request.StrategySnapshot.Parameters.SplitAlternatives,
+                        request.StrategySnapshot.Parameters.MinBatchQty);
 
                     if (splitTasks.Count > 0)
                     {
@@ -852,11 +930,74 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
+    /// P0-08：从已排 Task 反推各 PI 连续份额的完成时间，供修复路径的自由份额做「不得早于连续份额」的时间下界。
+    /// </summary>
+    private static Dictionary<string, DateTime> BuildContinuityCompletionByPI(
+        IReadOnlyList<LogicalProductionDemand> demands,
+        List<FinalTaskDraft> scheduledTasks)
+    {
+        var map = new Dictionary<string, DateTime>();
+        var demandByKey = demands.ToDictionary(d => d.LogicalDemandKey);
+        foreach (var task in scheduledTasks)
+        {
+            if (demandByKey.TryGetValue(task.SourceDraftId, out var demand)
+                && demand.IsContinuation
+                && !string.IsNullOrEmpty(demand.ProductionInstructionNo))
+            {
+                var pi = demand.ProductionInstructionNo!;
+                if (!map.TryGetValue(pi, out var existing) || task.PlannedEndTime > existing)
+                    map[pi] = task.PlannedEndTime;
+            }
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// 块4（任务喂任务）：计算某需求的「子件完成时间」动态物料下界。
+    /// 与 Phase2.GetDynamicMaterialFloor 口径一致：取所有直接子件已排完成时间的最大值。
+    /// 任一子件未成功排程（缺料）时 childUnavailable=true，调用方应保持该需求 Unscheduled。
+    /// P1-05：internal static 供 Phase5 Gap Compaction 复用。
+    /// </summary>
+    internal static DateTime GetDynamicMaterialFloor(
+        string demandKey,
+        ConstraintContext constraints,
+        Dictionary<string, DateTime> demandCompletion,
+        out bool childUnavailable)
+    {
+        childUnavailable = false;
+
+        if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+            || children.Count == 0)
+        {
+            return DateTime.MinValue;
+        }
+
+        DateTime floor = DateTime.MinValue;
+        foreach (var childKey in children)
+        {
+            if (!demandCompletion.TryGetValue(childKey, out var childEnd))
+            {
+                childUnavailable = true;
+                continue;
+            }
+            // P1-12：父件消费相对子件完工的滞后时间（分钟），累加到子件完成时间上。
+            if (constraints.CrossMaterialLagMinutes.TryGetValue((demandKey, childKey), out var lagMinutes))
+            {
+                childEnd = childEnd.AddMinutes((double)lagMinutes);
+            }
+            if (childEnd > floor) floor = childEnd;
+        }
+
+        return floor;
+    }
+
+    /// <summary>
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
     /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间，并验证总量是否足够
+    /// P1-05：internal static 供 Phase5 Gap Compaction 复用。
     /// </summary>
-    private DateTime GetMaterialEarliestTime(
+    internal static DateTime GetMaterialEarliestTime(
         long allocationSequence,
         decimal requiredQuantity,
         ConstraintContext constraints,
@@ -904,9 +1045,48 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
-    /// 正排寻找时间槽
+    /// P1-11：软偏好资源优先——在合法资源集内把 PreferredResourceId 排最前、FallbackResourceId 次之，
+    /// 其余保持原顺序。软偏好不改变合法性（非硬锁），偏好资源不可用时自然回落。
     /// </summary>
-    private TimeWindow? FindForwardSlot(
+    private static List<int> OrderResourcesByPreference(
+        LogicalProductionDemand demand,
+        List<int> eligibleResources)
+    {
+        if (demand.PreferredResourceId == null && demand.FallbackResourceId == null)
+        {
+            return eligibleResources;
+        }
+
+        var ordered = new List<int>(eligibleResources.Count);
+
+        if (demand.PreferredResourceId is int preferred && eligibleResources.Contains(preferred))
+        {
+            ordered.Add(preferred);
+        }
+
+        if (demand.FallbackResourceId is int fallback
+            && fallback != demand.PreferredResourceId
+            && eligibleResources.Contains(fallback))
+        {
+            ordered.Add(fallback);
+        }
+
+        foreach (var resourceId in eligibleResources)
+        {
+            if (!ordered.Contains(resourceId))
+            {
+                ordered.Add(resourceId);
+            }
+        }
+
+        return ordered;
+    }
+
+    /// <summary>
+    /// 正排寻找时间槽
+    /// P1-05：internal static 供 Phase5 Gap Compaction 复用（同一套日历感知槽查找，不另建）。
+    /// </summary>
+    internal static TimeWindow? FindForwardSlot(
         DateTime earliestStart,
         TimeSpan duration,
         int resourceId,
@@ -919,13 +1099,14 @@ internal class PhaseFourLocalRepair
             return null;
         }
 
+        // 0号位裁决（2026-09-12）：无末期限制 —— 正排不再被 planningEnd 截断，
+        // 只受资源日历窗口约束。与 Phase2.FindForwardSlot 口径一致。
         foreach (var calWindow in calendar.OrderBy(w => w.Start))
         {
             if (calWindow.End <= earliestStart) continue;
-            if (calWindow.Start >= planningEnd) break;
 
             var windowStart = calWindow.Start > earliestStart ? calWindow.Start : earliestStart;
-            var windowEnd = calWindow.End < planningEnd ? calWindow.End : planningEnd;
+            var windowEnd = calWindow.End;
 
             if (windowEnd - windowStart < duration) continue;
 
@@ -941,8 +1122,9 @@ internal class PhaseFourLocalRepair
 
     /// <summary>
     /// 在窗口内找第一个空闲槽
+    /// P1-05：internal static 供 FindForwardSlot 静态化后继续调用。
     /// </summary>
-    private TimeWindow? FindFirstAvailableSlot(
+    private static TimeWindow? FindFirstAvailableSlot(
         DateTime windowStart,
         TimeSpan duration,
         int resourceId,
@@ -979,7 +1161,8 @@ internal class PhaseFourLocalRepair
         OperationNode operation,
         int resourceId,
         DateTime start,
-        DateTime end)
+        DateTime end,
+        ConstraintContext constraints)
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
@@ -997,12 +1180,12 @@ internal class PhaseFourLocalRepair
             OperationCode = operation.OperationCode,
             TaskType = taskType,
             ResourceId = resourceId,
-            ResourceCode = string.Empty, // TODO: 从Resources查找ResourceCode
-            RouteCode = null, // TODO: 从Routing获取RouteCode
-            PathId = null, // TODO: 从Routing获取PathId
+            ResourceCode = GetResourceCode(resourceId, constraints),
+            RouteCode = operation.RouteCode,
+            PathId = operation.PathId,
             Quantity = demand.NetOutputQty,
             PlannedProcessQty = demand.PlannedProcessQty,
-            UOM = string.Empty,
+            UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
             SetupTime = operation.SetupTime,
@@ -1010,6 +1193,13 @@ internal class PhaseFourLocalRepair
             IsVirtual = false
         };
     }
+
+    /// <summary>
+    /// P1-08修复：资源编码回填（ResourceId → ResourceCode）。
+    /// 查不到时返回空串，不抛异常（资源定义缺省时 FinalTaskDraft.ResourceCode 留空，2号位落库兜底）。
+    /// </summary>
+    private static string GetResourceCode(int resourceId, ConstraintContext constraints)
+        => constraints.ResourceCodes.TryGetValue(resourceId, out var code) ? code : string.Empty;
 
     /// <summary>
     /// P0-04修复：获取资源产能系数
@@ -1061,18 +1251,21 @@ internal class PhaseFourLocalRepair
         DateTime earliestStart,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        int splitAlternatives,
+        decimal minBatchQty)
     {
         var splitTasks = new List<FinalTaskDraft>();
 
-        // Guardrail：Split候选≤3，尝试2分和3分
-        var splitCandidates = new[] { 2, 3 };
+        // Guardrail：Split候选上限（P1-02：读冻结 SplitAlternatives，默认 3 → 尝试 2 分 / 3 分）
+        // 拆分下限（P1-02：读冻结 MinBatchQty，默认 0.1）
+        var splitCandidates = Enumerable.Range(2, Math.Max(0, splitAlternatives - 1)).ToArray();
 
         foreach (var splitCount in splitCandidates)
         {
             // 计算每份数量（PlannedProcessQty）
             var qtyPerSplit = demand.PlannedProcessQty / splitCount;
-            if (qtyPerSplit < 0.1m) continue; // 拆分后数量过小，跳过
+            if (qtyPerSplit < minBatchQty) continue; // 拆分后数量过小，跳过
 
             var candidateTasks = new List<FinalTaskDraft>();
             var candidateStart = earliestStart;
@@ -1113,7 +1306,7 @@ internal class PhaseFourLocalRepair
                         // Task的PlannedStartTime是加工开始时间（Setup之后）
                         var taskStart = slot.Value.Start + setupDuration;
                         var splitQuantity = demand.NetOutputQty / splitCount;
-                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, slot.Value.End, qtyPerSplit, splitQuantity);
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, slot.Value.End, qtyPerSplit, splitQuantity, constraints);
 
                         candidateTasks.Add(splitTask);
 
@@ -1152,7 +1345,8 @@ internal class PhaseFourLocalRepair
         DateTime start,
         DateTime end,
         decimal plannedProcessQty,
-        decimal quantity)
+        decimal quantity,
+        ConstraintContext constraints)
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
         string taskType = "PRODUCTION";
@@ -1167,12 +1361,12 @@ internal class PhaseFourLocalRepair
             OperationCode = operation.OperationCode,
             TaskType = taskType,
             ResourceId = resourceId,
-            ResourceCode = string.Empty,
-            RouteCode = null,
-            PathId = null,
+            ResourceCode = GetResourceCode(resourceId, constraints),
+            RouteCode = operation.RouteCode,
+            PathId = operation.PathId,
             Quantity = quantity, // Split后的净产出
             PlannedProcessQty = plannedProcessQty, // Split后的加工数量
-            UOM = string.Empty,
+            UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
             SetupTime = operation.SetupTime,

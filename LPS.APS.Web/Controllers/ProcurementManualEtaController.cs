@@ -1,6 +1,8 @@
 using LPS.APS.BusinessRules.Services;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace LPS.APS.Web.Controllers;
@@ -20,6 +22,7 @@ namespace LPS.APS.Web.Controllers;
 ///
 /// 参考：复审报告P1-01
 /// </summary>
+[Authorize(Policy = PermissionCodes.ManualEtaView)]
 [ApiController]
 [Route("api/procurement-manual-eta")]
 public class ProcurementManualEtaController : ControllerBase
@@ -143,6 +146,7 @@ public class ProcurementManualEtaController : ControllerBase
     /// <summary>
     /// 新增或更新Manual ETA
     /// </summary>
+    [Authorize(Policy = PermissionCodes.ManualEtaMaintain)]
     [HttpPost]
     public async Task<ApiResponse<ProcurementManualEtaOverride>> Upsert(
         [FromBody] ProcurementManualEtaOverride etaOverride,
@@ -167,6 +171,7 @@ public class ProcurementManualEtaController : ControllerBase
     /// <summary>
     /// 取消Manual ETA（设置IsActive=0）
     /// </summary>
+    [Authorize(Policy = PermissionCodes.ManualEtaCancel)]
     [HttpDelete("{poNo}/{lineNo}")]
     public async Task<ApiResponse<CancelManualEtaResponse>> Cancel(
         [FromRoute] string poNo,

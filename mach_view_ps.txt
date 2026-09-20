@@ -1,0 +1,88 @@
+CREATE   VIEW [dbo].[MES_APS_OperationProgress_Mach_View] AS
+WITH
+-- Step 1: 跨所有开工记录预聚合报工数量（一次扫描，不逐行关联）
+ReportAgg AS (
+    SELECT
+        w.ProcessNo,
+        w.WorkOrder,
+        w.Model,
+        w.ProcessName,
+        SUM(r.AmountByManual)        AS GoodQty,
+        MAX(r.ReportTime)            AS LastReportTime,
+        MAX(r.LastModificationTime)  AS ReportUpdatedAt
+    FROM [SMC_MES_DeviceProcessReport].[dbo].[WorkOrderOnWork] w
+    INNER JOIN [SMC_MES_DeviceProcessReport].[dbo].[DeviceProcessReportLog] r
+        ON  r.WorkOrderOnWorkId = w.Id
+        AND r.IsDeleted         = 0
+    WHERE w.IsDeleted     = 0
+      AND w.ProcessNo     IS NOT NULL
+      AND w.WorkOrder     IS NOT NULL
+      AND w.StartWorkTime >= DATEADD(MONTH, -6, GETDATE())
+    GROUP BY w.ProcessNo, w.WorkOrder, w.Model, w.ProcessName
+),
+-- Step 2: 工单去重，取最新一条开工记录的基本属性
+Dedup AS (
+    SELECT
+        w.ProcessNo,
+        w.WorkOrder,
+        w.Model,
+        w.ProcessName,
+        w.WorkOrderCount,
+        w.OrgId,
+        w.LastModificationTime,
+        ROW_NUMBER() OVER (
+            PARTITION BY w.ProcessNo, w.WorkOrder, w.Model, w.ProcessName
+            ORDER BY w.LastModificationTime DESC, w.Id DESC
+        ) AS rn
+    FROM [SMC_MES_DeviceProcessReport].[dbo].[WorkOrderOnWork] w
+    WHERE w.IsDeleted     = 0
+      AND w.ProcessNo     IS NOT NULL
+      AND w.WorkOrder     IS NOT NULL
+      AND w.StartWorkTime >= DATEADD(MONTH, -6, GETDATE())
+)
+SELECT
+    CAST(d.ProcessNo AS NVARCHAR(100))  AS ProductionInstructionNo,
+    d.WorkOrder                          AS MESWorkOrderNo,
+    COALESCE(tmc.MaterialCode, d.Model)  AS MaterialCode,
+    ISNULL(ic.Name, d.ProcessName)       AS OperationName,
+    CASE
+        WHEN LEFT(org.Code, 4) = '3118' THEN 'BJ_MOLD'
+        WHEN LEFT(org.Code, 1) = '1'    THEN 'CN_MACH'
+        WHEN LEFT(org.Code, 1) = '3'    THEN 'BJ_MACH'
+        WHEN LEFT(org.Code, 1) = '5'    THEN 'TJ_MACH'
+        ELSE 'UNKNOWN'
+    END                                  AS StageCode,
+    CASE
+        WHEN LEFT(org.Code, 4) = '3118' THEN N'北京注塑'
+        WHEN LEFT(org.Code, 1) = '1'    THEN N'中国机加'
+        WHEN LEFT(org.Code, 1) = '3'    THEN N'北京机加'
+        WHEN LEFT(org.Code, 1) = '5'    THEN N'天津机加'
+        ELSE N'UNKNOWN'
+    END                                  AS StageName,
+    d.WorkOrderCount                     AS PlannedQty,
+    ISNULL(ra.GoodQty, 0)               AS GoodQty,
+    NULL                                 AS ScrapQty,
+    NULL                                 AS ReworkQty,
+    ra.LastReportTime,
+    ISNULL(ra.ReportUpdatedAt, d.LastModificationTime) AS SourceUpdatedAt
+FROM Dedup d
+LEFT JOIN [dbo].[TempMaterialCodes] tmc
+    ON  tmc.Spec = CONVERT(varchar(50), d.Model)
+LEFT JOIN [SMC_MOM_SYS].[dbo].[AbpOrganizationUnits] org
+    ON  org.Id        = d.OrgId
+    AND org.IsDeleted = 0
+-- OUTER APPLY TOP 1 保证 ProcessName 对应多条 V_ItemCode 时不产生笛卡尔积
+OUTER APPLY (
+    SELECT TOP 1 ic2.Name
+    FROM [SMC_MES_DeviceProcessReport].[dbo].[V_ItemCode] ic2
+    WHERE ic2.Code      = d.ProcessName
+      AND ic2.IsDeleted = 0
+      AND ic2.Category  = N'设备管理'
+    ORDER BY ic2.Id
+) ic
+LEFT JOIN ReportAgg ra
+    ON  ra.ProcessNo   = d.ProcessNo
+    AND ra.WorkOrder   = d.WorkOrder
+    AND ra.Model       = d.Model
+    AND ra.ProcessName = d.ProcessName
+WHERE d.rn = 1;

@@ -51,6 +51,14 @@ public class SchedulingContext
     public DateTime PlanHorizonEnd { get; set; }
 
     /// <summary>
+    /// 本次运行的数据截止时点（ScheduleRun.DataCutoffTime 冻结值）。
+    /// 供给事实/库存快照/PI Position/占位可用时间均以此为准，禁止用 DateTime.Now。
+    /// 【2号位填充】由 ExecuteDomainAsync 传入的 scheduleRun.DataCutoffTime 落到此处；
+    /// 手动/联调入口（dataCutoffTime=null）时为 null，下游回退 DateTime.Now。
+    /// </summary>
+    public DateTime? DataCutoffTime { get; set; }
+
+    /// <summary>
     /// 待排程的任务列表（由2号位填充，1号位填写StartTime/EndTime）
     /// 【2号位填充】阶段2 Pegging + 拆批后生成（每个订单工序展开为独立 Task）
     /// 【1号位消费】阶段3 填充 PlannedStartTime/PlannedEndTime

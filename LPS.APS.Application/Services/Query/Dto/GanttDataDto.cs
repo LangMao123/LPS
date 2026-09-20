@@ -7,6 +7,22 @@ public class GanttDataDto
 {
     public int PlanVersionId { get; set; }
     public string VersionCode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// PlanVersion 状态（ACTIVE / CANDIDATE / ARCHIVED）
+    ///
+    /// v1.5 §16.3：Candidate 结果查询时必须返回，供4号位区分当前版本类型。
+    /// </summary>
+    public string? PlanVersionStatus { get; set; }
+
+    /// <summary>
+    /// Candidate 基准版本 ID（仅 CANDIDATE 状态时有值）
+    ///
+    /// v1.5 §16.3：Candidate 与 Base 比较所需。
+    /// ACTIVE / ARCHIVED 版本为 null。
+    /// </summary>
+    public int? BasePlanVersionId { get; set; }
+
     public DateTime PlanHorizonStart { get; set; }
     public DateTime PlanHorizonEnd { get; set; }
 
@@ -31,7 +47,7 @@ public class GanttResourceDto
 
     /// <summary>
     /// 资源所属域标识（G2-b 档①；U01 多 Domain 染色分组）
-    /// V1.2：域 = 工厂维度（FACTORY_{FactoryId}，与 LogicalProductionDemand.DomainKey 一致）
+    /// F-G4：域不再以 FACTORY_{id} 命名规则推导，资源域 = 所属 PlanVersion.DomainKey（DomainDefinition 唯一权威源）
     /// </summary>
     public string? DomainKey { get; set; }
 

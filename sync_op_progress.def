@@ -1,0 +1,163 @@
+
+CREATE PROCEDURE [dbo].[Sp_syncmesoperationprogresssnapshot] @ScheduleRunId  INT,
+                                                            @DataCutoffTime DATETIME,
+                                                            @RowsAffected   INT OUTPUT
+AS
+  BEGIN
+      SET NOCOUNT ON;
+
+      DECLARE @ErrorMessage NVARCHAR(2000);
+      DECLARE @DeletedOld INT = 0;
+      DECLARE @sql NVARCHAR(MAX);
+      DECLARE @CutoffStr NVARCHAR(30) = CONVERT(NVARCHAR(30), @DataCutoffTime, 120);
+
+      SET @RowsAffected = 0;
+
+      -- Step 1: 幂等清除 + 全量同步
+      BEGIN TRY
+          BEGIN TRANSACTION;
+
+          DELETE FROM [dbo].[OperationProgressSnapshot]
+          WHERE  ScheduleRunId = @ScheduleRunId;
+
+          -- 预建临时表
+          CREATE TABLE #OperationProgressRaw
+            (
+               ProductionInstructionNo BIGINT NULL,
+               MESWorkOrderNo          NVARCHAR(50) NULL,
+               MaterialCode            NVARCHAR(80) NULL,
+               OperationName           NVARCHAR(200) NULL,
+               StageCode               VARCHAR(7) NULL,
+               StageName               NVARCHAR(100) NULL,
+               PlannedQty              DECIMAL(18, 2) NULL,
+               GoodQty                 DECIMAL(18, 2) NULL,
+               ScrapQty                DECIMAL(18, 2) NULL,
+               ReworkQty               DECIMAL(18, 2) NULL,
+               LastReportTime          DATETIME2(7) NULL,
+               SourceUpdatedAt         DATETIME2(7) NULL
+            );
+
+          -- 动态 SQL：字面量 DataCutoffTime，OLE DB 可识别
+          SET @sql = N'
+            INSERT INTO #OperationProgressRaw
+                (ProductionInstructionNo, MESWorkOrderNo, MaterialCode,
+                 OperationName, StageCode, StageName,
+                 PlannedQty, GoodQty, ScrapQty, ReworkQty,
+                 LastReportTime, SourceUpdatedAt)
+            SELECT v.ProductionInstructionNo, v.MESWorkOrderNo, v.MaterialCode,
+                   v.OperationName, v.StageCode, v.StageName,
+                   v.PlannedQty, v.GoodQty, v.ScrapQty, v.ReworkQty,
+                   v.LastReportTime, v.SourceUpdatedAt
+            FROM [dbo].[ext_MES_APS_OperationProgress_View] v
+            WHERE COALESCE(v.SourceUpdatedAt, v.LastReportTime) <= '''
+                     + @CutoffStr + N'''';
+
+          EXEC Sp_executesql
+            @sql;
+
+          -- 本地转换后写入快照表（RemainingQty 为 PERSISTED 计算列，不参与 INSERT）
+          INSERT INTO [dbo].[OperationProgressSnapshot]
+                      (ScheduleRunId,
+                       ProductionInstructionNo,
+                       MESWorkOrderNo,
+                       MaterialCode,
+                       OperationName,
+                       StageCode,
+                       StageName,
+                       PlannedQty,
+                       GoodQty,
+                       ScrapQty,
+                       ReworkQty,
+                       LastReportTime,
+                       SourceUpdatedAt,
+                       DataCutoffTime,
+                       CreatedAt)
+          SELECT @ScheduleRunId,
+                 Cast(r.ProductionInstructionNo AS NVARCHAR(100)),
+                 r.MESWorkOrderNo,
+                 r.MaterialCode,
+                 r.OperationName,
+                 Cast(r.StageCode AS NVARCHAR(20)),
+                 r.StageName,
+                 r.PlannedQty,
+                 r.GoodQty,
+                 r.ScrapQty,
+                 r.ReworkQty,
+                 r.LastReportTime,
+                 r.SourceUpdatedAt,
+                 @DataCutoffTime,
+                 Getdate()
+          FROM   #OperationProgressRaw r;
+
+          SET @RowsAffected = @@ROWCOUNT;
+
+          COMMIT TRANSACTION;
+
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESOperationProgressSnapshot',
+                       Concat(N'rows=', @RowsAffected, N' cutoff=', @CutoffStr),
+                       N'SUCCESS',
+                       Getdate());
+      END TRY
+      BEGIN CATCH
+          IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+          SET @ErrorMessage = LEFT(Error_message(), 2000);
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESOperationProgressSnapshot',
+                       @ErrorMessage,
+                       N'FAILED',
+                       Getdate());
+          THROW;
+      END CATCH;
+
+      -- Step 2: 历史快照清理（保留最近 2 个 ScheduleRunId）
+      BEGIN TRY
+          DELETE FROM [dbo].[OperationProgressSnapshot]
+          WHERE  ScheduleRunId NOT IN (SELECT TOP 2 ScheduleRunId
+                                       FROM   [dbo].[OperationProgressSnapshot]
+                                       GROUP  BY ScheduleRunId
+                                       ORDER  BY Max(CreatedAt) DESC);
+
+          SET @DeletedOld = @@ROWCOUNT;
+
+          IF @DeletedOld > 0
+            INSERT INTO [dbo].[APS_ETL_Log]
+                        (BatchNo,
+                         Step,
+                         Message,
+                         Status,
+                         CreatedAt)
+            VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                         N'sp_SyncMESOperationProgressSnapshot',
+                         Concat(N'purged old rows=', @DeletedOld),
+                         N'INFO',
+                         Getdate());
+      END TRY
+      BEGIN CATCH
+          INSERT INTO [dbo].[APS_ETL_Log]
+                      (BatchNo,
+                       Step,
+                       Message,
+                       Status,
+                       CreatedAt)
+          VALUES      (Cast(@ScheduleRunId AS NVARCHAR(50)),
+                       N'sp_SyncMESOperationProgressSnapshot',
+                       Concat(N'purge failed: ', LEFT(Error_message(), 500)),
+                       N'WARN',
+                       Getdate());
+      END CATCH;
+  END; 
+

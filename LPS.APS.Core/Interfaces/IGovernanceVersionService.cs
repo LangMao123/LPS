@@ -19,10 +19,10 @@ namespace LPS.APS.Core.Interfaces;
 public interface IGovernanceVersionService
 {
     /// <summary>发布规则集版本（DRAFT/SUBMITTED/APPROVED → PUBLISHED；已 PUBLISHED 拒绝）。G10：changeReason 记录于审计日志（版本表无 Remarks 列）。</summary>
-    Task PublishRuleSetVersionAsync(long ruleSetVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null);
+    Task PublishRuleSetVersionAsync(long ruleSetVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null);
 
     /// <summary>发布参数集版本（DRAFT/SUBMITTED/APPROVED → PUBLISHED；已 PUBLISHED 拒绝）。G10：changeReason 记录于审计日志（版本表无 Remarks 列）。</summary>
-    Task PublishParameterSetVersionAsync(long parameterSetVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null);
+    Task PublishParameterSetVersionAsync(long parameterSetVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null);
 
     /// <summary>对比两个规则集版本的差异（阶段 A-8：版本溯源）</summary>
     Task<VersionDiffResult> CompareRuleSetVersionsAsync(long sourceVersionId, long targetVersionId, CancellationToken ct = default);
@@ -52,18 +52,18 @@ public interface IGovernanceVersionService
     /// IsDefault=1 时：先清同 Profile 其他默认（ClearDefaultFlagAsync）再置位，避免 UQ_StrategyProfileVersion_DefaultPublished 冲突。
     /// G10：changeReason 记录于审计日志（版本表无 Remarks 列）。
     /// </summary>
-    Task PublishStrategyProfileVersionAsync(long strategyProfileVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null);
+    Task PublishStrategyProfileVersionAsync(long strategyProfileVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null);
 
     // ==================== G2：版本停用（3-4联调；Retired↔DISABLED 语义映射 §8.4） ====================
 
     /// <summary>停用规则集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED；DISABLED/ARCHIVED 拒绝；DRAFT 不可停用）。reason 记录于审计日志。</summary>
-    Task DisableRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default);
+    Task DisableRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default);
 
     /// <summary>停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED；DISABLED/ARCHIVED 拒绝；DRAFT 不可停用）。reason 记录于审计日志。</summary>
-    Task DisableParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default);
+    Task DisableParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default);
 
     /// <summary>停用策略包版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED；DISABLED/ARCHIVED 拒绝；DRAFT 不可停用）。reason 记录于审计日志。</summary>
-    Task DisableStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default);
+    Task DisableStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default);
 
     /// <summary>
     /// 解析当前有效默认 PUBLISHED 策略包版本（P0-06：跨号位冻结语义，C2-3）

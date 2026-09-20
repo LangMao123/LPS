@@ -1,10 +1,13 @@
 using FluentAssertions;
 using LPS.APS.Application.Services;
+using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Interfaces;
 using Moq;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
-using GovernanceAuditLog = LPS.APS.Core.Entities.Auth.GovernanceAuditLog;
+using AuditLog = LPS.APS.Core.Entities.Auth.AuditLog;
 using PlanVersion = LPS.APS.Core.Entities.APS.PlanVersion;
 using StrategyProfileVersion = LPS.APS.Core.Entities.APS.StrategyProfileVersion;
 using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
@@ -25,18 +28,34 @@ public class RunLifecycleServiceTests
     private readonly Mock<IStrategyProfileVersionRepository> _strategyProfileVersionRepo = new();
     private readonly Mock<IRuleSetVersionRepository> _ruleSetRepo = new();
     private readonly Mock<IParameterSetVersionRepository> _parameterSetRepo = new();
-    private readonly Mock<IGovernanceAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IDataScopeService> _dataScopeService = new();
+    private readonly Mock<ISchedulingOrchestrator> _schedulingOrchestrator = new();
     private readonly RunLifecycleService _service;
 
     public RunLifecycleServiceTests()
     {
+        // 5e：默认全范围放行（Global），既有用例不感知业务范围校验
+        _dataScopeService
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        // P1-02：3→2 排程发令枪默认成功（2号位 主流程不在单测内重演）
+        _schedulingOrchestrator
+            .Setup(o => o.RunSchedulingAndFinalizeAsync(
+                It.IsAny<int>(), It.IsAny<int>(), It.IsAny<long>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SchedulingRunResult { IsSuccess = true });
+
         _service = new RunLifecycleService(
             _scheduleRunRepo.Object,
             _planVersionRepo.Object,
             _strategyProfileVersionRepo.Object,
             _ruleSetRepo.Object,
             _parameterSetRepo.Object,
-            _auditRepo.Object);
+            _auditRepo.Object,
+            _dataScopeService.Object,
+            _schedulingOrchestrator.Object,
+            NullLogger<RunLifecycleService>.Instance);
     }
 
     /// <summary>构造合法 FULL_SCHEDULE 运行（两 Domain）</summary>
@@ -81,16 +100,16 @@ public class RunLifecycleServiceTests
         };
 
     /// <summary>构造"已完成最小人工确认"的审计记录（P0-04 激活硬前置）</summary>
-    private static IReadOnlyList<GovernanceAuditLog> ConfirmedLogs(int planVersionId = 5)
+    private static IReadOnlyList<AuditLog> ConfirmedLogs(int planVersionId = 5)
         => new[]
         {
-            new GovernanceAuditLog
+            new AuditLog
             {
-                OperationType = "ConfirmCandidate",
+                ActionCode = "ConfirmCandidate",
                 EntityType = "PlanVersion",
-                EntityId = planVersionId,
-                OperatedBy = "u1",
-                OperatedAt = DateTime.UtcNow,
+                EntityId = planVersionId.ToString(),
+                UserCode = "u1",
+                OccurredAt = DateTime.UtcNow,
             },
         };
 
@@ -116,7 +135,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(999, It.IsAny<CancellationToken>())).ReturnsAsync((ScheduleRunGov?)null);
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(999, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(999, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -130,7 +149,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(FullRun(expectedJson: null));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -144,7 +163,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(FullRun(expectedJson: """{"not":"array"}"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -158,7 +177,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(FullRun(expectedJson: """["D1","D2"]"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().NotThrowAsync();
@@ -172,7 +191,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(FullRun(expectedJson: """["D1","D1"]"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -186,7 +205,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(FullRun(expectedJson: "[]"));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -200,7 +219,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(CandidateRun(expectedJson: """["D1"]"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, 1, CancellationToken.None);
 
         // Assert
         await act.Should().NotThrowAsync();
@@ -214,7 +233,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(CandidateRun(expectedJson: """["D1","D2"]"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -228,7 +247,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(CandidateRun(expectedJson: """["D1",""]"""));
 
         // Act
-        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, CancellationToken.None);
+        var act = async () => await _service.ValidateExpectedDomainKeysAsync(2, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -243,7 +262,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(999, It.IsAny<CancellationToken>())).ReturnsAsync((PlanVersion?)null);
 
         // Act
-        var act = async () => await _service.ConfirmCandidateAsync(999, "u1", null, CancellationToken.None);
+        var act = async () => await _service.ConfirmCandidateAsync(999, 1, "u1", null, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -258,7 +277,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
 
         // Act
-        var act = async () => await _service.ConfirmCandidateAsync(5, "u1", null, CancellationToken.None);
+        var act = async () => await _service.ConfirmCandidateAsync(5, 1, "u1", null, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -272,7 +291,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(CandidateVersion(5, domainKey: null));
 
         // Act
-        var act = async () => await _service.ConfirmCandidateAsync(5, "u1", null, CancellationToken.None);
+        var act = async () => await _service.ConfirmCandidateAsync(5, 1, "u1", null, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -286,14 +305,14 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
 
         // Act：确认不预检同域 ACTIVE（P0-06：确认与唯一性无关，只记录事实）
-        await _service.ConfirmCandidateAsync(5, "u1", "基于 Base ACTIVE 的新 Candidate", CancellationToken.None);
+        await _service.ConfirmCandidateAsync(5, 1, "u1", "基于 Base ACTIVE 的新 Candidate", CancellationToken.None);
 
         // Assert：确认成功，仅记审计，不写 Activated、不转 ACTIVE、不触碰同域 ACTIVE
         version.Status.Should().Be("Computed");
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "ConfirmCandidate"
-                && l.EntityId == 5),
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "ConfirmCandidate"
+                && l.EntityId == "5"),
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -305,7 +324,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
 
         // Act
-        await _service.ConfirmCandidateAsync(5, "u1", "人工确认", CancellationToken.None);
+        await _service.ConfirmCandidateAsync(5, 1, "u1", "人工确认", CancellationToken.None);
 
         // Assert（P0-05）：确认不污染 ActivatedAt/ActivatedBy，状态保持 CANDIDATE，不写库
         version.ActivatedAt.Should().BeNull();
@@ -313,13 +332,31 @@ public class RunLifecycleServiceTests
         version.Status.Should().Be("Computed");
         _planVersionRepo.Verify(r => r.UpdateAsync(It.IsAny<PlanVersion>(), It.IsAny<CancellationToken>()), Times.Never);
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "ConfirmCandidate"
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "ConfirmCandidate"
                 && l.EntityType == "PlanVersion"
-                && l.EntityId == 5
-                && l.OperatedBy == "u1"
-                && l.Remarks!.Contains("5")),
+                && l.EntityId == "5"
+                && l.UserCode == "u1"
+                && l.Remark!.Contains("5")),
             It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Confirm_业务范围未授权Domain_抛异常()
+    {
+        // Arrange（5e：F-G4 Domain 维度）—— 用户 DataScopePolicy 仅授权 D2，目标版本 Domain=D1
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _dataScopeService
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), DataScopeTypes.Domain, "D1", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ScopeViolationException(DataScopeTypes.Domain, "D1"));
+
+        // Act
+        var act = async () => await _service.ConfirmCandidateAsync(5, 1, "u1", null, CancellationToken.None);
+
+        // Assert：范围拒绝，不写审计
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        _auditRepo.Verify(r => r.AddAsync(It.IsAny<AuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     // ==================== ActivateCandidateAsync ====================
@@ -333,7 +370,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
 
         // Act
-        var act = async () => await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -347,7 +384,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(CandidateVersion(5, domainKey: null));
 
         // Act
-        var act = async () => await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -358,11 +395,11 @@ public class RunLifecycleServiceTests
     {
         // Arrange（P0-04）：无 ConfirmCandidate 审计
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(CandidateVersion(5, "D1"));
-        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", 5, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(Array.Empty<GovernanceAuditLog>());
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<AuditLog>());
 
         // Act
-        var act = async () => await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert：激活被拒，未触碰来源 Run / 仓储写
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -376,12 +413,12 @@ public class RunLifecycleServiceTests
         // Arrange（P0-03）：已确认，但来源 Run 为 INSERT_ORDER_WHATIF（CTP/INSERT_IMPACT_ANALYSIS，永远不得激活）
         var version = CandidateVersion(5, "D1", sourceScheduleRunId: 3);
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
-        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", 5, It.IsAny<CancellationToken>()))
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
             .ReturnsAsync(ConfirmedLogs());
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(3, It.IsAny<CancellationToken>())).ReturnsAsync(WhatIfRun(3));
 
         // Act
-        var act = async () => await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert：无条件拒绝激活，未触发原子替换
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -395,11 +432,11 @@ public class RunLifecycleServiceTests
         // Arrange（P0-03 防绕过）：无法证明来源 Run 可激活 → 拒绝
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>()))
             .ReturnsAsync(CandidateVersion(5, "D1", sourceScheduleRunId: null));
-        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", 5, It.IsAny<CancellationToken>()))
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
             .ReturnsAsync(ConfirmedLogs());
 
         // Act
-        var act = async () => await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -413,12 +450,12 @@ public class RunLifecycleServiceTests
         // Arrange（P0-06）：Base ACTIVE 存在不再是失败，激活走原子替换（归档旧 ACTIVE + 新版本置 ACTIVE）
         var version = CandidateVersion(5, "D1");
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
-        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", 5, It.IsAny<CancellationToken>()))
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
             .ReturnsAsync(ConfirmedLogs());
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(CandidateRun(2));
 
         // Act
-        await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert：CANDIDATE → ACTIVE + 走原子替换（非单版本 UpdateAsync），不因同域 ACTIVE 拒绝
         version.Status.Should().Be("ACTIVE");
@@ -427,12 +464,12 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Verify(r => r.ReplaceActiveAsync(version, "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
         _planVersionRepo.Verify(r => r.UpdateAsync(It.IsAny<PlanVersion>(), It.IsAny<CancellationToken>()), Times.Never);
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "ActivateCandidate"
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "ActivateCandidate"
                 && l.EntityType == "PlanVersion"
-                && l.EntityId == 5
-                && l.BeforeStatus == "Computed"
-                && l.AfterStatus == "ACTIVE"),
+                && l.EntityId == "5"
+                && l.OldValue == "Computed"
+                && l.NewValue == "ACTIVE"),
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -442,12 +479,12 @@ public class RunLifecycleServiceTests
         // Arrange：已完成最小确认 + 来源 Run 为可激活的 MANUAL_RESCHEDULE
         var version = CandidateVersion(5, "D1");
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
-        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", 5, It.IsAny<CancellationToken>()))
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
             .ReturnsAsync(ConfirmedLogs());
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(CandidateRun(2));
 
         // Act
-        await _service.ActivateCandidateAsync(5, "u1", CancellationToken.None);
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
         // Assert：激活 = 正式采用，CANDIDATE → ACTIVE + 写 ActivatedAt/ActivatedBy + 原子替换
         version.Status.Should().Be("ACTIVE");
@@ -455,13 +492,34 @@ public class RunLifecycleServiceTests
         version.ActivatedBy.Should().Be("u1");
         _planVersionRepo.Verify(r => r.ReplaceActiveAsync(version, "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "ActivateCandidate"
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "ActivateCandidate"
                 && l.EntityType == "PlanVersion"
-                && l.EntityId == 5
-                && l.BeforeStatus == "Computed"
-                && l.AfterStatus == "ACTIVE"),
+                && l.EntityId == "5"
+                && l.OldValue == "Computed"
+                && l.NewValue == "ACTIVE"),
             It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Activate_业务范围未授权Domain_抛异常()
+    {
+        // Arrange（5e：F-G4 Domain 维度）—— 用户 DataScopePolicy 仅授权 D2，目标版本 Domain=D1
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConfirmedLogs());
+        _dataScopeService
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), DataScopeTypes.Domain, "D1", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ScopeViolationException(DataScopeTypes.Domain, "D1"));
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：范围拒绝在先（早于确认/来源 Run 校验），不触发原子替换
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     // ==================== RecoverFailedRunAsync ====================
@@ -473,7 +531,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(999, It.IsAny<CancellationToken>())).ReturnsAsync((ScheduleRunGov?)null);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(999, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(999, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -488,7 +546,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(run);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -507,7 +565,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(100);
 
         // Act
-        var newId = await _service.RecoverFailedRunAsync(1, CancellationToken.None);
+        var newId = await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
 
         // Assert：返回新 Id、继承 StrategyProfileVersionId + ExpectedDomainKeysJson 基线、旧 FAILED 记录不动
         newId.Should().Be(100);
@@ -520,10 +578,10 @@ public class RunLifecycleServiceTests
             It.IsAny<CancellationToken>()), Times.Once);
         failed.Status.Should().Be("FAILED");   // 旧记录不回改 RUNNING
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "RecoverFailedRun"
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "RecoverFailedRun"
                 && l.EntityType == "ScheduleRun"
-                && l.EntityId == 1),
+                && l.EntityId == "1"),
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -536,7 +594,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
 
         // Assert：不新建、旧记录不动
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -661,7 +719,7 @@ public class RunLifecycleServiceTests
         spec.Actor = string.Empty;
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(spec, CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(spec, 1, CancellationToken.None);
 
         // Assert：不触发任何仓储写
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -676,7 +734,7 @@ public class RunLifecycleServiceTests
         var spec = DaytimeSpec(runType: "FULL_SCHEDULE");
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(spec, CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(spec, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -691,7 +749,7 @@ public class RunLifecycleServiceTests
         var spec = DaytimeSpec(runType: "MANUAL_RESCHEDULE", purpose: "CTP");
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(spec, CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(spec, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -704,7 +762,7 @@ public class RunLifecycleServiceTests
         var spec = DaytimeSpec(domainKey: string.Empty);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(spec, CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(spec, 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -717,7 +775,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(999, It.IsAny<CancellationToken>())).ReturnsAsync((PlanVersion?)null);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 999), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 999), 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -732,7 +790,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>())).ReturnsAsync(baseVersion);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 50), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 50), 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -745,7 +803,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>())).ReturnsAsync(ActiveBase(domainKey: "D2"));
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 50), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(basePlanVersionId: 50), 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -758,7 +816,7 @@ public class RunLifecycleServiceTests
         _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>())).ReturnsAsync((PlanVersion?)null);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
 
         // Assert：白天候选必须基于 Base ACTIVE
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -774,7 +832,7 @@ public class RunLifecycleServiceTests
         SetupDefaultStrategyVersions(0);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -790,7 +848,7 @@ public class RunLifecycleServiceTests
         SetupDefaultStrategyVersions(2);
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -809,7 +867,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(new CandidateRunCreatedResult { NewScheduleRunId = 200, NewPlanVersionId = 300 });
 
         // Act
-        var result = await _service.CreateCandidateRunAsync(DaytimeSpec(), CancellationToken.None);
+        var result = await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
 
         // Assert：返回新 Run/壳 Id；冻结 RunType/Domain/Base/策略版本；写 CreateCandidateRun 审计
         result.NewScheduleRunId.Should().Be(200);
@@ -823,13 +881,13 @@ public class RunLifecycleServiceTests
             It.IsAny<string>(),
             It.IsAny<CancellationToken>()), Times.Once);
         _auditRepo.Verify(r => r.AddAsync(
-            It.Is<GovernanceAuditLog>(l =>
-                l.OperationType == "CreateCandidateRun"
+            It.Is<AuditLog>(l =>
+                l.ActionCode == "CreateCandidateRun"
                 && l.EntityType == "ScheduleRun"
-                && l.EntityId == 200
-                && l.AfterStatus == "RUNNING"
-                && l.OperatedBy == "u1"
-                && l.Remarks!.Contains("Purpose=MANUAL_ADJUSTMENT")),
+                && l.EntityId == "200"
+                && l.NewValue == "RUNNING"
+                && l.UserCode == "u1"
+                && l.Remark!.Contains("Purpose=MANUAL_ADJUSTMENT")),
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -845,7 +903,7 @@ public class RunLifecycleServiceTests
 
         // Act
         var result = await _service.CreateCandidateRunAsync(
-            DaytimeSpec(runType: "INSERT_ORDER_WHATIF", purpose: "CTP"), CancellationToken.None);
+            DaytimeSpec(runType: "INSERT_ORDER_WHATIF", purpose: "CTP"), 1, CancellationToken.None);
 
         // Assert
         result.NewScheduleRunId.Should().Be(210);
@@ -866,7 +924,7 @@ public class RunLifecycleServiceTests
 
         // Act
         var result = await _service.CreateCandidateRunAsync(
-            DaytimeSpec(runType: "LOCAL_RESCHEDULE", purpose: "INSERT_RESCHEDULE"), CancellationToken.None);
+            DaytimeSpec(runType: "LOCAL_RESCHEDULE", purpose: "INSERT_RESCHEDULE"), 1, CancellationToken.None);
 
         // Assert
         result.NewScheduleRunId.Should().Be(220);
@@ -886,10 +944,10 @@ public class RunLifecycleServiceTests
             .ThrowsAsync(new InvalidOperationException("模拟原子写失败"));
 
         // Act
-        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), CancellationToken.None);
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
 
         // Assert：异常向上传播；不产生审计（无孤立写入）
         await act.Should().ThrowAsync<InvalidOperationException>();
-        _auditRepo.Verify(r => r.AddAsync(It.IsAny<GovernanceAuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
+        _auditRepo.Verify(r => r.AddAsync(It.IsAny<AuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 }

@@ -1,0 +1,71 @@
+
+
+
+
+
+CREATE view [dbo].[Assy_OperationProgress_View]
+as
+select 
+ --a.IndicatingNo ProductionInstructionNo
+CAST(a.IndicatingNo AS NVARCHAR(100)) AS ProductionInstructionNo
+,case when a.IndicatingType=0 then 'assemble' when a.IndicatingType=1 then 'out' end InstructionType
+,a.WorkOrderNo MESWorkOrderNo
+,d.MaterialCode
+,c.ProcedureName OperationName
+,CASE 
+        WHEN LEFT(a.Holon, 1) = '3' THEN 'BJ_ASSY'
+        WHEN LEFT(a.Holon, 1) = '5' THEN 'TJ_ASSY'
+        WHEN LEFT(a.Holon, 1) = '1' THEN 'CN_ASSY'
+        ELSE 'others'
+END AS StageCode
+,CASE 
+        WHEN LEFT(a.Holon, 1) = '3' THEN 'BJ组立'
+        WHEN LEFT(a.Holon, 1) = '5' THEN 'TJ组立'
+        WHEN LEFT(a.Holon, 1) = '1' THEN 'CN组立'
+        ELSE 'others'
+END AS StageName
+,a.WorkOrderNum PlannedQty
+,c.GoodQty
+,NULL ScrapQty
+,NULL ReworkQty
+,c.ReportWorkTime LastReportTime
+,GETDATE() SourceUpdatedAt
+FROM [SMC_MES_AssemblyOperateManage].[dbo].[ProductionPlan] a
+--inner join [SMC_MES_AssemblyOperateManage].[dbo].[OperationRecord] b on a.Id=b.ProductionPlanId
+--inner join 
+--	(
+--		select 
+--		 b.Id opId
+--		,SUM(ISNULL(c.Num,0)) GoodQty
+--		FROM [SMC_MES_AssemblyOperateManage].[dbo].[ProductionPlan] a
+--			inner join [SMC_MES_AssemblyOperateManage].[dbo].[OperationRecord] b on a.Id=b.ProductionPlanId
+--			left join [SMC_MES_AssemblyOperateManage].[dbo].[QualifiedProductRecord] c on b.Id=c.ORId and c.IsDeleted=0
+--			where a.IsDeleted=0 and b.IsDeleted=0  and a.IndicatingType in (0,1)
+--			and a.PlanStartTime>CONVERT(varchar,DATEADD(DAY,-30,GETDATE()),111)
+--			and a.PlanStartTime<CONVERT(varchar,DATEADD(DAY,1,GETDATE()),111)
+--		group by b.Id
+--	)c on b.Id=c.opId
+inner join 
+	(
+		select
+		 b.ProductionPlanId
+		,b.WorkOrderNo
+		,b.ProcedureCode
+		,b.ProcedureName
+		,SUM(ISNULL(c.Num,0)) GoodQty
+		,MAX(b.ReportWorkTime) ReportWorkTime
+		FROM [SMC_MES_AssemblyOperateManage].[dbo].[ProductionPlan] a
+			inner join [SMC_MES_AssemblyOperateManage].[dbo].[OperationRecord] b on a.Id=b.ProductionPlanId
+			left join [SMC_MES_AssemblyOperateManage].[dbo].[QualifiedProductRecord] c on b.Id=c.ORId and c.IsDeleted=0
+			where a.IsDeleted=0 and b.IsDeleted=0  and a.IndicatingType in (0,1)
+			and a.PlanStartTime>CONVERT(varchar,DATEADD(DAY,-30,GETDATE()),111)
+			and a.PlanStartTime<CONVERT(varchar,DATEADD(DAY,1,GETDATE()),111)
+		group by b.ProductionPlanId, b.WorkOrderNo,b.ProcedureCode,b.ProcedureName
+	)c on a.Id=c.ProductionPlanId 
+left join [MES_Integration].[dbo].[TempMaterialCodes] d on d.Spec=a.MasterName
+	where a.IsDeleted=0
+	and a.PlanStartTime>CONVERT(varchar,DATEADD(DAY,-30,GETDATE()),111)
+	and a.PlanStartTime<CONVERT(varchar,DATEADD(DAY,1,GETDATE()),111)
+    and a.IndicatingType in (0,1)
+
+

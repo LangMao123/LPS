@@ -1,0 +1,469 @@
+
+CREATE   PROCEDURE [dbo].[sp_SyncRoutingData]
+    @BatchNo              NVARCHAR(50),
+    -- RoutingOperation 统计
+    @OperationInserted    INT = 0 OUTPUT,
+    @OperationUpdated     INT = 0 OUTPUT,
+    @OperationDeactivated INT = 0 OUTPUT,
+    -- RoutingDependency 统计
+    @DependencyInserted    INT = 0 OUTPUT,
+    @DependencyUpdated     INT = 0 OUTPUT,
+    @DependencyDeactivated INT = 0 OUTPUT,
+    -- RoutingStage 统计
+    @StageInserted    INT = 0 OUTPUT,
+    @StageUpdated     INT = 0 OUTPUT,
+    @StageDeactivated INT = 0 OUTPUT,
+    -- OperationResourceEligibility 统计
+    @EligibilityInserted    INT = 0 OUTPUT,
+    @EligibilityUpdated     INT = 0 OUTPUT,
+    @EligibilityDeactivated INT = 0 OUTPUT,
+    -- 合计未映射跳过行数
+    @UnmappedSkipped INT = 0 OUTPUT,
+    @ResourceUnmappedSkipped INT = 0 OUTPUT,
+    @DeptUnmappedSkipped INT = 0 OUTPUT,
+    -- 错误信息
+    @ErrorMessage NVARCHAR(4000) = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    -- 初始化输出参数
+    SET @OperationInserted = 0;    SET @OperationUpdated = 0;    SET @OperationDeactivated = 0;
+    SET @DependencyInserted = 0;   SET @DependencyUpdated = 0;   SET @DependencyDeactivated = 0;
+    SET @StageInserted = 0;        SET @StageUpdated = 0;        SET @StageDeactivated = 0;
+    SET @EligibilityInserted = 0;  SET @EligibilityUpdated = 0;  SET @EligibilityDeactivated = 0;
+    SET @UnmappedSkipped = 0;
+    SET @ResourceUnmappedSkipped = 0;
+    SET @DeptUnmappedSkipped = 0;
+    SET @ErrorMessage = NULL;
+
+    DECLARE @StartTime DATETIME2 = Getdate();
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 1：构建映射字典（一次性加载）
+        -- ═══════════════════════════════════════════════════════════════
+        IF Object_id('tempdb..#MesMaterialMap') IS NOT NULL DROP TABLE #MesMaterialMap;
+        CREATE TABLE #MesMaterialMap (
+            SourceID   NVARCHAR(100) NOT NULL,
+            Source     NVARCHAR(20)  NOT NULL,
+            MaterialId INT           NOT NULL,
+            PRIMARY KEY (SourceID, Source)
+        );
+
+        INSERT INTO #MesMaterialMap (SourceID, Source, MaterialId)
+        SELECT Cast(mm.SourceID AS NVARCHAR(100)), mm.[Source], m.Id
+        FROM MaterialMapping mm WITH (NOLOCK)
+        INNER JOIN Material m WITH (NOLOCK) ON m.MaterialCode = mm.MaterialCode
+        WHERE mm.[Source] IN ('ERP', 'MES') AND mm.IsCurrent = 1;
+
+        IF Object_id('tempdb..#ResourceMap') IS NOT NULL DROP TABLE #ResourceMap;
+        CREATE TABLE #ResourceMap (
+            ResourceCode NVARCHAR(50) NOT NULL PRIMARY KEY,
+            ResourceId   INT          NOT NULL
+        );
+
+        INSERT INTO #ResourceMap (ResourceCode, ResourceId)
+        SELECT ResourceCode, Id
+        FROM Resource WITH (NOLOCK)
+        WHERE IsActive = 1;
+
+        IF Object_id('tempdb..#DeptMap') IS NOT NULL DROP TABLE #DeptMap;
+        CREATE TABLE #DeptMap (
+            DeptCode              NVARCHAR(50) NOT NULL PRIMARY KEY,
+            ProductionDepartmentId INT          NOT NULL
+        );
+
+        INSERT INTO #DeptMap (DeptCode, ProductionDepartmentId)
+        SELECT SourceDeptCode, Id
+        FROM ProductionDepartment WITH (NOLOCK)
+        WHERE IsActive = 1 AND SourceDeptCode IS NOT NULL;
+
+
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 2：一次性加载 RoutingOperation 视图到临时表（关键优化）
+        -- ═══════════════════════════════════════════════════════════════
+        IF Object_id('tempdb..#RoutingOperationSource') IS NOT NULL DROP TABLE #RoutingOperationSource;
+        CREATE TABLE #RoutingOperationSource (
+            MES_ID               NVARCHAR(100),
+            Source               NVARCHAR(20),
+            MaterialId           INT,
+            ProductionDeptCode   NVARCHAR(50),
+            ProductionDepartmentId INT,
+            RouteCode            NVARCHAR(200),
+            PathId               INT,
+            OperationCode        NVARCHAR(50),
+            OperationName        NVARCHAR(200),
+            ProcessType          NVARCHAR(50),
+            StageCode            NVARCHAR(50),
+            StandardDuration     DECIMAL(18,4),
+            SetupTime            DECIMAL(18,4),
+            IsActive             BIT
+        );
+
+        -- 一次性加载并完成映射（避免重复扫描视图）
+        INSERT INTO #RoutingOperationSource
+        SELECT
+            v.MES_ID,
+            v.Source,
+            mm.MaterialId,
+            v.ProductionDeptCode,
+            dm.ProductionDepartmentId,
+            Isnull(v.RouteCode, 'DEFAULT'),
+            Isnull(v.PathId, 1),
+            v.OperationCode,
+            v.OperationName,
+            v.ProcessType,
+            v.StageCode,
+            Isnull(v.StandardTime, 0),
+            Isnull(v.SetupTime, 0),
+            Isnull(v.IsActive, 1)
+        FROM ext_MES_APS_Routing_Operation_View v WITH (NOLOCK)
+        LEFT JOIN #MesMaterialMap mm ON mm.SourceID = Cast(v.MES_ID AS NVARCHAR(100)) AND mm.Source = v.Source
+        LEFT JOIN #DeptMap dm ON dm.DeptCode = v.ProductionDeptCode
+        WHERE Isnull(v.IsActive, 1) = 1
+        OPTION (MAXDOP 4);
+
+        -- 统计未映射（从临时表统计，不再扫描视图）
+        DECLARE @UnmappedOp INT, @DeptUnmappedOp INT;
+        SELECT @UnmappedOp = Count(*) FROM #RoutingOperationSource WHERE MaterialId IS NULL;
+        SELECT @DeptUnmappedOp = Count(*) FROM #RoutingOperationSource WHERE MaterialId IS NOT NULL AND ProductionDepartmentId IS NULL;
+
+        -- MERGE（只处理映射成功的行）
+        DECLARE @OpMerge TABLE (Action NVARCHAR(10), NewIsActive BIT);
+
+        MERGE INTO RoutingOperation AS T
+        USING (
+            SELECT * FROM (
+                SELECT *, Row_number() OVER (PARTITION BY MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode ORDER BY MES_ID DESC) AS _rn
+                FROM #RoutingOperationSource
+                WHERE MaterialId IS NOT NULL AND ProductionDepartmentId IS NOT NULL
+            ) x WHERE _rn = 1
+        ) AS S
+           ON T.MaterialId             = S.MaterialId
+          AND T.ProductionDepartmentId = S.ProductionDepartmentId
+          AND T.RouteCode              = S.RouteCode
+          AND T.PathId                 = S.PathId
+          AND T.OperationCode          = S.OperationCode
+        WHEN MATCHED AND (
+                T.OperationName    <> S.OperationName
+             OR T.ProcessType      <> S.ProcessType
+             OR Isnull(T.StageCode,'') <> Isnull(S.StageCode,'')
+             OR T.StandardDuration <> S.StandardDuration
+             OR T.SetupTime        <> S.SetupTime
+             OR T.IsActive         = 0
+        ) THEN UPDATE SET
+            OperationName    = S.OperationName,
+            ProcessType      = S.ProcessType,
+            StageCode        = S.StageCode,
+            StandardDuration = S.StandardDuration,
+            SetupTime        = S.SetupTime,
+            IsActive         = 1,
+            UpdatedAt        = Getdate()
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode, OperationName, ProcessType, StageCode, StandardDuration, SetupTime, IsActive, CreatedAt, UpdatedAt)
+            VALUES (S.MaterialId, S.ProductionDepartmentId, S.RouteCode, S.PathId, S.OperationCode, S.OperationName, S.ProcessType, S.StageCode, S.StandardDuration, S.SetupTime, 1, Getdate(), Getdate())
+        -- ?? v2.0 优化：去除 WHEN NOT MATCHED BY SOURCE（避免全表扫描）
+        -- 软删除改为定期全量对账任务处理
+        OUTPUT $action, INSERTED.IsActive INTO @OpMerge(Action, NewIsActive)
+        OPTION (MAXDOP 4);
+
+        SELECT
+            @OperationInserted    = Isnull(Sum(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END), 0),
+            @OperationUpdated     = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 1 THEN 1 ELSE 0 END), 0),
+            @OperationDeactivated = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 0 THEN 1 ELSE 0 END), 0)
+        FROM @OpMerge;
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 3：一次性加载 RoutingDependency 视图到临时表
+        -- ═══════════════════════════════════════════════════════════════
+        IF Object_id('tempdb..#RoutingDependencySource') IS NOT NULL DROP TABLE #RoutingDependencySource;
+        CREATE TABLE #RoutingDependencySource (
+            MES_ID                NVARCHAR(100),
+            Source                NVARCHAR(20),
+            MaterialId            INT,
+            ProductionDeptCode    NVARCHAR(50),
+            ProductionDepartmentId INT,
+            RouteCode             NVARCHAR(200),
+            PathId                INT,
+            FromOperationCode     NVARCHAR(50),
+            ToOperationCode       NVARCHAR(50),
+            DependencyType        NVARCHAR(10),
+            LagTime               DECIMAL(18,4),
+            IsActive              BIT
+        );
+
+        INSERT INTO #RoutingDependencySource
+        SELECT
+            v.MES_ID,
+            v.Source,
+            mm.MaterialId,
+            v.ProductionDeptCode,
+            dm.ProductionDepartmentId,
+            Isnull(v.RouteCode, 'DEFAULT'),
+            Isnull(v.PathId, 1),
+            v.FromOperationCode,
+            v.ToOperationCode,
+            Isnull(v.DependencyType, 'ES'),
+            Isnull(v.LagTime, 0),
+            Isnull(v.IsActive, 1)
+        FROM ext_MES_APS_Routing_Dependency_View v WITH (NOLOCK)
+        LEFT JOIN #MesMaterialMap mm ON mm.SourceID = Cast(v.MES_ID AS NVARCHAR(100)) AND mm.Source = v.Source
+        LEFT JOIN #DeptMap dm ON dm.DeptCode = v.ProductionDeptCode
+        WHERE Isnull(v.IsActive, 1) = 1
+        OPTION (MAXDOP 4);
+
+        DECLARE @UnmappedDep INT, @DeptUnmappedDep INT;
+        SELECT @UnmappedDep = Count(*) FROM #RoutingDependencySource WHERE MaterialId IS NULL;
+        SELECT @DeptUnmappedDep = Count(*) FROM #RoutingDependencySource WHERE MaterialId IS NOT NULL AND ProductionDepartmentId IS NULL;
+
+        DECLARE @DepMerge TABLE (Action NVARCHAR(10), NewIsActive BIT);
+
+        MERGE INTO RoutingDependency AS T
+        USING (
+            SELECT * FROM (
+                SELECT *, Row_number() OVER (PARTITION BY MaterialId, ProductionDepartmentId, RouteCode, PathId, FromOperationCode, ToOperationCode ORDER BY MES_ID DESC) AS _rn
+                FROM #RoutingDependencySource
+                WHERE MaterialId IS NOT NULL AND ProductionDepartmentId IS NOT NULL AND ToOperationCode IS NOT NULL
+            ) x WHERE _rn = 1
+        ) AS S
+           ON T.MaterialId             = S.MaterialId
+          AND T.ProductionDepartmentId = S.ProductionDepartmentId
+          AND T.RouteCode              = S.RouteCode
+          AND T.PathId                 = S.PathId
+          AND T.FromOperationCode      = S.FromOperationCode
+          AND T.ToOperationCode        = S.ToOperationCode
+        WHEN MATCHED AND (
+                T.DependencyType <> S.DependencyType
+             OR T.LagTime        <> S.LagTime
+             OR T.IsActive        = 0
+        ) THEN UPDATE SET
+            DependencyType = S.DependencyType,
+            LagTime        = S.LagTime,
+            IsActive       = 1,
+            UpdatedAt      = Getdate()
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (MaterialId, ProductionDepartmentId, RouteCode, PathId, FromOperationCode, ToOperationCode, DependencyType, LagTime, IsActive, CreatedAt, UpdatedAt)
+            VALUES (S.MaterialId, S.ProductionDepartmentId, S.RouteCode, S.PathId, S.FromOperationCode, S.ToOperationCode, S.DependencyType, S.LagTime, 1, Getdate(), Getdate())
+        OUTPUT $action, INSERTED.IsActive INTO @DepMerge(Action, NewIsActive)
+        OPTION (MAXDOP 4);
+
+        SELECT
+            @DependencyInserted    = Isnull(Sum(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END), 0),
+            @DependencyUpdated     = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 1 THEN 1 ELSE 0 END), 0),
+            @DependencyDeactivated = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 0 THEN 1 ELSE 0 END), 0)
+        FROM @DepMerge;
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 4：RoutingStage（数据量相对较小，保持原逻辑）
+        -- ═══════════════════════════════════════════════════════════════
+        IF Object_id('tempdb..#RoutingStageSource') IS NOT NULL DROP TABLE #RoutingStageSource;
+        CREATE TABLE #RoutingStageSource (
+            MES_ID       NVARCHAR(100),
+            Source       NVARCHAR(20),
+            MaterialId   INT,
+            RouteCode    NVARCHAR(200),
+            PathId       INT,
+            StageCode    NVARCHAR(50),
+            StageName    NVARCHAR(200),
+            IsOutsource  BIT,
+            IsStockPoint BIT,
+            IsActive     BIT
+        );
+
+        INSERT INTO #RoutingStageSource
+        SELECT
+            v.MES_ID,
+            v.Source,
+            mm.MaterialId,
+            Isnull(v.RouteCode, 'DEFAULT'),
+            Isnull(v.PathId, 1),
+            v.StageCode,
+            v.StageName,
+            Isnull(v.IsOutsource, 0),
+            Isnull(v.IsStockPoint, 0),
+            Isnull(v.IsActive, 1)
+        FROM ext_MES_APS_Routing_Stage_View v WITH (NOLOCK)
+        LEFT JOIN #MesMaterialMap mm ON mm.SourceID = Cast(v.MES_ID AS NVARCHAR(100)) AND mm.Source = v.Source
+        WHERE Isnull(v.IsActive, 1) = 1;
+
+        DECLARE @UnmappedStage INT;
+        SELECT @UnmappedStage = Count(*) FROM #RoutingStageSource WHERE MaterialId IS NULL;
+
+        DECLARE @StgMerge TABLE (Action NVARCHAR(10), NewIsActive BIT);
+
+        MERGE INTO RoutingStage AS T
+        USING (
+            SELECT * FROM (
+                SELECT *, Row_number() OVER (PARTITION BY MaterialId, RouteCode, PathId, StageCode ORDER BY MES_ID DESC) AS _rn
+                FROM #RoutingStageSource WHERE MaterialId IS NOT NULL
+            ) x WHERE _rn = 1
+        ) AS S
+           ON T.MaterialId = S.MaterialId
+          AND T.RouteCode  = S.RouteCode
+          AND T.PathId     = S.PathId
+          AND T.StageCode  = S.StageCode
+        WHEN MATCHED AND (
+                T.StageName    <> S.StageName
+             OR T.IsOutsource  <> S.IsOutsource
+             OR T.IsStockPoint <> S.IsStockPoint
+             OR T.IsActive      = 0
+        ) THEN UPDATE SET
+            StageName    = S.StageName,
+            IsOutsource  = S.IsOutsource,
+            IsStockPoint = S.IsStockPoint,
+            IsActive     = 1,
+            UpdatedAt    = Getdate()
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (MaterialId, RouteCode, PathId, StageCode, StageName, IsOutsource, IsStockPoint, IsActive, CreatedAt, UpdatedAt)
+            VALUES (S.MaterialId, S.RouteCode, S.PathId, S.StageCode, S.StageName, S.IsOutsource, S.IsStockPoint, 1, Getdate(), Getdate())
+        OUTPUT $action, INSERTED.IsActive INTO @StgMerge(Action, NewIsActive);
+
+        SELECT
+            @StageInserted    = Isnull(Sum(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END), 0),
+            @StageUpdated     = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 1 THEN 1 ELSE 0 END), 0),
+            @StageDeactivated = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 0 THEN 1 ELSE 0 END), 0)
+        FROM @StgMerge;
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 5：一次性加载 OperationResourceEligibility 视图到临时表
+        -- ═══════════════════════════════════════════════════════════════
+        IF Object_id('tempdb..#EligibilitySource') IS NOT NULL DROP TABLE #EligibilitySource;
+        CREATE TABLE #EligibilitySource (
+            MES_ID                NVARCHAR(100),
+            Source                NVARCHAR(20),
+            MaterialId            INT,
+            ProductionDeptCode    NVARCHAR(50),
+            ProductionDepartmentId INT,
+            ResourceCode          NVARCHAR(50),
+            ResourceId            INT,
+            RouteCode             NVARCHAR(200),
+            PathId                INT,
+            OperationCode         NVARCHAR(50),
+            Priority              INT,
+            CapacityFactor        DECIMAL(18,4),
+            IsActive              BIT
+        );
+
+        INSERT INTO #EligibilitySource
+        SELECT
+            v.MES_ID,
+            v.Source,
+            mm.MaterialId,
+            v.ProductionDeptCode,
+            dm.ProductionDepartmentId,
+            v.ResourceCode,
+            rm.ResourceId,
+            Isnull(v.RouteCode, 'DEFAULT'),
+            Isnull(v.PathId, 1),
+            v.OperationCode,
+            Isnull(v.Priority, 1),
+            Isnull(v.CapacityFactor, 1.0),
+            Isnull(v.IsActive, 1)
+        FROM ext_APS_OperationResourceEligibility_View v WITH (NOLOCK)
+        LEFT JOIN #MesMaterialMap mm ON mm.SourceID = Cast(v.MES_ID AS NVARCHAR(100)) AND mm.Source = v.Source
+        LEFT JOIN #DeptMap dm ON dm.DeptCode = v.ProductionDeptCode
+        LEFT JOIN #ResourceMap rm ON rm.ResourceCode = v.ResourceCode
+        WHERE Isnull(v.IsActive, 1) = 1
+        OPTION (MAXDOP 4);
+
+        DECLARE @UnmappedElig INT, @DeptUnmappedElig INT;
+        SELECT @UnmappedElig = Count(*) FROM #EligibilitySource WHERE MaterialId IS NULL;
+        SELECT @ResourceUnmappedSkipped = Count(*) FROM #EligibilitySource WHERE MaterialId IS NOT NULL AND ResourceId IS NULL;
+        SELECT @DeptUnmappedElig = Count(*) FROM #EligibilitySource WHERE MaterialId IS NOT NULL AND ProductionDepartmentId IS NULL;
+
+        DECLARE @EligMerge TABLE (Action NVARCHAR(10), NewIsActive BIT);
+
+        MERGE INTO OperationResourceEligibility AS T
+        USING (
+            SELECT * FROM (
+                SELECT *, Row_number() OVER (PARTITION BY MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode, ResourceId ORDER BY MES_ID DESC) AS _rn
+                FROM #EligibilitySource
+                WHERE MaterialId IS NOT NULL
+                  AND ProductionDepartmentId IS NOT NULL
+                  AND ResourceId IS NOT NULL
+            ) x WHERE _rn = 1
+        ) AS S
+           ON T.MaterialId             = S.MaterialId
+          AND T.ProductionDepartmentId = S.ProductionDepartmentId
+          AND T.RouteCode              = S.RouteCode
+          AND T.PathId                 = S.PathId
+          AND T.OperationCode          = S.OperationCode
+          AND T.ResourceId             = S.ResourceId
+        WHEN MATCHED AND (
+                T.Priority       <> S.Priority
+             OR T.CapacityFactor <> S.CapacityFactor
+             OR T.IsActive        = 0
+        ) THEN UPDATE SET
+            Priority       = S.Priority,
+            CapacityFactor = S.CapacityFactor,
+            IsActive       = 1,
+            UpdatedAt      = Getdate()
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode, ResourceId, Priority, CapacityFactor, IsActive, EffectiveFrom, CreatedAt, UpdatedAt)
+            VALUES (S.MaterialId, S.ProductionDepartmentId, S.RouteCode, S.PathId, S.OperationCode, S.ResourceId, S.Priority, S.CapacityFactor, 1, Cast(Getdate() AS DATE), Getdate(), Getdate())
+        OUTPUT $action, INSERTED.IsActive INTO @EligMerge(Action, NewIsActive)
+        OPTION (MAXDOP 4);
+
+        SELECT
+            @EligibilityInserted    = Isnull(Sum(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END), 0),
+            @EligibilityUpdated     = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 1 THEN 1 ELSE 0 END), 0),
+            @EligibilityDeactivated = Isnull(Sum(CASE WHEN Action = 'UPDATE' AND NewIsActive = 0 THEN 1 ELSE 0 END), 0)
+        FROM @EligMerge;
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 6：汇总统计 + 写日志
+        -- ═══════════════════════════════════════════════════════════════
+        SET @UnmappedSkipped = Isnull(@UnmappedOp, 0) + Isnull(@UnmappedDep, 0) + Isnull(@UnmappedStage, 0) + Isnull(@UnmappedElig, 0);
+        SET @DeptUnmappedSkipped = Isnull(@DeptUnmappedOp, 0) + Isnull(@DeptUnmappedDep, 0) + Isnull(@DeptUnmappedElig, 0);
+
+        DECLARE @ElapsedMs INT = Datediff(MILLISECOND, @StartTime, Getdate());
+
+        INSERT INTO APS_ETL_Log (BatchNo, Step, Message, Status, CreatedAt)
+        VALUES (
+            @BatchNo,
+            'sp_SyncRoutingData_v2.0',
+            Concat(
+                'Op(I/U/D)=',  @OperationInserted,  '/', @OperationUpdated,  '/', @OperationDeactivated,
+                ', Dep(I/U/D)=', @DependencyInserted, '/', @DependencyUpdated, '/', @DependencyDeactivated,
+                ', Stage(I/U/D)=', @StageInserted,  '/', @StageUpdated,    '/', @StageDeactivated,
+                ', Elig(I/U/D)=', @EligibilityInserted, '/', @EligibilityUpdated, '/', @EligibilityDeactivated,
+                ', Unmapped=', @UnmappedSkipped,
+                ', ResUnmapped=', @ResourceUnmappedSkipped,
+                ', DeptUnmapped=', @DeptUnmappedSkipped,
+                ', Elapsed=', @ElapsedMs, 'ms'
+            ),
+            'SUCCESS',
+            Getdate()
+        );
+
+        -- 清理临时表
+        DROP TABLE IF EXISTS #MesMaterialMap;
+        DROP TABLE IF EXISTS #ResourceMap;
+        DROP TABLE IF EXISTS #DeptMap;
+        DROP TABLE IF EXISTS #RoutingOperationSource;
+        DROP TABLE IF EXISTS #RoutingDependencySource;
+        DROP TABLE IF EXISTS #RoutingStageSource;
+        DROP TABLE IF EXISTS #EligibilitySource;
+
+        COMMIT TRANSACTION;
+
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        SET @ErrorMessage = Concat(
+            'sp_SyncRoutingData_v2.0 失败 [Error ', Error_number(), ' Line ', Error_line(), ']: ',
+            Error_message()
+        );
+
+        INSERT INTO APS_ETL_Log (BatchNo, Step, Message, Status, CreatedAt)
+        VALUES (@BatchNo, 'sp_SyncRoutingData_v2.0', @ErrorMessage, 'FAILED', Getdate());
+    END CATCH
+END;
+

@@ -6,9 +6,20 @@ namespace LPS.APS.Scheduling.Solvers;
 
 /// <summary>
 /// 时间槽寻址器
-/// 【1号位核心组件】阶段3步骤3.2
-/// 
-/// 职责：
+///
+/// 【遗留死代码】本类已不再被生产排程使用。
+/// 唯一引用方是 FiniteCapacitySolver 的遗留方法 Solve() / Reschedule()（同为死代码，见 FiniteCapacitySolver.cs 头注释）。
+/// 生产五阶段流程（SolveAsync → Phase1-5）不经过本类：
+/// - Phase2 使用 PhaseTwoInitialScheduler 自带的 FindForwardSlot（Line 903）
+/// - Phase4 使用 PhaseFourLocalRepair 自带的 FindForwardSlot（Line 979）
+/// 这两处副本才是真实生效的寻址逻辑，且已按「0号位裁决（2026-09-12）：无末期限制」移除了 planHorizonEnd 截断。
+///
+/// ⚠️ 注意：本类下方 FindForwardSlot 里仍保留着 `calWindow.Start >= planHorizonEnd → break`（L212）
+/// 和 `windowEnd = min(calWindow.End, planHorizonEnd)`（L220）两行截断逻辑——这是 2号位曾引用的位置，
+/// 但它们只存在于这条死代码路径上，对生产结果没有任何影响。请勿据此判断生产正排行为。
+/// 保留本类仅为历史参考，请勿在此路径上修改或新增逻辑。
+///
+/// 早期职责（已失效，仅供理解原设计）：
 /// - 倒排寻址：从交期往前推，寻找最晚可开工时间
 /// - 撞墙翻转正排：倒排撞到产能墙时，自动翻转为正排（从当前时间往后推）
 /// - 虚拟库存硬约束：检查 AvailableTime，物料未到则不能开工

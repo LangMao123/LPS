@@ -3,7 +3,7 @@ namespace LPS.APS.Core.DTOs.Governance;
 /// <summary>
 /// 白天候选运行创建入参（B-1）
 /// 语义：3号位 创建白天候选 ScheduleRun（RUNNING，冻结 RunType × Purpose × 策略版本 × 预期 Domain）
-///       + 新建 Candidate PlanVersion 壳（BUILDING）；触发 2号位 主流程留契约接缝。
+///       + 新建 Candidate PlanVersion 壳（Created）；触发 2号位 主流程留契约接缝。
 /// 校验规则见 IRunLifecycleService.CreateCandidateRunAsync（任一失败抛 InvalidOperationException）。
 /// </summary>
 /// <remarks>开发者：3号位</remarks>

@@ -1,0 +1,36 @@
+
+
+/****** SSMS µÄ SelectTopNRows ÃüÁîµÄ½Å±¾  ******/
+CREATE VIEW [dbo].[MES_APS_OperationProgress_View]
+AS
+SELECT [ProductionInstructionNo]
+	  ,NULL [InstructionType]
+      ,[MESWorkOrderNo]
+      ,[MaterialCode]
+      ,[OperationName]
+      ,CAST([StageCode] AS NVARCHAR(20)) [StageCode]
+      ,[StageName]
+      ,[PlannedQty]
+      ,CAST([GoodQty] AS DECIMAL(18,4)) [GoodQty]
+      ,CAST([ScrapQty] AS DECIMAL(18,4))[ScrapQty]
+      ,CAST([ReworkQty] AS DECIMAL(18,4))[ReworkQty]
+      ,[LastReportTime]
+      ,[SourceUpdatedAt]
+  FROM [MES_Integration].[dbo].[MES_APS_OperationProgress_Mach_View]
+UNION ALL
+SELECT 
+       [ProductionInstructionNo]
+      ,[InstructionType]
+      ,[MESWorkOrderNo]
+      ,CAST([MaterialCode] AS NVARCHAR(100)) [MaterialCode]
+      ,CAST([OperationName] AS NVARCHAR(200)) [OperationName]
+      ,CAST([StageCode] AS NVARCHAR(20)) [StageCode]
+      ,CAST([StageName] AS NVARCHAR(100)) [StageName]
+      ,CAST([PlannedQty] AS DECIMAL(18,4))[PlannedQty]
+      ,CAST([GoodQty] AS DECIMAL(18,4))[GoodQty]
+      ,CAST([ScrapQty] AS DECIMAL(18,4))[ScrapQty]
+      ,CAST([ReworkQty] AS DECIMAL(18,4))[ReworkQty]
+      ,[LastReportTime]
+      ,[SourceUpdatedAt]
+  FROM [MES_Integration].[dbo].[Assy_OperationProgress_View]
+

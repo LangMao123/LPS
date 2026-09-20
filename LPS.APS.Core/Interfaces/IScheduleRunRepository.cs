@@ -34,7 +34,7 @@ public interface IScheduleRunRepository
     /// <summary>
     /// 白天候选运行创建（B-1：0号位 2026-08-29 裁决3——ScheduleRun 创建归 3号位 运行治理侧）。
     /// 单事务原子写入：① ScheduleRun（Status='RUNNING'，冻结 RunType / BasePlanVersionId / StrategyProfileVersionId / ExpectedDomainKeysJson）；
-    ///                 ② 新建 Candidate PlanVersion 壳（Status='BUILDING'，VersionCategory='CANDIDATE'，SourceScheduleRunId=新 Run Id）。
+    ///                 ② 新建 Candidate PlanVersion 壳（Status='Created'，VersionCategory='CANDIDATE'，SourceScheduleRunId=新 Run Id）。
     /// 任一步失败整体回滚，不产生孤立 RUNNING 运行。触发 2号位 主流程不在本方法内（契约接缝，见 IRunLifecycleService）。
     /// </summary>
     /// <param name="spec">创建入参（RunType / DomainKey / BasePlanVersionId / DataCutoffTime / Actor / 壳计划窗口）</param>

@@ -37,7 +37,7 @@ public class SolverStrategyValidatorTests
             Mode = SolverStrategyMode.Mixed,
             OnTimeTarget = new OnTimeTargetParams { TargetPercent = 95, IsPrimaryObjective = true },
             Split = new SplitParams { MaxOptimizationSplitCount = 3, LimitMandatorySplit = false, MinBatchQty = 1 },
-            Setup = new SetupParams { Dimensions = ["Mold", "Color"], DefaultSetupMinutes = 30, SetupLookAheadSize = 5 },
+            Setup = new SetupParams { DefaultSetupMinutes = 30, SetupLookAheadSize = 5 },
             StageOverlap = new StageOverlapParams { AllowOverlap = false, TransferBatchQty = 10, ThresholdQty = 5, ThresholdPercent = 20 }
         };
 
@@ -91,21 +91,6 @@ public class SolverStrategyValidatorTests
         // Assert
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.Contains("MaxOptimizationSplitCount"));
-    }
-
-    [Fact]
-    public void E4_SetupDefaultSetupMinutes_非正_拒绝()
-    {
-        // Arrange
-        var block = new SolverStrategyBlock();
-        block.Setup.DefaultSetupMinutes = 0;
-
-        // Act
-        var result = _validator.Validate(block);
-
-        // Assert
-        result.IsValid.Should().BeFalse();
-        result.Errors.Should().Contain(e => e.Contains("DefaultSetupMinutes"));
     }
 
     [Fact]

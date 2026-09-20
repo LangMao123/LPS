@@ -28,7 +28,9 @@ public class OrderQueryRepository : IOrderQueryRepository
         string? status = null,
         int skip = 0,
         int take = 50,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null)
     {
         var sql = @"
 SELECT
@@ -65,6 +67,8 @@ WHERE o.PlanVersionId = @PlanVersionId
     AND (@DomainKey IS NULL OR o.DomainKey = @DomainKey)
     AND (@DelayStatus IS NULL OR o.DelayStatus = @DelayStatus)
     AND (@Status IS NULL OR o.Status = @Status)
+    AND (@AllowedFactories IS NULL OR f.Code IN @AllowedFactories)
+    AND (@AllowedDomains IS NULL OR o.DomainKey IN @AllowedDomains)
 ORDER BY o.Priority DESC, o.CustomerDueDate
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -78,6 +82,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             DomainKey = domainKey,
             DelayStatus = delayStatus,
             Status = status,
+            AllowedFactories = allowedFactories,
+            AllowedDomains = allowedDomains,
             Skip = skip,
             Take = take
         };
@@ -190,5 +196,37 @@ ORDER BY t.OperationSeq";
             Pegging = pegging,
             Tasks = tasks
         };
+    }
+
+    public async Task<OrderSummaryDto> GetSummaryAsync(
+        int planVersionId,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null,
+        CancellationToken ct = default)
+    {
+        var sql = @"
+SELECT
+    COUNT(*) AS TotalCount,
+    SUM(CASE WHEN o.DelayStatus IS NULL OR o.DelayStatus = 'ON_TIME' THEN 1 ELSE 0 END) AS OnTimeCount,
+    SUM(CASE WHEN o.DelayStatus IN ('FIRST_DELAY', 'REPEATED_DELAY') THEN 1 ELSE 0 END) AS DelayedCount,
+    SUM(CASE WHEN o.DelayStatus = 'RISK' THEN 1 ELSE 0 END) AS RiskCount,
+    SUM(CASE WHEN o.Status = 'UNSCHEDULED' THEN 1 ELSE 0 END) AS UnscheduledCount
+FROM [Order] o
+LEFT JOIN Factory f ON f.Id = o.FactoryId
+WHERE o.PlanVersionId = @PlanVersionId
+    AND (@AllowedFactories IS NULL OR f.Code IN @AllowedFactories)
+    AND (@AllowedDomains IS NULL OR o.DomainKey IN @AllowedDomains)";
+
+        var parameters = new
+        {
+            PlanVersionId = planVersionId,
+            AllowedFactories = allowedFactories,
+            AllowedDomains = allowedDomains
+        };
+
+        var result = await _connectionManager.QueryFirstOrDefaultAsync<OrderSummaryDto>(
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+
+        return result ?? new OrderSummaryDto { PlanVersionId = planVersionId };
     }
 }

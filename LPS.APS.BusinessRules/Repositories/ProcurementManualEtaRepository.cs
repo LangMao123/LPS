@@ -40,7 +40,7 @@ public class ProcurementManualEtaRepository : IProcurementManualEtaRepository
     {
         var sql = @"
 SELECT
-    PONo, LineNo, MaterialId, MaterialCode, ReceivingWarehouse,
+    PONo, [LineNo], MaterialId, MaterialCode, ReceivingWarehouse,
     ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark
 FROM ProcurementManualEtaOverride
 WHERE 1=1
@@ -88,11 +88,11 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
     {
         var sql = @"
 SELECT
-    PONo, LineNo, MaterialId, MaterialCode, ReceivingWarehouse,
+    PONo, [LineNo], MaterialId, MaterialCode, ReceivingWarehouse,
     ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark
 FROM ProcurementManualEtaOverride
 WHERE PONo = @PONo
-    AND LineNo = @LineNo
+    AND [LineNo] = @LineNo
     AND MaterialId = @MaterialId
     AND ReceivingWarehouse = @ReceivingWarehouse";
 
@@ -120,12 +120,12 @@ WHERE PONo = @PONo
 MERGE INTO ProcurementManualEtaOverride AS target
 USING (SELECT
     @PONo AS PONo,
-    @LineNo AS LineNo,
+    @LineNo AS [LineNo],
     @MaterialId AS MaterialId,
     @ReceivingWarehouse AS ReceivingWarehouse
 ) AS source
 ON target.PONo = source.PONo
-    AND target.LineNo = source.LineNo
+    AND target.[LineNo] = source.[LineNo]
     AND target.MaterialId = source.MaterialId
     AND target.ReceivingWarehouse = source.ReceivingWarehouse
 WHEN MATCHED THEN
@@ -136,7 +136,7 @@ WHEN MATCHED THEN
         UpdatedAt = GETDATE(),
         Remark = @Remark
 WHEN NOT MATCHED THEN
-    INSERT (PONo, LineNo, MaterialId, MaterialCode, ReceivingWarehouse,
+    INSERT (PONo, [LineNo], MaterialId, MaterialCode, ReceivingWarehouse,
             ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark)
     VALUES (@PONo, @LineNo, @MaterialId, @MaterialCode, @ReceivingWarehouse,
             @ManualEta, @IsActive, @UpdatedBy, GETDATE(), @UpdatedBy, GETDATE(), @Remark);";
@@ -182,7 +182,7 @@ SET IsActive = 0,
     UpdatedBy = @UpdatedBy,
     UpdatedAt = GETDATE()
 WHERE PONo = @PONo
-    AND LineNo = @LineNo
+    AND [LineNo] = @LineNo
     AND MaterialId = @MaterialId
     AND ReceivingWarehouse = @ReceivingWarehouse;";
 

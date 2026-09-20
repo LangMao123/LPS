@@ -1,9 +1,11 @@
 using System.Security.Claims;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Shared.Models;
 using LPS.APS.Web.Dto.Auth;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace LPS.APS.Web.Controllers;
 
@@ -16,11 +18,13 @@ namespace LPS.APS.Web.Controllers;
 public class AuthController : ControllerBase
 {
     private readonly IAuthService _authService;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<AuthController> _logger;
 
-    public AuthController(IAuthService authService, ILogger<AuthController> logger)
+    public AuthController(IAuthService authService, IDataScopeService dataScopeService, ILogger<AuthController> logger)
     {
         _authService = authService;
+        _dataScopeService = dataScopeService;
         _logger = logger;
     }
 
@@ -29,6 +33,7 @@ public class AuthController : ControllerBase
     /// </summary>
     [HttpPost("login")]
     [AllowAnonymous]
+    [EnableRateLimiting("login")] // M3：登录 IP 维度限流
     public async Task<ApiResponse<LoginResponseDto>> Login([FromBody] LoginRequestDto request)
     {
         if (string.IsNullOrWhiteSpace(request.UserCode) || string.IsNullOrWhiteSpace(request.Password))
@@ -96,22 +101,37 @@ public class AuthController : ControllerBase
 
     /// <summary>
     /// 获取当前用户信息（验证Token有效性）
+    /// 含业务范围（IsGlobal + 各维度集合），直接复用 IDiaScopeService（不建立第二套 Scope DTO 真值）。
     /// </summary>
     [HttpGet("me")]
     [Authorize]
-    public ApiResponse<UserInfoDto> GetCurrentUser()
+    public async Task<ApiResponse<UserInfoDto>> GetCurrentUser(CancellationToken ct)
     {
         var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
         var userCode = User.FindFirst(ClaimTypes.Name)?.Value;
         var userName = User.FindFirst("userName")?.Value;
         var roles = User.FindAll(ClaimTypes.Role).Select(c => c.Value).ToList();
+        var permissions = User.FindAll(PermissionCodes.PermissionClaimType).Select(c => c.Value).ToList();
+
+        var currentUserId = int.TryParse(userId, out var id) ? id : 0;
+        var scope = await _dataScopeService.ResolveScopeAsync(currentUserId, ct);
 
         return ApiResponse<UserInfoDto>.Success(new UserInfoDto
         {
-            UserId = int.Parse(userId ?? "0"),
+            UserId = currentUserId,
             UserCode = userCode ?? "",
             UserName = userName ?? "",
-            Roles = roles
+            Roles = roles,
+            Permissions = permissions,
+            IsGlobal = scope.IsGlobal,
+            Factories = ScopeValues(scope, DataScopeTypes.Factory),
+            ProductFamilies = ScopeValues(scope, DataScopeTypes.ProductFamily),
+            Departments = ScopeValues(scope, DataScopeTypes.Department),
+            Domains = ScopeValues(scope, DataScopeTypes.Domain),
+            ResourceOrgGroups = ScopeValues(scope, DataScopeTypes.ResourceOrgGroup)
         });
     }
+
+    private static List<string> ScopeValues(DataScopeContext scope, string scopeType)
+        => scope.GetValues(scopeType)?.OrderBy(x => x, StringComparer.Ordinal).ToList() ?? new List<string>();
 }
