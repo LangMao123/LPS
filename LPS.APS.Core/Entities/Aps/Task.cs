@@ -52,6 +52,27 @@ public class Task
     /// </summary>
     public string? MTS_InstructionNo { get; set; }
 
+    /// <summary>
+    /// 换型来源（唯一落库值 = 4 态：INITIAL_SETUP_STATE / EXACT / DEFAULT / SETUP_RULE_MISSING_ZERO_FALLBACK，
+    /// 0号位 2026-09-22 裁决）。
+    /// 实体列（非计算属性）；1号位 填充、2号位 原样落库不映射；禁止查询层反推。
+    /// </summary>
+    public string? SetupSource { get; set; }
+
+    /// <summary>
+    /// 大工艺阶段码（= RoutingOperation.StageCode，1号位 FinalTaskDraft.StageCode 透传）。
+    /// 同一物料可跨多个大工艺（机加工/表面处理…），Task 落库必须带 StageCode，
+    /// 否则下发 MES 时区分不出「这是哪个 Stage 的指示」（2026-09-21，TaskDispatch 引申缺口）。
+    /// </summary>
+    public string? StageCode { get; set; }
+
+    /// <summary>
+    /// 人工能力槽号（PM 0923 资源模型裁决）：人工能力槽在运行时投影为合成 ResourceId，结果落库时拆回——
+    /// 存 ManualSlotId、ResourceId 置 NULL（不落负号/不落合成大数）。设备 Task 此列为 NULL。
+    /// 逻辑 FK → ManualCapacitySlot.ManualSlotId。
+    /// </summary>
+    public int? ManualSlotId { get; set; }
+
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
 }

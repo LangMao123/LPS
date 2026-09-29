@@ -146,6 +146,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 t.PlannedStartTime,
                 t.PlannedEndTime,
                 t.Status,
+                t.SetupSource                 AS SetupSource,
                 CAST(CASE
                     WHEN t.PlannedEndTime IS NOT NULL
                      AND o.CustomerDueDate IS NOT NULL
@@ -397,6 +398,128 @@ public class ScheduleQueryService : IScheduleQueryService
             },
             BaseSummary = baseSummary,
             CandidateSummary = candidateSummary
+        };
+    }
+
+    /// <inheritdoc />
+    public async Task<CandidateSummaryDto> GetCandidateSummaryAsync(
+        int userId,
+        int candidateRunId,
+        CancellationToken cancellationToken = default)
+    {
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+
+        var run = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string Status)>(
+            "SELECT Id, Status FROM ScheduleRun WHERE Id = @Id",
+            new { Id = candidateRunId },
+            db: DatabaseId.APS);
+
+        if (run.Id == 0)
+            throw new KeyNotFoundException($"候选运行不存在：{candidateRunId}");
+
+        var pv = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string DomainKey, string CreatedBy, DateTime CreatedAt)>(
+            @"SELECT Id, DomainKey, CreatedBy, CreatedAt
+              FROM PlanVersion
+              WHERE SourceScheduleRunId = @RunId AND VersionCategory = 'CANDIDATE'",
+            new { RunId = candidateRunId },
+            db: DatabaseId.APS);
+
+        if (pv.Id == 0 || !IsDomainAllowed(allowed, pv.DomainKey))
+            throw new KeyNotFoundException($"候选运行不存在或超出当前用户业务范围：{candidateRunId}");
+
+        var counts = await _connectionManager.QueryFirstOrDefaultAsync<(int OrderCount, int TaskCount)>(
+            @"SELECT
+                (SELECT COUNT(*) FROM [Order] WHERE PlanVersionId = @PvId) AS OrderCount,
+                (SELECT COUNT(*) FROM [Task] WHERE PlanVersionId = @PvId) AS TaskCount",
+            new { PvId = pv.Id },
+            db: DatabaseId.APS);
+
+        return new CandidateSummaryDto
+        {
+            CandidateId = candidateRunId,
+            RunStatus = run.Status,
+            OrderCount = counts.OrderCount,
+            TaskCount = counts.TaskCount,
+            CreatedBy = pv.CreatedBy,
+            CreatedAt = pv.CreatedAt
+        };
+    }
+
+    /// <inheritdoc />
+    public async Task<CandidateDiffDto> GetCandidateDiffAsync(
+        int userId,
+        int candidateRunId,
+        CancellationToken cancellationToken = default)
+    {
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+
+        var run = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, int? BasePlanVersionId)>(
+            "SELECT Id, BasePlanVersionId FROM ScheduleRun WHERE Id = @Id",
+            new { Id = candidateRunId },
+            db: DatabaseId.APS);
+
+        if (run.Id == 0)
+            throw new KeyNotFoundException($"候选运行不存在：{candidateRunId}");
+
+        var pv = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string DomainKey)>(
+            "SELECT Id, DomainKey FROM PlanVersion WHERE SourceScheduleRunId = @RunId AND VersionCategory = 'CANDIDATE'",
+            new { RunId = candidateRunId },
+            db: DatabaseId.APS);
+
+        if (pv.Id == 0 || !IsDomainAllowed(allowed, pv.DomainKey))
+            throw new KeyNotFoundException($"候选运行不存在或超出当前用户业务范围：{candidateRunId}");
+
+        if (run.BasePlanVersionId is not int baseId)
+            throw new InvalidOperationException($"候选运行 {candidateRunId} 无基础计划版本（BasePlanVersionId 为空）");
+
+        var parameters = new { CandidateId = pv.Id, BaseId = baseId };
+
+        var addedOrders = (await _connectionManager.QueryAsync<int?>(
+            $@"SELECT DISTINCT t_c.OrderId
+               FROM [Task] t_c
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND NOT EXISTS (
+                   SELECT 1 FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})",
+            parameters, db: DatabaseId.APS))
+            .Where(x => x.HasValue).Select(x => x!.Value).ToList();
+
+        var removedOrders = (await _connectionManager.QueryAsync<int?>(
+            $@"SELECT DISTINCT t_b.OrderId
+               FROM [Task] t_b
+               WHERE t_b.PlanVersionId = @BaseId
+                 AND NOT EXISTS (
+                   SELECT 1 FROM [Task] t_c
+                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})",
+            parameters, db: DatabaseId.APS))
+            .Where(x => x.HasValue).Select(x => x!.Value).ToList();
+
+        var changedTasks = (await _connectionManager.QueryAsync<ChangedTaskDto>(
+            $@"SELECT
+                 t_c.OrderId, t_c.MaterialId, t_c.OperationSeq, t_c.OperationCode,
+                 t_c.RouteCode, t_c.PathId, t_c.ResourceId,
+                 t_c.PlannedStartTime, t_c.PlannedEndTime
+               FROM [Task] t_c
+               WHERE t_c.PlanVersionId = @CandidateId
+                 AND EXISTS (
+                   SELECT 1 FROM [Task] t_b
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                     AND (
+                       (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
+                       OR t_c.PlannedStartTime <> t_b.PlannedStartTime
+                       OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
+                       OR t_c.PlannedEndTime <> t_b.PlannedEndTime
+                       OR (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
+                       OR t_c.ResourceId <> t_b.ResourceId))",
+            parameters, db: DatabaseId.APS)).ToList();
+
+        return new CandidateDiffDto
+        {
+            BasePlanVersionId = baseId,
+            CandidatePlanVersionId = pv.Id,
+            AddedOrders = addedOrders,
+            RemovedOrders = removedOrders,
+            ChangedTasks = changedTasks
         };
     }
 

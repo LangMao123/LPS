@@ -27,11 +27,12 @@ public class DataScopeService : IDataScopeService
             .Where(x => x.UserId == userId)
             .Select(x => x.ScopePolicyId);
 
-        // 2. 角色范围策略 Id（UserRole → RoleDataScope）
+        // 2. 角色范围策略 Id（UserRole → RoleDataScope；join Role 过滤停用角色，与权限解析对齐）
         var roleScopeIds =
             from ur in _context.UserRoles
+            join r in _context.Roles on ur.RoleId equals r.Id
             join rd in _context.RoleDataScopes on ur.RoleId equals rd.RoleId
-            where ur.UserId == userId
+            where ur.UserId == userId && r.IsActive
             select rd.ScopePolicyId;
 
         var policyIds = await userScopeIds.Union(roleScopeIds).Distinct().ToListAsync(cancellationToken);

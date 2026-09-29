@@ -310,7 +310,7 @@ public class FrozenStrategySnapshotProviderIntegrationTests : IDisposable
         {
             Mode = SolverStrategyMode.Backward,
             OnTimeTarget = new OnTimeTargetParams { TargetPercent = 85 },
-            Setup = new SetupParams { DefaultSetupMinutes = 45, SetupLookAheadSize = 4 }
+            Setup = new SetupParams()
         });
 
         var candidateGuardrailJson = JsonSerializer.Serialize(new CandidateGuardrailBlock

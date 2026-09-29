@@ -41,7 +41,13 @@ public class DomainDefinitionGovernanceServiceTests
     }
 
     /// <summary>构造合法 FAMILY 域定义入参（FactoryId 必须为空）</summary>
-    private static DomainDefinition ValidFamilyInput(string domainKey = "D1")
+    /// <remarks>
+    /// 【2026-09-29 修正】原默认值为 <c>"D1"</c> —— **违反现行 DomainKey 校验规则**（`DomainKeyPattern`：
+    /// 首字符大写字母、**4-50 字符**、仅 [A-Z0-9_-]，见 <c>DomainDefinitionGovernanceService.ValidateCoreAsync</c> 的 F2 注释）。
+    /// 后果：本类唯一走到 key 校验的正例 `Create_授权同Domain_放行` 恒失败；另外 3 个负例在 **scope 检查**处
+    /// 先抛（scope 校验先于 key 校验），恰好因对而绿、未暴露该问题。改用 4 字符合法键。
+    /// </remarks>
+    private static DomainDefinition ValidFamilyInput(string domainKey = "DOM1")
         => new()
         {
             DomainKey = domainKey,
@@ -123,13 +129,13 @@ public class DomainDefinitionGovernanceServiceTests
         // Arrange（负向控制）：授权同域 → 放行并落库审计
         _dataScopeService
             .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Domain, "D1") }));
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Domain, "DOM1") }));
         _repository
             .Setup(r => r.CreateAsync(It.IsAny<DomainDefinition>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new DomainDefinition { Id = 1, DomainKey = "D1", IsActive = true, ScopeType = "FAMILY", ProductFamilyId = 1 });
+            .ReturnsAsync(new DomainDefinition { Id = 1, DomainKey = "DOM1", IsActive = true, ScopeType = "FAMILY", ProductFamilyId = 1 });
 
         // Act
-        var result = await _service.CreateAsync(ValidFamilyInput("D1"), 1, "u1", CancellationToken.None);
+        var result = await _service.CreateAsync(ValidFamilyInput("DOM1"), 1, "u1", CancellationToken.None);
 
         // Assert
         result.Id.Should().Be(1);

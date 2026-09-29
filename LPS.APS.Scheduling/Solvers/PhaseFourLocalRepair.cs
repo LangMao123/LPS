@@ -40,7 +40,14 @@ internal class PhaseFourLocalRepair
         // 4. 固定不可移动约束：Execution/Firm/Frozen/Protection/外Domain阻挡
         // 5. Fallback兜底：局部修复超限 → 本Domain全部可移动任务重排
 
-        if (request.CandidateContext?.ChangeSeedKeys != null && request.CandidateContext.ChangeSeedKeys.Count > 0)
+        // M5 第一批：Task 软目标（RunScope.TaskTargetOverrides）也触发传播修复——目标 Task 优先重排（软偏好贴近 TargetTime）。
+        bool hasTaskTargets = request.RunScope?.TaskTargetOverrides is { Count: > 0 };
+        // A 项（§69 明定的三个 Seed 之一）：资源变化（停机/加班/维修）也是传播起点——
+        // 仅 ChangeSeedKeys/TaskTargetOverrides 无法承载「某资源可用性变了 → 其上已排 Task 需重评估」。
+        // 口径（与 2号位 双向确认，见《白天候选配合事项 回执 v1.0》§一）：
+        // ChangedResourceIds 只作传播起点，不得当事实源（§13.4）—— 不改变资源可用性判定，不新增机制。
+        bool hasChangedResources = request.RunScope?.ChangedResourceIds is { Count: > 0 };
+        if ((request.CandidateContext?.ChangeSeedKeys != null && request.CandidateContext.ChangeSeedKeys.Count > 0) || hasTaskTargets || hasChangedResources)
         {
             // Candidate模式：影响传播
             return RepairWithPropagation(request, scheduleResult, diagnostics, constraints, resourceOccupancy);
@@ -69,7 +76,7 @@ internal class PhaseFourLocalRepair
         var affectedTasks = new HashSet<string>(); // FinalDraftId
         var affectedDemands = new HashSet<string>(); // LogicalDemandKey
 
-        foreach (var seedKey in request.CandidateContext!.ChangeSeedKeys)
+        foreach (var seedKey in request.CandidateContext?.ChangeSeedKeys ?? Array.Empty<string>())
         {
             // 关联已排任务：按DemandKey/AllocationSequence找到对应的已排Task
             foreach (var task in scheduleResult.ScheduledTasks)
@@ -100,6 +107,55 @@ internal class PhaseFourLocalRepair
             }
         }
 
+        // M5 第一批：Task 软目标 → 目标 Task 进影响集（传播优先处理，软偏好贴近 TargetTime；
+        // 匹配键 (DraftId=SourceDraftId, OperationCode)）。
+        //
+        // ⛔ 「未达 TargetTime 的决策说明」产出点**此处暂不落码**（2026-09-28 复核后确认），三个前置未满足：
+        //   ① 载体虽已落（2号位 r13494 `DomainSolveResult.SolveTraceNotes`），但 1号位 2026-09-24
+        //      《白天候选配合事项 回执 v1.1》§2.3/§2.4 已向 2号位 提请 3 项并声明「三小项一并明确后…同批落两处产出点」：
+        //      `ReasonCode` 位是否改名（撞域，1号位 倾向改名）/ `Level` 取值域 / `Key` 语义（失踪键 vs 产出点标识）。**2号位 尚未答复**。
+        //   ② 「未达」判定口径在契约中**不存在**：`TaskTargetOverride`（DomainSolveRequest.cs:311）仅定义
+        //      「(DraftId, OperationCode) → TargetTime」，未规定 TargetTime 对应 PlannedStartTime 还是 PlannedEndTime，
+        //      亦无容差定义。自创即违反「要求 1号位 按某键判定时该键必须是契约既有字段」通则 → 投结论不投判据。
+        //   ③ 产出点位置须在 Phase5 之后：Phase5 `CompactGaps`/`OptimizeSetupSequences` 会继续移动与重排序 Task，
+        //      在 Phase4 记录「未达」会立即过时。
+        //   ⇒ 三项齐备后，落点应在 PhaseFiveCompression 压实与序列优化之后、导出 `SolveTraceNotes` 之前。
+        if (request.RunScope?.TaskTargetOverrides != null)
+        {
+            foreach (var target in request.RunScope.TaskTargetOverrides)
+            {
+                // ⚠ 键域说明（0号位 2026-09-29 §5.3 后复核）：契约 `TaskTargetOverride` 的键就是
+                //   **(DraftId, OperationCode)**，契约内**没有 StageCode** ⇒ 1号位不得自行加维
+                //   （通则：按某键判定时该键必须是契约既有字段；否则投结论不投判据）。
+                //   同码跨 Stage 时会多收另一 Stage 的同名 Task ⇒ 影响集**偏大**（方向保守：只扩大重排范围，
+                //   不会漏收、不产生错误计划）；代价是可能更早触及 §13.4 的 30% 警戒线而走 Fallback。
+                //   若后续要精确化，须由 2号位 在契约层补 StageCode，不在 1号位 自决。
+                foreach (var task in scheduleResult.ScheduledTasks.Where(t =>
+                             t.SourceDraftId == target.DraftId && t.OperationCode == target.OperationCode))
+                {
+                    affectedTasks.Add(task.FinalDraftId);
+                }
+            }
+        }
+
+        // A 项（§69 明定的 Seed 之一）：ChangedResourceIds → 该资源上的已排 Task 进影响集。
+        // 匹配键：RunScope.ChangedResourceIds（int，与 ResourceDefinition.ResourceId 同域，2号位 原样透传）
+        //         ↔ FinalTaskDraft.ResourceId（int?，非资源工序 UNCONSTRAINED/WAIT_ONLY 为 NULL，自然不命中）。
+        // ⚠ 规模提示：资源维度的影响集 = 该资源上「全部」已排 Task，单点即可能逼近 §13.4 的 30% 警戒线
+        //   （maxAffectedTasks）→ 超线走既有 Fallback（本 Domain 可移动任务全量重排）；
+        //   代价是性能而非正确性，已在《06 拆批两域自检与优化性拆批成本缺口》§六 登记（与实施包 §19 同源风险）。
+        if (request.RunScope?.ChangedResourceIds is { Count: > 0 } changedResourceIds)
+        {
+            var changedResourceIdSet = new HashSet<int>(changedResourceIds);
+            foreach (var task in scheduleResult.ScheduledTasks)
+            {
+                if (task.ResourceId is int taskResourceId && changedResourceIdSet.Contains(taskResourceId))
+                {
+                    affectedTasks.Add(task.FinalDraftId);
+                }
+            }
+        }
+
         // 2. 传播Guardrail（文档§十三 13.4）
         // 第8轮P0-02修复：30%是警戒线而非硬截断，修复小规模场景Bug
         // P1-02：轮数/警戒线改读冻结参数（B 组整块透传，零行为变化：默认 10 / 30%）
@@ -116,6 +172,14 @@ internal class PhaseFourLocalRepair
         var propagationRound = 0;
         var taskSnapshots = new Dictionary<string, TaskSnapshot>(); // FinalDraftId -> 快照
         var immovableTasks = IdentifyImmovableTasks(request, scheduleResult.ScheduledTasks);
+
+        // 锚点（Anchor）不可移动：ExecutionConstraints 标记的 Task 不进影响集——它们是「保持原位的真实约束」，
+        // 既不重排也不参与传播（与 Phase5 压实跳过 immovable 的处置一致）。
+        // 修复背景：初始集原未排除锚点，导致「既是锚点又是变化种子」的 Task 会被 relocation 主循环搬走
+        //           （该主循环只排连带牺牲者，不查 immovableTasks 自身）。
+        // 注：IdentifyImmovableTasks 只认 request.ExecutionConstraints；当前生产侧该字段恒空
+        //     （PeggingOrchestrator.cs:210「当前锚点机制未建……故预留为空」），本保护在锚点通道接通后生效。
+        affectedTasks.ExceptWith(immovableTasks);
 
         // 初始化所有已排任务的快照
         foreach (var task in scheduleResult.ScheduledTasks)
@@ -157,18 +221,27 @@ internal class PhaseFourLocalRepair
                 var taskSetup = TimeSpan.FromMinutes((double)task.SetupTime);
                 var taskOccupancyStart = task.PlannedStartTime - taskSetup;
 
-                // 1. 从resourceOccupancy中移除当前Task占用
-                if (resourceOccupancy.TryGetValue(task.ResourceId, out var occupiedWindows))
+                // 1. 从resourceOccupancy中移除当前Task占用（非资源 Task ResourceId=NULL，无占用，跳过）
+                if (task.ResourceId is int rid)
                 {
-                    occupiedWindows.RemoveAll(w =>
-                        w.Start == taskOccupancyStart && w.End == task.PlannedEndTime);
+                    if (resourceOccupancy.TryGetValue(rid, out var occupiedWindows))
+                    {
+                        occupiedWindows.RemoveAll(w =>
+                            w.Start == taskOccupancyStart && w.End == task.PlannedEndTime);
+                    }
+                    // item1 接线（阶段二）：产品时间线同步摘除，移动/保持后按最终位置重新登记
+                    constraints.ProductTimeline.Remove(rid, task.PlannedEndTime, task.MaterialId);
                 }
 
                 // 2. 计算该Task的工序约束时间窗
                 var demand = request.LogicalProductionDemands
                     .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
 
-                DateTime earliestStart = task.PlannedStartTime; // 默认保持原位置
+                // item1 接线（阶段二）：默认 floor 用占用起点（含 Setup）而非加工起点——
+                // 旧口径（加工起点当占用 floor）会让槽查找系统性晚 Setup 量，传播每轮向后漂移直至轮次耗尽。
+                // 前序约束（predEnd+lag）是加工口径，直接作占用 floor 属保守收紧（proc ≥ predEnd+lag+setup），
+                // 永不违反硬约束；精确的 occ floor = procFloor - setupEstimate 留待夜间 FULL 精细化。
+                DateTime earliestStart = taskOccupancyStart; // 默认保持原位置（占用口径）
                 // P0-02修复：latestEnd 不再默认等于原结束时间（那会人为锁死Task位置），
                 // 改为 DateTime.MaxValue，仅由后继约束（如有）收紧。
                 DateTime latestEnd = DateTime.MaxValue;
@@ -177,14 +250,19 @@ internal class PhaseFourLocalRepair
                 {
                     if (routeGraphs.TryGetValue("DEFAULT", out var graph))
                     {
+                        // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
+                        // 同码跨 Stage 时若只按 OperationCode 匹配，会把另一 Stage 的同名工序误认为前驱/后继。
+                        var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
+
                         // 检查前驱约束：必须在所有前驱完成后开始
-                        if (graph.Dependencies.TryGetValue(task.OperationCode, out var predecessors))
+                        if (graph.Dependencies.TryGetValue(taskNodeKey, out var predecessors))
                         {
                             foreach (var pred in predecessors)
                             {
                                 var predecessorTask = scheduleResult.ScheduledTasks
                                     .FirstOrDefault(t => t.SourceDraftId == task.SourceDraftId &&
-                                                        t.OperationCode == pred.FromOperationCode);
+                                                        t.StageCode == pred.From.StageCode &&
+                                                        t.OperationCode == pred.From.OperationCode);
                                 if (predecessorTask != null)
                                 {
                                     var predEnd = predecessorTask.PlannedEndTime.AddMinutes((double)pred.LagTime);
@@ -198,15 +276,16 @@ internal class PhaseFourLocalRepair
 
                         // 检查后继约束：必须在所有后继开始前完成
                         var successors = graph.Dependencies
-                            .Where(kvp => kvp.Value.Any(dep => dep.FromOperationCode == task.OperationCode))
-                            .SelectMany(kvp => kvp.Value.Where(dep => dep.FromOperationCode == task.OperationCode)
-                                .Select(dep => new { ToOpCode = kvp.Key, LagMinutes = dep.LagTime }));
+                            .Where(kvp => kvp.Value.Any(dep => dep.From == taskNodeKey))
+                            .SelectMany(kvp => kvp.Value.Where(dep => dep.From == taskNodeKey)
+                                .Select(dep => new { ToNode = kvp.Key, LagMinutes = dep.LagTime }));
 
                         foreach (var succ in successors)
                         {
                             var successorTask = scheduleResult.ScheduledTasks
                                 .FirstOrDefault(t => t.SourceDraftId == task.SourceDraftId &&
-                                                    t.OperationCode == succ.ToOpCode);
+                                                    t.StageCode == succ.ToNode.StageCode &&
+                                                    t.OperationCode == succ.ToNode.OperationCode);
                             if (successorTask != null)
                             {
                                 var succStart = successorTask.PlannedStartTime.AddMinutes(-(double)succ.LagMinutes);
@@ -219,25 +298,31 @@ internal class PhaseFourLocalRepair
                     }
                 }
 
-                // 3. P0-02修复：用日历感知的 FindForwardSlot 寻找可用时间窗（含Setup占用），
-                // 修复此前朴素 gap 扫描不遵守 Resource Calendar / Setup occupancy 的问题。
+                // 3. P0-02修复 + item1 接线（阶段二）：日历感知 + 动态 Setup 规则查找（含Setup占用）。
+                // 移动后的 Task 以新位置前产品重解析 Setup（v1.2 §11.1：移动必须重算受影响邻接），
+                // 不再读 RoutingOperation.SetupTime（§1.2/§20.3 废止）。
                 var duration = task.PlannedEndTime - task.PlannedStartTime;
-                var totalDuration = duration + taskSetup;
 
-                var slot = FindForwardSlot(
-                    earliestStart,
-                    totalDuration,
-                    task.ResourceId,
-                    constraints,
-                    resourceOccupancy,
-                    request.PlanningEnd);
+                // 非资源 Task（ResourceId=NULL）不占资源、无槽可找 → 跳过重排（found=null，走"保持原位置"分支）
+                var found = task.ResourceId is int ridSlot
+                    ? SetupOptimizer.FindSlotWithDynamicSetup(
+                        earliestStart, duration, ridSlot, task.OperationCode, task.MaterialId,
+                        constraints.ProductTimeline, constraints.SetupExactRules, constraints.SetupDefaultRules,
+                        (f, total) => FindForwardSlot(f, total, ridSlot, constraints, resourceOccupancy, request.PlanningEnd))
+                    : ((TimeWindow Slot, decimal SetupMinutes, SetupOptimizer.SetupResolution Resolution)?)null;
 
-                bool foundSlot = slot.HasValue && slot.Value.End <= latestEnd;
-                DateTime newStart = foundSlot ? slot!.Value.Start + taskSetup : task.PlannedStartTime;
-                DateTime newEnd = foundSlot ? slot!.Value.End : task.PlannedEndTime;
+                bool foundSlot = found.HasValue && found.Value.Slot.End <= latestEnd;
+                decimal newSetupMinutes = foundSlot ? found!.Value.SetupMinutes : task.SetupTime;
+                var newSetup = TimeSpan.FromMinutes((double)newSetupMinutes);
+                DateTime newStart = foundSlot ? found!.Value.Slot.Start + newSetup : task.PlannedStartTime;
+                DateTime newEnd = foundSlot ? found!.Value.Slot.End : task.PlannedEndTime;
+                // SetupSource 填充：新位置以新解析命中类型更新；无新槽时保留原来源（2号位 原样落库）
+                string? newSetupSource = foundSlot
+                    ? SetupOptimizer.SetupOutcomeToSource(found!.Value.Resolution.Outcome)
+                    : task.SetupSource;
 
-                // 4. 如果找到新位置且与原位置不同，创建新FinalTaskDraft替换
-                if (foundSlot && (newStart != task.PlannedStartTime || newEnd != task.PlannedEndTime))
+                // 4. 如果找到新位置且与原位置不同（或 Setup 解析值变化），创建新FinalTaskDraft替换
+                if (foundSlot && (newStart != task.PlannedStartTime || newEnd != task.PlannedEndTime || newSetupMinutes != task.SetupTime))
                 {
                     // 创建新FinalTaskDraft对象（init-only属性需要重新构造）
                     var updatedTask = new FinalTaskDraft
@@ -259,7 +344,8 @@ internal class PhaseFourLocalRepair
                         UOM = task.UOM,
                         PlannedStartTime = newStart,  // 新位置
                         PlannedEndTime = newEnd,      // 新位置
-                        SetupTime = task.SetupTime,
+                        SetupTime = newSetupMinutes,  // item1 接线：新位置规则解析值（§11.1 移动重算）
+                        SetupSource = newSetupSource, // SetupSource 填充：新位置命中类型 / 保留原来源
                         Priority = task.Priority,
                         IsVirtual = task.IsVirtual,
                         StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
@@ -275,23 +361,32 @@ internal class PhaseFourLocalRepair
                         scheduleResult.ScheduledTasks[taskIndex] = updatedTask;
                     }
 
-                    // 5. 更新resourceOccupancy
-                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    // 5. 更新resourceOccupancy（P0-02：占用窗口含Setup；found.Slot 即 [newStart-Setup, newEnd]）
+                    // 非资源 Task（ResourceId=NULL）不占资源，跳过占用登记。
+                    if (task.ResourceId is int ridRep)
                     {
-                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                        if (!resourceOccupancy.ContainsKey(ridRep))
+                        {
+                            resourceOccupancy[ridRep] = new List<TimeWindow>();
+                        }
+                        resourceOccupancy[ridRep].Add(found!.Value.Slot);
+                        constraints.ProductTimeline.Place(ridRep, newEnd, task.MaterialId);
                     }
-                    // P0-02修复：占用窗口含Setup（newStart已是Setup之后的加工开始，需回退Setup）
-                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(newStart - taskSetup, newEnd));
                 }
-                else if (foundSlot)
+                else
                 {
-                    // 位置未变，但需要重新加回resourceOccupancy
-                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    // 位置未变或无可行槽：原样加回 resourceOccupancy + 产品时间线。
+                    // （item1 接线顺手修复：旧代码「找不到槽」时占用不加回，形成伪空洞 → 后续 Task 可能与其重叠。）
+                    if (task.ResourceId is int ridKeep)
                     {
-                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                        if (!resourceOccupancy.ContainsKey(ridKeep))
+                        {
+                            resourceOccupancy[ridKeep] = new List<TimeWindow>();
+                        }
+                        // P0-02修复：占用窗口含Setup
+                        resourceOccupancy[ridKeep].Add(new TimeWindow(taskOccupancyStart, task.PlannedEndTime));
+                        constraints.ProductTimeline.Place(ridKeep, task.PlannedEndTime, task.MaterialId);
                     }
-                    // P0-02修复：占用窗口含Setup
-                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(taskOccupancyStart, task.PlannedEndTime));
                 }
 
 
@@ -303,14 +398,18 @@ internal class PhaseFourLocalRepair
                 {
                     if (taskRouteGraphs.TryGetValue("DEFAULT", out var graph))
                     {
+                        // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
+                        var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
+
                         // 1.1 前序传播：找当前工序的前驱
-                        if (graph.Dependencies.TryGetValue(task.OperationCode, out var predecessors))
+                        if (graph.Dependencies.TryGetValue(taskNodeKey, out var predecessors))
                         {
                             foreach (var pred in predecessors)
                             {
                                 var predecessorTask = scheduleResult.ScheduledTasks
                                     .FirstOrDefault(t => t.SourceDraftId == task.SourceDraftId &&
-                                                        t.OperationCode == pred.FromOperationCode);
+                                                        t.StageCode == pred.From.StageCode &&
+                                                        t.OperationCode == pred.From.OperationCode);
                                 if (predecessorTask != null && !immovableTasks.Contains(predecessorTask.FinalDraftId))
                                 {
                                     nextRoundAffected.Add(predecessorTask.FinalDraftId);
@@ -318,12 +417,13 @@ internal class PhaseFourLocalRepair
                             }
                         }
 
-                        // 1.2 后序传播：找到以当前Operation作为FromOperationCode的所有后继
+                        // 1.2 后序传播：找到以当前节点作为 From 的所有后继
                         var successors = graph.Dependencies
-                            .Where(kvp => kvp.Value.Any(dep => dep.FromOperationCode == task.OperationCode))
+                            .Where(kvp => kvp.Value.Any(dep => dep.From == taskNodeKey))
                             .SelectMany(kvp => scheduleResult.ScheduledTasks
                                 .Where(t => t.SourceDraftId == task.SourceDraftId &&
-                                           t.OperationCode == kvp.Key &&
+                                           t.StageCode == kvp.Key.StageCode &&
+                                           t.OperationCode == kvp.Key.OperationCode &&
                                            !immovableTasks.Contains(t.FinalDraftId)));
 
                         foreach (var successorTask in successors)
@@ -417,9 +517,14 @@ internal class PhaseFourLocalRepair
                             if (materialRouteGraphs.TryGetValue("DEFAULT", out var materialGraph))
                             {
                                 // 检查consumer是否依赖当前Task的工序
-                                if (materialGraph.Dependencies.TryGetValue(consumer.OperationCode, out var consumerPreds))
+                                // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
+                                var consumerNodeKey = OperationNodeKey.Of(consumer.StageCode, consumer.OperationCode);
+                                var currentTaskNodeKey = OperationNodeKey.Of(
+                                    currentTaskForMaterial.StageCode, currentTaskForMaterial.OperationCode);
+
+                                if (materialGraph.Dependencies.TryGetValue(consumerNodeKey, out var consumerPreds))
                                 {
-                                    if (consumerPreds.Any(dep => dep.FromOperationCode == currentTaskForMaterial.OperationCode))
+                                    if (consumerPreds.Any(dep => dep.From == currentTaskNodeKey))
                                     {
                                         nextRoundAffected.Add(consumer.FinalDraftId);
                                     }
@@ -561,12 +666,16 @@ internal class PhaseFourLocalRepair
                 // 更新资源占用
                 foreach (var task in repairedTasks)
                 {
-                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    // 非资源 Task（ResourceId=NULL）不占资源，跳过登记
+                    if (task.ResourceId is not int ridRep) continue;
+                    if (!resourceOccupancy.ContainsKey(ridRep))
                     {
-                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                        resourceOccupancy[ridRep] = new List<TimeWindow>();
                     }
-                    resourceOccupancy[task.ResourceId].Add(
-                        new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+                    // P0-02 口径：Task 占用从 Setup 起点算起（与 BuildResourceOccupancy 及移除口径一致）。
+                    // 旧写法用 PlannedStartTime（加工起点）会漏登 Setup 那一段，导致后续 Task 被排进本 Task 的 Setup 窗口。
+                    var occStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
+                    resourceOccupancy[ridRep].Add(new TimeWindow(occStart, task.PlannedEndTime));
                 }
             }
             else
@@ -644,17 +753,24 @@ internal class PhaseFourLocalRepair
                 // 更新资源占用
                 foreach (var task in repairedTasks)
                 {
-                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    // 非资源 Task（ResourceId=NULL）不占资源，跳过登记
+                    if (task.ResourceId is not int ridRep) continue;
+                    if (!resourceOccupancy.ContainsKey(ridRep))
                     {
-                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                        resourceOccupancy[ridRep] = new List<TimeWindow>();
                     }
-                    resourceOccupancy[task.ResourceId].Add(
-                        new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+                    // P0-02 口径：Task 占用从 Setup 起点算起（与 BuildResourceOccupancy 及移除口径一致）。
+                    // 旧写法用 PlannedStartTime（加工起点）会漏登 Setup 那一段，导致后续 Task 被排进本 Task 的 Setup 窗口。
+                    var occStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
+                    resourceOccupancy[ridRep].Add(new TimeWindow(occStart, task.PlannedEndTime));
                 }
 
-                // TODO P6: Setup邻接优化
-                // 文档§十一：当Task插入/移动时，重新计算它与前后邻居的Setup
-                // Setup属性可包括：模具、刀具、材质、颜色等冻结配置维度
+                // 待办（原 TODO P6，描述已按 v1.2 更新）：本修复路径的 Setup 邻接关系重算。
+                // 现状：Setup 由 TryResourceSwitch → FindSlotWithDynamicSetup 在放置时解析（含时间线邻接前产品的规则命中）；
+                //       占用登记口径见上方 P0-02 修复（从 Setup 起点算起）。
+                // 未覆盖：Task 插入/移动后若时间线上前后邻居的产品关系变化，邻居自身的 Setup 未随之重算
+                //       （属有界序列优化范畴；Phase5 夜间 FULL 的 OptimizeSetupSequences 已覆盖 FORWARD 方向）。
+                // 注：旧描述「模具/刀具/材质/颜色」属 v1.2 已废止的 SetupAttribute 口径，勿再引用。
             }
             else
             {
@@ -723,14 +839,16 @@ internal class PhaseFourLocalRepair
 
         foreach (var task in tasks)
         {
-            if (!occupancy.ContainsKey(task.ResourceId))
+            // 非资源 Task（ResourceId=NULL）不占资源，跳过
+            if (task.ResourceId is not int ridOcc) continue;
+            if (!occupancy.ContainsKey(ridOcc))
             {
-                occupancy[task.ResourceId] = new List<TimeWindow>();
+                occupancy[ridOcc] = new List<TimeWindow>();
             }
 
             // 第4轮Setup修复：PlannedStartTime是加工开始时间（Setup之后），资源占用需从Setup开始
             var occupancyStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
-            occupancy[task.ResourceId].Add(
+            occupancy[ridOcc].Add(
                 new TimeWindow(occupancyStart, task.PlannedEndTime));
         }
 
@@ -818,7 +936,7 @@ internal class PhaseFourLocalRepair
             // 获取合格资源列表（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
             var eligibleResources = OrderResourcesByPreference(
                 demand,
-                GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints));
+                GetEligibleResources(demand.MaterialId, operation, constraints));
 
             FinalTaskDraft? scheduledTask = null;
 
@@ -828,43 +946,47 @@ internal class PhaseFourLocalRepair
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
                 // 第5轮修复：CapacityFactor缺失或非法时跳过该资源
-                var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
+                var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
                 if (capacityFactor == null || capacityFactor <= 0)
                 {
                     continue; // CapacityFactor缺失/非法，跳过该资源
                 }
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
-                var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
-                var totalDuration = processDuration + setupDuration;
 
-                var slot = FindForwardSlot(
-                    earliestStart,
-                    totalDuration,
-                    resourceId,
-                    constraints,
-                    resourceOccupancy,
-                    request.PlanningEnd);
+                // item1 接线（阶段二）：Setup = 规则查找「当前工序+当前设备+前产品→当前产品」（v1.2 §2/§5），
+                // 不再读 RoutingOperation.SetupTime（§1.2/§20.3 废止）；§12 候选评价即含 Setup。
+                var found = SetupOptimizer.FindSlotWithDynamicSetup(
+                    earliestStart, processDuration, resourceId, operation.OperationCode, demand.MaterialId,
+                    constraints.ProductTimeline, constraints.SetupExactRules, constraints.SetupDefaultRules,
+                    (f, total) => FindForwardSlot(f, total, resourceId, constraints, resourceOccupancy, request.PlanningEnd));
 
-                if (slot.HasValue)
+                if (found.HasValue)
                 {
+                    var (occSlot, setupMinutes, setupResolution) = found.Value;
                     // Task的PlannedStartTime是加工开始时间（Setup之后）
-                    var taskStart = slot.Value.Start + setupDuration;
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End, constraints);
+                    var taskStart = occSlot.Start + TimeSpan.FromMinutes((double)setupMinutes);
+                    // SetupSource 填充：解析命中类型 → 大写 5 值（5号位 值契约统一 20260921）
+                    var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource);
 
                     // 临时占用：从Setup开始
                     if (!resourceOccupancy.ContainsKey(resourceId))
                     {
                         resourceOccupancy[resourceId] = new List<TimeWindow>();
                     }
-                    resourceOccupancy[resourceId].Add(slot.Value);
+                    resourceOccupancy[resourceId].Add(occSlot);
+                    constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
 
                     // P0-17修复：应用Routing LagTime到下道工序的最早开始时间
-                    earliestStart = slot.Value.End;
+                    earliestStart = occSlot.End;
                     if (i < operations.Count - 1)
                     {
                         var nextOperation = operations[i + 1];
-                        var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
+                        var lagTime = GetLagTime(
+                            OperationNodeKey.Of(operation.StageCode, operation.OperationCode),
+                            OperationNodeKey.Of(nextOperation.StageCode, nextOperation.OperationCode),
+                            routingGraph);
                         earliestStart = earliestStart.AddMinutes((double)lagTime);
                     }
                     break;
@@ -894,15 +1016,19 @@ internal class PhaseFourLocalRepair
                         // 第5轮修复：Split Task的资源占用必须包含Setup时间
                         foreach (var splitTask in splitTasks)
                         {
-                            if (!resourceOccupancy.ContainsKey(splitTask.ResourceId))
+                            // 非资源 Task（ResourceId=NULL）不占资源，跳过登记
+                            if (splitTask.ResourceId is not int ridSplit) continue;
+                            if (!resourceOccupancy.ContainsKey(ridSplit))
                             {
-                                resourceOccupancy[splitTask.ResourceId] = new List<TimeWindow>();
+                                resourceOccupancy[ridSplit] = new List<TimeWindow>();
                             }
                             // PlannedStartTime是Setup后的加工开始时间，资源占用要从Setup开始算
                             var setupDuration = TimeSpan.FromMinutes((double)splitTask.SetupTime);
                             var resourceStart = splitTask.PlannedStartTime - setupDuration;
-                            resourceOccupancy[splitTask.ResourceId].Add(
+                            resourceOccupancy[ridSplit].Add(
                                 new TimeWindow(resourceStart, splitTask.PlannedEndTime));
+                            // item1 接线（阶段二）：拆分件逐个登记产品时间线（首件前产品=时间线邻接，后续件=前件同产品）
+                            constraints.ProductTimeline.Place(ridSplit, splitTask.PlannedEndTime, splitTask.MaterialId);
                         }
 
                         tasks.AddRange(splitTasks);
@@ -912,7 +1038,10 @@ internal class PhaseFourLocalRepair
                         if (i < operations.Count - 1)
                         {
                             var nextOperation = operations[i + 1];
-                            var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
+                            var lagTime = GetLagTime(
+                            OperationNodeKey.Of(operation.StageCode, operation.OperationCode),
+                            OperationNodeKey.Of(nextOperation.StageCode, nextOperation.OperationCode),
+                            routingGraph);
                             earliestStart = earliestStart.AddMinutes((double)lagTime);
                         }
                         continue; // Split成功，继续下一道工序
@@ -1032,11 +1161,16 @@ internal class PhaseFourLocalRepair
     /// </summary>
     private List<int> GetEligibleResources(
         int materialId,
-        string operationCode,
+        OperationNode operation,
         ConstraintContext constraints)
     {
         // 第4轮C1修复：索引加入MaterialId
-        var key = $"{materialId}::DEFAULT::{operationCode}";
+        // 0号位 2026-09-29 裁决 §5.3 落实：键升为强类型 EligibilityLookupKey，**补上 ProductionDepartmentId**
+        // （旧键写死 "DEFAULT" 且无部门 ⇒ 两个部门的同名工序资格被合并 ⇒ 跨部门串资源）。
+        // ⚠ 契约 OperationResourceEligibility **无 StageCode 字段**，无法再细到 Stage（残留见键类型注释）。
+        var key = new EligibilityLookupKey(
+            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.OperationCode);
+
         if (constraints.OperationResourceEligibility.TryGetValue(key, out var resources))
         {
             return resources;
@@ -1162,7 +1296,9 @@ internal class PhaseFourLocalRepair
         int resourceId,
         DateTime start,
         DateTime end,
-        ConstraintContext constraints)
+        decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
+        ConstraintContext constraints,
+        string? setupSource = null)  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
@@ -1188,7 +1324,8 @@ internal class PhaseFourLocalRepair
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
-            SetupTime = operation.SetupTime,
+            SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
+            SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
@@ -1205,9 +1342,11 @@ internal class PhaseFourLocalRepair
     /// P0-04修复：获取资源产能系数
     /// 第4轮C1修复：索引加入MaterialId
     /// </summary>
-    private decimal? GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
+    private decimal? GetCapacityFactor(int materialId, OperationNode operation, int resourceId, ConstraintContext constraints)
     {
-        var key = $"{materialId}::DEFAULT::{operationCode}";
+        // 0号位 2026-09-29 裁决 §5.3 落实：与 GetEligibleResources 同步升维（键补 ProductionDepartmentId）
+        var key = new EligibilityLookupKey(
+            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.OperationCode);
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
         {
             if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
@@ -1223,15 +1362,17 @@ internal class PhaseFourLocalRepair
     /// P0-17修复：获取工序间的Lag时间（分钟）
     /// 应用Routing LagTime到工序间时间依赖
     /// 第4轮审核修正：Dependencies按ToOperationCode存储，应查toOperationCode
+    /// 0号位 2026-09-29 裁决 §5.3：节点身份升维为 (StageCode, OperationCode)，
+    ///   出入参由 string operationCode 改为 OperationNodeKey，避免同码跨 Stage 时取到错误边的 LagTime。
     /// </summary>
-    private decimal GetLagTime(string fromOperationCode, string toOperationCode, RoutingGraph routingGraph)
+    private decimal GetLagTime(OperationNodeKey fromNode, OperationNodeKey toNode, RoutingGraph routingGraph)
     {
-        // Dependencies结构：Key=ToOperationCode, Value=该To的所有前驱边
-        // 应查找toOperation的前驱边列表，找到FromOperationCode匹配的边
-        if (routingGraph.Dependencies.TryGetValue(toOperationCode, out var edges))
+        // Dependencies结构：Key=To节点, Value=该To的所有前驱边
+        // 应查找toNode的前驱边列表，找到From匹配的边
+        if (routingGraph.Dependencies.TryGetValue(toNode, out var edges))
         {
-            // 找到从fromOperation来的边
-            var edge = edges.FirstOrDefault(e => e.FromOperationCode == fromOperationCode);
+            // 找到从fromNode来的边
+            var edge = edges.FirstOrDefault(e => e.From == fromNode);
             if (edge != null)
             {
                 return edge.LagTime;
@@ -1280,38 +1421,68 @@ internal class PhaseFourLocalRepair
                 foreach (var resourceId in eligibleResources)
                 {
                     // 计算Split Task的Duration
-                    // 第4轮Setup修复：Split任务也需要Setup时间
                     // 第5轮修复：CapacityFactor缺失或非法时跳过该资源
-                    var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
+                    var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
                     if (capacityFactor == null || capacityFactor <= 0)
                     {
                         continue; // CapacityFactor缺失/非法，跳过该资源
                     }
                     var adjustedDuration = operation.StandardDuration * qtyPerSplit / capacityFactor.Value;
                     var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
-                    var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
-                    var totalDuration = processDuration + setupDuration;
 
-                    var slot = FindForwardSlot(
-                        candidateStart,
-                        totalDuration,
-                        resourceId,
-                        constraints,
-                        resourceOccupancy,
-                        planningEnd);
+                    // item1 接线（阶段二）：拆分件 Setup 走规则查找——首件前产品 = 资源时间线邻接；
+                    // 后续件前产品 = 前一拆分件（同产品 → v1.2 §六 A→A 显式规则或 0）。
+                    // 拆分件为模拟放置（成功前不入真实时间线/占用，成功后由调用方统一登记）；
+                    // 固定前产品下解析值不随槽位变化，有界收敛（≤3 轮，实际 ≤2）。
+                    int? fromMaterial = i == 0
+                        ? constraints.ProductTimeline.GetPrevMaterial(resourceId, candidateStart)
+                        : demand.MaterialId;
+                    decimal setupMinutes = 0m;
+                    TimeWindow? pieceSlot = null;
+                    SetupOptimizer.SetupResolution? convergedResolution = null;   // SetupSource 填充：记录收敛解析结果
+                    for (int iter = 0; iter < 3; iter++)
+                    {
+                        var totalDuration = processDuration + TimeSpan.FromMinutes((double)setupMinutes);
+                        var slot = FindForwardSlot(
+                            candidateStart,
+                            totalDuration,
+                            resourceId,
+                            constraints,
+                            resourceOccupancy,
+                            planningEnd);
+                        if (!slot.HasValue)
+                        {
+                            pieceSlot = null;
+                            break;
+                        }
 
-                    if (slot.HasValue)
+                        var resolved = SetupOptimizer.ResolveSetupCore(
+                            operation.OperationCode, resourceId, fromMaterial, demand.MaterialId,
+                            constraints.SetupExactRules, constraints.SetupDefaultRules);
+                        if (resolved.SetupMinutes == setupMinutes)
+                        {
+                            pieceSlot = slot;
+                            convergedResolution = resolved;   // SetupSource 填充：收敛值即实际命中类型
+                            break;
+                        }
+                        setupMinutes = resolved.SetupMinutes;
+                    }
+
+                    if (pieceSlot.HasValue)
                     {
                         // 创建Split Task：Quantity按比例拆分
                         // Task的PlannedStartTime是加工开始时间（Setup之后）
-                        var taskStart = slot.Value.Start + setupDuration;
+                        var taskStart = pieceSlot.Value.Start + TimeSpan.FromMinutes((double)setupMinutes);
                         var splitQuantity = demand.NetOutputQty / splitCount;
-                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, slot.Value.End, qtyPerSplit, splitQuantity, constraints);
+                        var splitSetupSource = convergedResolution.HasValue
+                            ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
+                            : null;
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, qtyPerSplit, splitQuantity, setupMinutes, constraints, splitSetupSource);
 
                         candidateTasks.Add(splitTask);
 
                         // 临时占用该槽（模拟，不真正修改resourceOccupancy）
-                        candidateStart = slot.Value.End; // 下一个Split从当前结束时间开始
+                        candidateStart = pieceSlot.Value.End; // 下一个Split从当前结束时间开始
                         break;
                     }
                 }
@@ -1346,7 +1517,9 @@ internal class PhaseFourLocalRepair
         DateTime end,
         decimal plannedProcessQty,
         decimal quantity,
-        ConstraintContext constraints)
+        decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
+        ConstraintContext constraints,
+        string? setupSource = null)  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
         string taskType = "PRODUCTION";
@@ -1369,7 +1542,8 @@ internal class PhaseFourLocalRepair
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
-            SetupTime = operation.SetupTime,
+            SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
+            SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
@@ -1390,7 +1564,7 @@ internal class RepairResult
 /// </summary>
 internal class TaskSnapshot
 {
-    public int ResourceId { get; set; }
+    public int? ResourceId { get; set; }   // 非资源工序 Task（UNCONSTRAINED/WAIT_ONLY）为 NULL
     public DateTime PlannedStartTime { get; set; }
     public DateTime PlannedEndTime { get; set; }
     public decimal Quantity { get; set; }

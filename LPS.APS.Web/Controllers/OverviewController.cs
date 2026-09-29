@@ -2,7 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Interfaces;
-using LPS.APS.BusinessRules.Services;
+using LPS.APS.Application.Services.Query;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 using Microsoft.AspNetCore.Mvc;
@@ -27,12 +27,12 @@ namespace LPS.APS.Web.Controllers;
 [Route("api/overview")]
 public class OverviewController : ControllerBase
 {
-    private readonly OverviewQueryService _service;
+    private readonly IOverviewQueryService _service;
     private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<OverviewController> _logger;
 
     public OverviewController(
-        OverviewQueryService service,
+        IOverviewQueryService service,
         IDataScopeService dataScopeService,
         ILogger<OverviewController> logger)
     {

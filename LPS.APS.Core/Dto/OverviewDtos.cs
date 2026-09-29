@@ -109,8 +109,9 @@ public sealed class OverviewCandidateSummaryDto
 }
 
 /// <summary>
-/// Candidate简要信息（candidate-summary 列表项）
-/// 补齐 4号位 §十二 17 字段中 5号位可算部分；需落盘真值字段（Estimated/跨域）在 0号位 裁决返回 null/占位
+/// Candidate简要信息（candidate-summary 列表项，仅候选元信息）
+/// 注意：Base vs Candidate 差集/Diff 统一由 3号位 ScheduleQueryService.GetCandidateComparisonAsync 提供，
+/// 5号位 Overview 列表示不重复计算，也不在列表项内承载 diff/平均完成时间等统计字段。
 /// </summary>
 public sealed class CandidateBriefDto
 {
@@ -143,46 +144,4 @@ public sealed class CandidateBriefDto
 
     /// <summary>Base 是否仍为当前 Domain ACTIVE（§12.3 激活红线前置校验）</summary>
     public bool CanActivate { get; init; }
-
-    // ---- Base vs Candidate 完成时间差（单订单最大完工时间的版本均值）----
-
-    /// <summary>Base 平均完成时间（AVG per-Order MAX(PlannedEndTime)）</summary>
-    public DateTime? BaseAvgCompletionTime { get; init; }
-
-    /// <summary>Candidate 平均完成时间</summary>
-    public DateTime? CandidateAvgCompletionTime { get; init; }
-
-    /// <summary>完成时间差（小时；Candidate - Base）</summary>
-    public decimal? AvgDeltaHours { get; init; }
-
-    // ---- Task 增删移 / Resource 变化（复用 comparison 差集 SQL）----
-
-    /// <summary>新增任务数（候选存在、基础不存在）</summary>
-    public int TaskAddedCount { get; init; }
-
-    /// <summary>移除任务数（基础存在、候选不存在）</summary>
-    public int TaskRemovedCount { get; init; }
-
-    /// <summary>时间平移任务数（同主键且起止时间任一变化）</summary>
-    public int TaskTimeShiftedCount { get; init; }
-
-    /// <summary>资源变更任务数（同主键且资源变化）</summary>
-    public int TaskResourceChangedCount { get; init; }
-
-    /// <summary>受影响订单数（发生增删移/资源变更任务的去重订单数）</summary>
-    public int ImpactedOrderCount { get; init; }
-
-    /// <summary>新增延期数（候选延期且基础同主键任务未延期的任务数）</summary>
-    public int NewDelayCount { get; init; }
-
-    // ---- 需落盘真值（0号位 裁决前占位；归 2号位/1号位，5号位不重算）----
-
-    /// <summary>估算供给订单数（⚠️ 2号位 pegging 落盘 Estimated 标志后接入；裁决前 null）</summary>
-    public int? EstimatedOnlyCount { get; init; }
-
-    /// <summary>跨域影响订单数（⚠️ 未落盘，归 2号位/1号位；裁决前 null）</summary>
-    public int? CrossDomainImpacted { get; init; }
-
-    /// <summary>跨域阻挡任务数（⚠️ 未落盘，归 1号位/2号位；裁决前 null）</summary>
-    public int? CrossDomainBlockedCount { get; init; }
 }

@@ -169,6 +169,15 @@ public class GanttTaskDto
     /// 上游阻挡阶段编码（G2-b 档②；未就绪返回 null，v1.3）
     /// </summary>
     public string? UpstreamStageCode { get; set; }
+
+    /// <summary>
+    /// 换型/Setup 来源（R3 SetupSource 输出链；v1.5 §9/§10）
+    /// 1号位 产出 → 2号位 原样落库 [Task].[SetupSource] → 本 DTO 透传。
+    /// 值契约：0号位 20260922 四态 INITIAL_SETUP_STATE / EXACT / DEFAULT / SETUP_RULE_MISSING_ZERO_FALLBACK（nullable string）。
+    ///         内部 SetupOutcome 5 值（ExactHit/DefaultHit/SameProductZero/InitialState/RuleMissing）经 SetupOutcomeToSource 归并后落库；SAME_PRODUCT/NONE 不再是正式值。
+    /// 用途：甘特每 Task 展示换型标签（EXACT/DEFAULT 正常；SETUP_RULE_MISSING_ZERO_FALLBACK 红 Tag 规则缺失；INITIAL_SETUP_STATE 班头首单普通展示）。
+    /// </summary>
+    public string? SetupSource { get; set; }
 }
 
 /// <summary>设备不可用窗口（G2-b 档②）</summary>

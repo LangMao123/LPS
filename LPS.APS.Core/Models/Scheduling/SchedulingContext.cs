@@ -102,7 +102,7 @@ public class SchedulingContext
     /// 排产策略配置（由0号位在界面配置，2号位装载）
     /// 【0号位配置】用户在界面维护 StrategyProfile/RuleSet/ParameterSet
     /// 【3号位填充】阶段0.1 根据 StrategyProfileVersionId 加载规则参数
-    /// 【1号位消费】阶段3 读取 Mode/FrozenHorizonDays/DefaultSetupMinutes 等配置
+    /// 【1号位消费】阶段3 读取 Mode/FrozenHorizonDays 等配置
     /// </summary>
     public StrategyConfig Strategy { get; set; } = new();
 
@@ -226,11 +226,6 @@ public class SchedulingTask
     public double DurationMinutes { get; set; }
 
     /// <summary>
-    /// 换型属性（模具编号/颜色代码/材质规格，由5号位在阶段2.3标注）
-    /// </summary>
-    public string? SetupAttribute { get; set; }
-
-    /// <summary>
     /// 客户交期（用于倒排寻址）
     /// </summary>
     public DateTime? CustomerDueDate { get; set; }
@@ -270,6 +265,12 @@ public class SchedulingResource
     /// 设备名称
     /// </summary>
     public string ResourceName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 业务编码（来自 Resource.ResourceCode；人工槽合成资源为 MAN: 前缀合成码）。
+    /// 用于 BottleneckMode 锚点反查与落库回写，非展示字段。
+    /// </summary>
+    public string ResourceCode { get; set; } = string.Empty;
 
     /// <summary>
     /// 工厂ID
@@ -313,19 +314,9 @@ public class StrategyConfig
     public int FirmHorizonDays { get; set; } = 7;
 
     /// <summary>
-    /// 默认换型时间（分钟）
-    /// </summary>
-    public double DefaultSetupMinutes { get; set; } = 30;
-
-    /// <summary>
     /// 排程模式：Backward（倒排）/ Forward（正排）
     /// </summary>
     public SchedulingMode Mode { get; set; } = SchedulingMode.BackwardThenForward;
-
-    /// <summary>
-    /// 换型优化前瞻窗口大小
-    /// </summary>
-    public int SetupLookAheadSize { get; set; } = 5;
 }
 
 /// <summary>

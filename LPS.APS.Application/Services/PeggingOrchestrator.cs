@@ -1,8 +1,10 @@
 using System.Data;
 using System.Diagnostics;
+using System.Text.Json;
 using Dapper;
 using LPS.APS.Application.Models;
 using LPS.APS.Core.Dto;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Core.Enum;
 using LPS.APS.Core.Interfaces;
@@ -93,6 +95,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             var frozenSnapshot = await _frozenStrategySnapshotProvider
                 .GetFrozenStrategySnapshotAsync(strategyProfileVersionId.Value, cancellationToken);
 
+            // ── ⑦ Setup 换型规则（重构方案 S-5）：由 FrozenStrategySnapshotProvider 装配第⑦块 ──
+            // （原物理表装载 LoadSetupTransitionRulesAsync 已移除；红线：Solver 不得运行中逐 Task 查 3号位规则库）
             var (supplyPool, continuityFacts) = await LoadSupplyPoolAsync(request, frozenSnapshot, cancellationToken);
             _logger.LogInformation(
                 "[Pegging] 供给池装载完成: PlanVersionId={PlanVersionId}, 条目={EntryCount}",
@@ -126,15 +130,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 voucher.LogicalProductionDemands.Count);
 
             // ── 装载 Routing 三件套 + 部门归属上下文（PM 裁定：最小 B）──
-            // 2号位裁剪当前 Domain 所需的 (MaterialId, StageCode) Context 与 Routing 三件套一并传入 1号位；
-            // 1号位按 (MaterialId, StageCode) → ProductionDepartmentId 锁定部门后过滤三件套（不得重新推导部门）。
+            // 【2026-09-28 改造】按 PM《BOM取用_Pegging_Stage_Routing完整链路说明》§二十一/§二十二：
+            //   Stage 的存在性与顺序由 `APS_BOM_STAGE_PATH_RAW`（本次 BOM 上下文）决定，**不得从 Routing 反推**；
+            //   Routing 只回答「该 Stage 内部有哪些小工序」⇒ 须按 (MaterialId, StageCode) 过滤装载。
+            //   原实现 `WHERE MaterialId IN @Ids` 会把该物料所有 Stage 的工序全捞进来（PM 指出的「混载」）。
             var demandMaterialIds = voucher.LogicalProductionDemands
                 .Select(d => d.MaterialId)
                 .Distinct()
                 .ToList();
 
+            // 本次 BOM 上下文下的有效 Stage：MaterialId → 该物料本次需经过的 StageCode 集合（ROOT ∪ EDGE）
+            var effectiveStages = await LoadEffectiveStageKeysAsync(request.PlanVersionId, demandMaterialIds, cancellationToken);
+
             var (routingOperations, routingDependencies, operationResourceEligibility) =
-                await LoadRoutingContextAsync(demandMaterialIds, cancellationToken);
+                await LoadRoutingContextAsync(demandMaterialIds, effectiveStages.ByMaterial, cancellationToken);
 
             var materialStageDeptContexts =
                 await LoadMaterialStageDeptContextAsync(demandMaterialIds, cancellationToken);
@@ -142,6 +151,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             // ③ StartStageCode 填值（2026-09-11，5号位 O3 回复划归 2号位）：Routing 图「无入边源结点」的
             // 大工艺阶段码 → LogicalProductionDemand.StartStageCode（原 BuildLogicalProductionDemand 写空）。
             FillStartStageCodes(voucher, routingOperations, routingDependencies);
+
+            // ③b 供给阈值 Stage 填值（PM《BOM取用…完整链路说明》§八，2026-09-28）：BOM 边
+            //   `ChildRequiredStageCode`（主源，已随 bomSnapshot 按本批上下文装载）→ 兜底 StagePath `IsSupplyThreshold=1`（按本批）
+            //   → LogicalProductionDemand.RequiredStageCode。
+            //   语义：「子件做到该 Stage 以后才成为父件可使用的 Supply」⇒ 该需求做到此阶段即为终点。
+            await FillRequiredStageCodesAsync(voucher, bomSnapshot, request.PlanVersionId, cancellationToken);
+
+            // ── 无 Routing 阶段的提前期（PM《无Routing Stage统一处理建议》§九：2号位 装载 → 1号位 消费）──
+            // StagePath 决定阶段存在性；Routing 不存在 ≠ Stage 不存在 ⇒ 对「有效 Stage 但零工序」的
+            // (物料, 阶段) 解析 StageLeadTimeParam 提前期，交由 1号位 保留该阶段的时间与前后依赖。
+            //   部门码复用上一行已整批装好的 `materialStageDeptContexts`（其物料集 = 本 Domain 需求物料，
+            //   是 gapPairs 物料的超集）——**不在循环内逐对重查**（原为 N+1，见方法内注释）。
+            var stageLeadTimes = await LoadStageLeadTimesAsync(
+                effectiveStages.ByMaterial, routingOperations, voucher.LogicalProductionDemands,
+                materialStageDeptContexts);
 
             if (demandMaterialIds.Count > 0 && routingOperations.Count == 0)
             {
@@ -161,6 +185,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             // P0-04：CandidateContext（FULL 为 null）。Base 锚点 = request.BasePlanVersionId（3号位冻结），
             // ChangeSeed/ExternalDomainResourceBlocks 由 BuildCandidateContextAsync 计算/透传。
             var candidateContext = await BuildCandidateContextAsync(request, voucher);
+
+            // ScopeJsonV2 → RunScope 投影（M2；null = FULL 零改动）
+            var runScope = await BuildRunScopeAsync(request, voucher, candidateContext?.BasePlanVersionId, cancellationToken);
 
             var solveRequest = new DomainSolveRequest
             {
@@ -185,6 +212,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 RoutingDependencies = routingDependencies,
                 OperationResourceEligibility = operationResourceEligibility,
                 MaterialStageDepartmentContexts = materialStageDeptContexts,
+                StageLeadTimes                 = stageLeadTimes,
+                // Stage 顺序事实（PM §七 权威 = StageSeq；1号位 2026-09-28 回执 §六 第 2 项同意先落）。
+                // 每个物料一条完整有序链、每步带 StageSeq 数值 + ProductionDepartmentId
+                // —— 即 PM《…接口裁决回复》2026-09-28 §三 命名的 `EffectiveStagePath` 业务事实
+                //（MaterialId + StageCode + StageSeq + ProductionDepartmentId 四条一组）。
+                StageSequenceChains            = BuildEffectiveStagePaths(effectiveStages.OrderedChains, materialStageDeptContexts),
 
                 MaterialConstraints = BuildMaterialConstraints(voucher),
 
@@ -204,6 +237,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     // P1-02：⑤⑥ 全字段整块透传（强类型零漂移）——1号位从整块读，不再等 2号位 逐批平铺/读投影子集硬编码。
                     SolverStrategy     = frozenSnapshot.SolverStrategy,
                     CandidateGuardrail = frozenSnapshot.CandidateGuardrail,
+                    // ⑦ 换型规则：2号位装载投影后按 Domain（Dept+Stage）裁剪，只传本域涉及规则（§19.3「只加载本 Domain」）。
+                    SetupTransitionRules = SetupTransitionRuleProjector.CropToDomain(frozenSnapshot.SetupTransitionRules, materialStageDeptContexts),
                     Parameters = new FiniteCapacityParameters
                     {
                         AllowSplit = solverStrategy.Split.MaxOptimizationSplitCount > 1,
@@ -219,6 +254,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 },
 
                 CandidateContext = candidateContext,
+
+                RunScope = runScope,
 
                 // FULL §9：前序 Domain 成功后的共享 Resource 占用块 → 1号位 作为不可用时间窗
                 UpstreamDomainResourceBlocks = request.UpstreamResourceBlocks ?? Array.Empty<ResourceBlock>()
@@ -329,8 +366,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 var oldTaskNoByWorkOrder = new Dictionary<string, string>(StringComparer.Ordinal);
                 if (continuationWorkOrders.Count > 0)
                 {
-                    var bindRows = await conn.QueryAsync<TaskNoBindingRow>(
-                        @"SELECT d.MESWorkOrderNo, d.TaskNo
+                    // 分片：`continuationWorkOrders` = 本域 **全部** FinalTasks 的 MES 工单号去重（全量跑可达数千，
+                    // 远超 2100）⇒ 裸 `IN @Wos` 会把「TaskNo 继承」这一步整个打断。lambda 内闭包 `tx`，同一事务不变。
+                    var bindRows = await QueryChunkedInAsync(continuationWorkOrders, chunk =>
+                        conn.QueryAsync<TaskNoBindingRow>(
+                            @"SELECT d.MESWorkOrderNo, d.TaskNo
                           FROM [TaskDispatch] d
                           JOIN (
                               SELECT MESWorkOrderNo, MAX(Id) AS MaxId
@@ -338,8 +378,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                               WHERE MESWorkOrderNo IN @Wos AND SourcePlanVersionId <> @CurrentPlanVersionId
                               GROUP BY MESWorkOrderNo
                           ) m ON m.MaxId = d.Id",
-                        new { Wos = continuationWorkOrders, CurrentPlanVersionId = planVersionId },
-                        transaction: tx);
+                            new { Wos = chunk, CurrentPlanVersionId = planVersionId },
+                            transaction: tx));
 
                     foreach (var r in bindRows)
                         oldTaskNoByWorkOrder[r.MESWorkOrderNo] = r.TaskNo;
@@ -354,14 +394,30 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     // G4：连续份额从 ContinuationKey 反解 MES 工单号；TaskNo 三分支（继承旧号 / 新号）
                     var mesWorkOrderNo = ExtractMesWorkOrderNo(final.SourceDraftId);
                     var taskNo = ResolveTaskNo(planVersionId, final.FinalDraftId, mesWorkOrderNo, oldTaskNoByWorkOrder);
+
+                    // S3c：人工槽合成 ResourceId 拆回——合成键（≥ ManualSlotResourceOffset）→ Task.ResourceId=NULL + Task.ManualSlotId=原槽号；
+                    // 设备真实 ResourceId 原样落 ResourceId（P0-06 不丢 1号位 时间资源真相）。
+                    int? persistResourceId;
+                    int? persistManualSlotId;
+                    if (final.ResourceId.HasValue && SolverResourceProjection.IsManualSlotId(final.ResourceId.Value))
+                    {
+                        persistResourceId = null;
+                        persistManualSlotId = SolverResourceProjection.ToManualSlotId(final.ResourceId.Value);
+                    }
+                    else
+                    {
+                        persistResourceId = final.ResourceId;
+                        persistManualSlotId = null;
+                    }
+
                     var ids = await conn.QueryAsync<long>(
                         @"INSERT INTO [Task] (
                               PlanVersionId, TaskNo, OrderId, MaterialId,
                               OperationSeq, OperationCode,
                               Quantity, PlannedProcessQty, UOM, PlannedStartTime, PlannedEndTime, Duration,
-                              ResourceId,
+                              ResourceId, ManualSlotId,
                               Status, IsLocked, IsCriticalPath, TaskType,
-                              MTS_InstructionNo,
+                              MTS_InstructionNo, SetupSource, StageCode,
                               CreatedAt, UpdatedAt
                           )
                           OUTPUT INSERTED.Id
@@ -369,9 +425,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                               @PlanVersionId, @TaskNo, @OrderId, @MaterialId,
                               @OperationSeq, @OperationCode,
                               @Quantity, @PlannedProcessQty, @UOM, @PlannedStartTime, @PlannedEndTime, @Duration,
-                              @ResourceId,
+                              @ResourceId, @ManualSlotId,
                               @Status, @IsLocked, @IsCriticalPath, @TaskType,
-                              @MTS_InstructionNo,
+                              @MTS_InstructionNo, @SetupSource, @StageCode,
                               @CreatedAt, @UpdatedAt
                           )",
                         new
@@ -390,14 +446,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             PlannedEndTime   = final.PlannedEndTime,
                             // Q8：Duration 补齐回写（表有列；单位=分钟，PlannedEnd-Start 计划区间跨度）
                             Duration         = (decimal)Math.Round((final.PlannedEndTime - final.PlannedStartTime).TotalMinutes, 4),
-                            // P0-06：1号位实际 Resource 原样落库（不得丢掉 1号位 的时间资源真相）
-                            ResourceId       = final.ResourceId,
+                            // S3c：人工槽合成键拆回 ResourceId=NULL + ManualSlotId；设备 Resource 原样落库（P0-06 不丢时间资源真相）
+                            ResourceId       = persistResourceId,
+                            ManualSlotId     = persistManualSlotId,
                             Status           = "PLANNED",
                             IsLocked         = false,
                             IsCriticalPath   = false,
                             TaskType         = final.TaskType,
                             // W3：连续份额 / 自由份额 Task 回填 MTS_InstructionNo（无 PI 需求 = null，不得下发 MES）
                             MTS_InstructionNo = mtsInstructionNo,
+                            // SetupSource 增列（5号位 动作单 2026-09-21）：1号位 SetupOutcome 原样落库，2号位 不反推
+                            SetupSource      = final.SetupSource,
+                            // StageCode 增列（2026-09-21）：FinalTaskDraft.StageCode（=RoutingOperation.StageCode 大工艺）原样落库，
+                            // 供 TaskDispatch 下发时区分「哪个 Stage 的指示」；空串落 NULL（与 MTS_InstructionNo 同口径）。
+                            StageCode        = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
                             CreatedAt        = now,
                             UpdatedAt        = now
                         },
@@ -416,7 +478,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         MaterialId       = final.MaterialId,
                         OperationSeq     = final.OperationSeq,
                         OperationCode    = final.OperationCode,
-                        ResourceId       = final.ResourceId,   // P0-06：保留 1号位 实际 Resource（供跨域占用块提取）
+                        ResourceId       = persistResourceId,   // S3c：拆键后（人工槽→NULL）；设备保留 1号位 实际 Resource（供跨域占用块提取）
+                        ManualSlotId     = persistManualSlotId,
                         RouteCode        = "DEFAULT",
                         PathId           = 1,
                         Quantity         = final.Quantity,
@@ -429,6 +492,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         IsCriticalPath   = false,
                         TaskType         = final.TaskType,
                         MTS_InstructionNo = mtsInstructionNo,
+                        SetupSource      = final.SetupSource,
+                        StageCode        = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
                         CreatedAt        = now,
                         UpdatedAt        = now
                     });
@@ -481,6 +546,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 }
 
                 // B5. INSERT AllocationTaskShare (v5.1.2冻结设计：轻量中间表，支持批次拆分多对多)
+                // PM《回复0928-2》§三/§六 裁决：防重复不是「显示问题」而是 **Candidate 正确性的前置条件**
+                // （本文件 ComputeChangeSeedKeysAsync 以 `SUM(ShareQty) BY DemandKey` 为变化基线）。
+                // ⇒ Inv1~Inv4 纳入正式运行校验，违例 **fail-closed**（不落库），不得静默跳过。
+                ValidateAllocationShareInvariants(solveResult, voucher, finalDraftToTaskId);
+
                 var seqToShareId = new Dictionary<long, long>();
                 if (solveResult.AllocationShares.Count > 0)
                 {
@@ -558,6 +628,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             materialMap[(int)r.Id] = (string)r.MaterialCode;
                     }
 
+                    // PM《Stage、生产部门、Routing、Dependency、StageLeadTimeParam 接口裁决回复》§十一（2026-09-28）：
+                    //   `RequiredStageCode` **两处保留** —— ① 运行输入 `LogicalProductionDemand.RequiredStageCode`（Solver 用，已回填）
+                    //   ② Pegging 结果 `PeggingSupplyAllocation.NextRequiredStageCode`（追溯「为什么这个 Supply 可以承接这个需求」）。
+                    //
+                    // 【2026-09-29 修正】取值改为**按承接行自身物料直查**（主），`DemandKey` 关联降为兜底。
+                    //   原实现只走 DemandKey ⇒ 经 `LogicalProductionDemand` 中转，而 LPD **只为「有生产缺口」的需求生成**
+                    //   ⇒ 纯供给承接（库存/在途直接接走）的行取不到值。实测 PlanVersionId=540：**1,205 行只填出 40 行**，
+                    //   而 BOM 侧有 30,652 个物料带阈值 ⇒ 缺的是取值路径，不是数据。
+                    //   `SupplyAllocationItem` 无需求物料字段，但 `ValidateEligibility` 红线1 保证供需同物料
+                    //   ⇒ 落库行的 `MaterialId`（= supply.MaterialId）即需求物料，可直接命中物料级映射。
+                    var requiredStageByDemandKey = voucher.LogicalProductionDemands
+                        .Where(d => !string.IsNullOrEmpty(d.RequiredStageCode))
+                        .GroupBy(d => d.DemandKey, StringComparer.Ordinal)
+                        .ToDictionary(g => g.Key, g => g.First().RequiredStageCode!, StringComparer.Ordinal);
+
                     var supplyRows = nonTaskAllocations
                         .Select(a =>
                         {
@@ -577,6 +662,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                                 SupplyFactoryCode      = a.FactoryCode,
                                 KnownAvailableTime     = a.AvailableAt,
                                 SupplyDocumentNo       = a.SourceReference,
+                                // 主：按承接行自身物料查物料级映射（覆盖全部承接关系）
+                                // 兜底：按 DemandKey 查运行输入侧已填值（防御性，二者同源，正常结果一致）
+                                NextRequiredStageCode  = voucher.RequiredStageByMaterialId.TryGetValue(a.SupplyMaterialId, out var reqStage)
+                                                             ? reqStage
+                                                             : (requiredStageByDemandKey.TryGetValue(a.DemandKey, out var reqStageByKey)
+                                                                 ? reqStageByKey
+                                                                 : null),
                                 CreatedAt              = now
                             };
                         })
@@ -588,13 +680,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                               RootOrderId, MaterialId, MaterialCode,
                               DemandFactoryCode, DemandQty, AllocatedQty,
                               SupplyType, SupplyFactoryCode,
-                              KnownAvailableTime, SupplyDocumentNo, CreatedAt
+                              KnownAvailableTime, SupplyDocumentNo, NextRequiredStageCode, CreatedAt
                           ) VALUES (
                               @PlanVersionId, @ScheduleRunId, @AllocationSequence,
                               @RootOrderId, @MaterialId, @MaterialCode,
                               @DemandFactoryCode, @DemandQty, @AllocatedQty,
                               @SupplyType, @SupplyFactoryCode,
-                              @KnownAvailableTime, @SupplyDocumentNo, @CreatedAt
+                              @KnownAvailableTime, @SupplyDocumentNo, @NextRequiredStageCode, @CreatedAt
                           )",
                         supplyRows,
                         transaction: tx);
@@ -1537,6 +1629,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public int DefaultProductionDepartmentId { get; set; }
     }
 
+    private sealed class ManualCapacitySlotKeyDto
+    {
+        public int ManualSlotId { get; set; }
+        public int ProductionDepartmentId { get; set; }
+        public string OperationName { get; set; } = string.Empty;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 供给池装载
     // ─────────────────────────────────────────────────────────────────────────
@@ -1597,16 +1696,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         Dictionary<(string, int, int, string), DateTime> manualEtaMap = new();
         if (rawFacts.Count > 0)
         {
-            var materialIds = rawFacts.Select(f => f.MaterialId).Distinct().ToList();
-            var poNos = rawFacts.Select(f => f.SourceDocumentNo)
-                                .Where(p => !string.IsNullOrWhiteSpace(p))
-                                .Distinct()
-                                .ToList();
-            var manualEtaOverrides = await _procurementManualEtaRepo.QueryAsync(
-                materialIds: materialIds,
-                poNos: poNos,
-                activeOnly: true,
-                ct: ct);
+            // Manual ETA 覆盖表人工维护、天然小：全量查 IsActive=1，内存按业务键 (PO,LineNo,MaterialId,Warehouse)
+            // 精确匹配（BuildManualEtaMap 兜底）。避免 distinct MaterialId=36k / PONo=56k 大 IN 列表超
+            // SQL Server 2100 参数上限（1号位 2026-09-21 催办）。
+            var manualEtaOverrides = await _procurementManualEtaRepo.GetActiveOverridesAsync(ct);
             manualEtaMap = AvailableTimeCalculator.BuildManualEtaMap(manualEtaOverrides);
         }
 
@@ -1756,6 +1849,32 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         var overCommits = new List<ContinuityOverCommitEvent>();
         var result = BucketContinuityShares(demands, contextsByPi, overCommits.Add);
+
+        // ── PI续排起点接入（2026-09-24）：Free 增产从 5号位 NextOperationContext 开始，不复从首工序 ──
+        // 5号位 CalculateNextOperationContexts（r13369）产出各 PI 的 NextOperation/StartOperationCode，
+        // 2号位 此前白拿未消费（Free 恒 startOperationCode=null→从头开始）。
+        // 现改为：Free 若无 MES 工单覆盖，从 5号位 给的 StartOperationCode 起（跳过已完成工序）。
+        var nextOpsByPi = facts.PiPositions
+            .Where(kv => kv.Value.NextOperationContexts is { Count: > 0 })
+            .ToDictionary(
+                kv => kv.Key,
+                kv => kv.Value.NextOperationContexts!
+                    .Where(c => !string.IsNullOrEmpty(c.StartOperationCode))
+                    .Select(c => (StartOperationCode: c.StartOperationCode!, StartStageCode: c.StartStageCode))
+                    .FirstOrDefault(),
+                StringComparer.Ordinal);
+
+        foreach (var r in result)
+        {
+            if (r.IsContinuation || r.StartOperationCode != null) continue;
+            var pi = r.ProductionInstructionNo;
+            if (pi is null or "") continue;
+            if (!nextOpsByPi.TryGetValue(pi, out var nextOp) || nextOp.StartOperationCode is null) continue;
+            r.StartOperationCode = nextOp.StartOperationCode;
+            if (!string.IsNullOrEmpty(nextOp.StartStageCode))
+                r.StartStageCode = nextOp.StartStageCode;
+        }
+
         foreach (var evt in overCommits)
             _logger.LogWarning("[Pegging][Continuity]{Kind} {Msg}", evt.Kind, evt.Message);
 
@@ -2190,9 +2309,46 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         if (wipStageRows.Count == 0)
             return new Dictionary<string, ProductionInstructionPositionResult>();
 
-        // 1) Stage 顺序映射：ChildMaterialCode+StageCode → StageSeq（MIN 去重多 BOMNO/Scope）
+        // 1) Stage 顺序映射：ChildMaterialCode+StageCode → StageSeq
+        //    【2026-09-28 改造，1号位 回执 §4.2 双方同意】原实现是**全局** `MIN(StageSeq)`、无任何批次上下文
+        //    （PM §二十一.3 明令禁止的「跨订单/BOM/父件汇总」形态）。现改为三态：
+        //      ① 每条 WIP 行按自身 PI → 订单 → BOM 批次，取**该批次**的 StagePath（精确，优先）；
+        //      ② 该批次内查不到 ⇒ 回退**全局** `MIN(StageSeq)`（= 原行为，**保证不回归**：不因批次缺失而归零，
+        //         避免重演「StagePathFact 空 → startStageCode 空 → derivedRemainingQty=0 → 406 上下文全 0」）；
+        //      ③ 三态**可计数**（1号位 要求：兜底占比必须可监控 —— 悄悄涨到 100% 的兜底等于没改）。
         var materialCodes = wipStageRows.Select(r => r.MaterialCode).Distinct().ToList();
-        var stagePathRows = await QueryChunkedInAsync(materialCodes, chunk =>
+
+        // 1.a) PI → 本次 BOM 批次
+        var piNos = wipStageRows.Select(r => r.ProductionInstructionNo)
+            .Where(p => !string.IsNullOrEmpty(p))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var batchByPi = await LoadBatchByPiAsync(piNos);
+
+        // 1.b) 本批 StagePath（逐批一次分块查询）：(BatchNo, MaterialCode) → { StageCode → StageSeq }
+        var batchStageByMaterial = new Dictionary<(string BatchNo, string MaterialCode), Dictionary<string, int>>();
+        foreach (var batch in batchByPi.Values.Distinct(StringComparer.Ordinal).ToList())
+        {
+            var rows = await QueryChunkedInAsync(materialCodes, chunk =>
+                _connectionManager.QueryAsync<StagePathLoadRow>(
+                    @"SELECT ChildMaterialCode, StageCode, MIN(StageSeq) AS StageSeq
+                      FROM APS_BOM_STAGE_PATH_RAW
+                      WHERE BatchNo = @BatchNo AND ChildMaterialCode IN @MaterialCodes
+                      GROUP BY ChildMaterialCode, StageCode",
+                    new { BatchNo = batch, MaterialCodes = chunk },
+                    db: DatabaseId.APS));
+
+            foreach (var r in rows)
+            {
+                var key = (batch, r.ChildMaterialCode);
+                if (!batchStageByMaterial.TryGetValue(key, out var m))
+                    batchStageByMaterial[key] = m = new Dictionary<string, int>(StringComparer.Ordinal);
+                m[r.StageCode] = r.StageSeq;
+            }
+        }
+
+        // 1.c) 全局兜底（= 原实现口径）
+        var globalRows = await QueryChunkedInAsync(materialCodes, chunk =>
             _connectionManager.QueryAsync<StagePathLoadRow>(
                 @"SELECT ChildMaterialCode, StageCode, MIN(StageSeq) AS StageSeq
                   FROM APS_BOM_STAGE_PATH_RAW
@@ -2201,23 +2357,75 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 new { MaterialCodes = chunk },
                 db: DatabaseId.APS));
 
+        var globalStageByMaterial = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        foreach (var r in globalRows)
+        {
+            if (!globalStageByMaterial.TryGetValue(r.ChildMaterialCode, out var m))
+                globalStageByMaterial[r.ChildMaterialCode] = m = new Dictionary<string, int>(StringComparer.Ordinal);
+            m[r.StageCode] = r.StageSeq;
+        }
+
+        // 1.d) 合并：批次优先、全局兜底；同时统计三态。
+        //      同物料多 WIP 行时取其**首个可解析批次**（确定性优先，避免同物料不同行取到不同批次）。
+        var batchByMaterial = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var r in wipStageRows)
+        {
+            if (batchByMaterial.ContainsKey(r.MaterialCode)) continue;
+            if (!string.IsNullOrEmpty(r.ProductionInstructionNo)
+                && batchByPi.TryGetValue(r.ProductionInstructionNo, out var b))
+                batchByMaterial[r.MaterialCode] = b;
+        }
+
         var stageSeqMap = new Dictionary<(string MaterialCode, string StageCode), int>();
-        foreach (var p in stagePathRows)
-            stageSeqMap[(p.ChildMaterialCode, p.StageCode)] = p.StageSeq;
+        var stageSeqByMaterial = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        var batchHitPairs = 0;
+        var globalFallbackPairs = 0;
+        var unresolvedStageSeqMaterials = 0;
+        foreach (var code in materialCodes)
+        {
+            globalStageByMaterial.TryGetValue(code, out var globalMap);
+            Dictionary<string, int>? batchMap = null;
+            if (batchByMaterial.TryGetValue(code, out var batch) && !string.IsNullOrEmpty(batch))
+                batchStageByMaterial.TryGetValue((batch, code), out batchMap);
+
+            var merged = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (globalMap != null)
+                foreach (var kv in globalMap) merged[kv.Key] = kv.Value;
+            if (batchMap != null)
+                foreach (var kv in batchMap) merged[kv.Key] = kv.Value;
+
+            if (merged.Count == 0)
+            {
+                unresolvedStageSeqMaterials++;
+                continue;
+            }
+
+            var batchCnt = batchMap?.Count ?? 0;
+            batchHitPairs += batchCnt;
+            globalFallbackPairs += merged.Count - batchCnt;
+
+            stageSeqByMaterial[code] = merged;
+            foreach (var kv in merged)
+                stageSeqMap[(code, kv.Key)] = kv.Value;
+        }
+
+        // 兜底占比可监控（1号位 要求）：若「全局兜底」长期接近「批次内命中」，说明 PI→批次 解析失效
+        // 或批次内确无 StagePath —— 兜底形同虚设，必须能从日志直接发现，而非等结果变差再回溯。
+        _logger.LogInformation(
+            "[Pegging] PI Stage 顺序装载：物料 {Materials} 个（批次内命中 {BatchHit} 个(物料,阶段) / 全局兜底 {GlobalFallback} 个 / 无 StagePath {Unresolved} 个物料；PI→批次解析 {BatchResolved} 个 PI）",
+            materialCodes.Count, batchHitPairs, globalFallbackPairs, unresolvedStageSeqMaterials, batchByPi.Count);
 
         // 每物料 Stage 路径（按 StageSeq 升序，首/末标记 IsStartStage/IsEndStage）。
         // 关键：5号位 DetermineEffectiveStartStage / CalculateStagePositions(isFirstStage) /
         //       CalculateNextOperationContexts 都消费 input.StagePath；缺了会 startStageCode 为空 →
         //       BuildExistingExecutionContexts 的 derivedRemainingQty=0 → 连续份额切不出（实测 406 上下文全 0）。
-        var stagePathByMaterial = stagePathRows
-            .GroupBy(p => p.ChildMaterialCode, StringComparer.Ordinal)
+        var stagePathByMaterial = stageSeqByMaterial
             .ToDictionary(
-                g => g.Key,
-                g =>
+                kv => kv.Key,
+                kv =>
                 {
-                    var ordered = g
-                        .GroupBy(x => x.StageCode, StringComparer.Ordinal)
-                        .Select(grp => (StageCode: grp.Key, StageSequence: grp.Min(x => x.StageSeq)))
+                    var ordered = kv.Value
+                        .Select(x => (StageCode: x.Key, StageSequence: x.Value))
                         .OrderBy(x => x.StageSequence)
                         .ToList();
                     return (IReadOnlyList<StagePathFact>)ordered.Select((x, i) => new StagePathFact
@@ -2323,6 +2531,69 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 3) 调 5号位计算器（纯计算，无 I/O）
         var parameters = BuildFrozenFactParameters(frozenSnapshot);
         var results = await _piPositionCalculator.CalculateProductionInstructionPositionsAsync(inputs, parameters, ct);
+
+        // 3.5) 续排起点出口核验（2026-09-29）：StartOperationCode 是需求「从哪道工序续排」的唯一入口。
+        // 1号位 按 OperationCode 建图/匹配该值（PhaseOneConstraintBuilder.BuildReachableStages 的
+        // nodesByOperationCode[demand.StartOperationCode]、PhaseTwoInitialScheduler.GetOperationsFromStage 的
+        // k.OperationCode == startOperationCode）——非空但查不中时无兜底，需求直接判 S26 Unscheduled。
+        // ⚠️ 该风险「随时会发」而非「潜在」：5号位 出口值取的是工序名（OperationName）、1号位 匹配空间是
+        //    工序号（OperationCode），两侧取值集合交集为 0（432 名 ∩ 188 号 = ∅）⇒ 一旦有值产出，100% 落 S26。
+        //    产能源侧 confirms 该形态普遍存在：OperationProgressSnapshot 无 OperationCode 列（源头只有名）；
+        //    全库 (MaterialCode,StageCode) 在制工序数=1 的有 6,530 组（唯一前沿，最多的档）、PI 在制工序数=1 的 49,586 个。
+        // ⛔ 反面口径（勿再复述）：曾据「PV 633 实测非空 0 条」判其「未触发/上了膛没击发」——**那是抽样假象**：
+        //    PV 633 的 4,109 个 MTS_InstructionNo 在快照批次里在制工序数恰为 0，整批落进 remainingOps.Count==0
+        //    的设计内合法空分支。一次交集为 0 不等于代码不会产出值，别拿单次抽样当普遍规律。
+        // 此处只观测、不改写：把「出口值是否落在该PI的 RoutingOperation.OperationCode 空间内」打成计数，
+        // 跑完可直接从日志核，避免该类静默失败再靠结果变差回溯。
+        var opCodeSpaceByPi = inputs.ToDictionary(
+            i => i.ProductionInstructionNo,
+            i => new HashSet<string>(i.RoutingOperations.Select(o => o.OperationCode), StringComparer.Ordinal),
+            StringComparer.Ordinal);
+        var startOpNonEmpty = 0;
+        var startOpUnmatchable = 0;
+        var startOpPis = new HashSet<string>(StringComparer.Ordinal);
+        var startOpSamples = new List<string>();
+        var startOps = results
+            .SelectMany(r => (r.NextOperationContexts ?? (IReadOnlyList<NextOperationContextDto>)Array.Empty<NextOperationContextDto>())
+                .Select(c => (r.ProductionInstructionNo, Value: c.StartOperationCode))
+                .Concat((r.ExistingExecutionContexts ?? (IReadOnlyList<ExistingExecutionContextDto>)Array.Empty<ExistingExecutionContextDto>())
+                    .Select(c => (r.ProductionInstructionNo, Value: c.StartOperationCode))));
+        foreach (var (pi, value) in startOps)
+        {
+            if (string.IsNullOrEmpty(value)) continue;
+            startOpNonEmpty++;
+            // 只在「该PI有 Routing 节点」时判不中：无 Routing 的物料是另一类问题（无工序），不混计。
+            if (opCodeSpaceByPi.TryGetValue(pi, out var codeSpace)
+                && codeSpace.Count > 0 && !codeSpace.Contains(value!))
+            {
+                startOpUnmatchable++;
+                startOpPis.Add(pi);
+                if (startOpSamples.Count < 10) startOpSamples.Add(value!);
+            }
+        }
+        if (startOpNonEmpty > 0)
+            _logger.LogInformation(
+                "[Pegging][红线] 续排起点出口核验：StartOperationCode 非空 {Tot} 条（涉及 {Pi} 个PI），其中 {Bad} 条不在该PI的 RoutingOperation.OperationCode 空间内（1号位 按 OperationCode 匹配 ⇒ 这类需求必然 S26 Unscheduled，无兜底）；样例=[{Samples}]",
+                startOpNonEmpty, startOpPis.Count, startOpUnmatchable,
+                string.Join(",", startOpSamples.Distinct()));
+        else
+            _logger.LogInformation("[Pegging][红线] 续排起点出口核验：本次 StartOperationCode 全为空。⚠️ 这**不代表风险不存在**——它只说明本次这一批 PI 恰好全落在「工序已完/无 Routing 数据」的合法空分支（详见下条断口定位）。产工序名的分支在全库形态上普遍存在（(Material,Stage) 单在制工序 6,530 组），换批数据即会命中 ⇒ 别把「本次全空」记成「已排除」");
+
+        // 3.6) 续排起点「全空」时定位断口在哪一级：无Routing节点 / 无上下文 / 上下文E=0 / 只到Stage级。
+        var nextCtx = results.Sum(r => (r.NextOperationContexts ?? Array.Empty<NextOperationContextDto>()).Count);
+        var nextCtxWithStartStage = results.Sum(r => (r.NextOperationContexts ?? Array.Empty<NextOperationContextDto>()).Count(c => !string.IsNullOrEmpty(c.StartStageCode)));
+        var nextCtxWithQty = results.Sum(r => (r.NextOperationContexts ?? Array.Empty<NextOperationContextDto>()).Count(c => c.SliceQty > 0m));
+        var existCtx = results.Sum(r => (r.ExistingExecutionContexts ?? Array.Empty<ExistingExecutionContextDto>()).Count);
+        var existCtxWithStage = results.Sum(r => (r.ExistingExecutionContexts ?? Array.Empty<ExistingExecutionContextDto>()).Count(c => !string.IsNullOrEmpty(c.StartStageCode)));
+        var existCtxWithQty = results.Sum(r => (r.ExistingExecutionContexts ?? Array.Empty<ExistingExecutionContextDto>()).Count(c => c.DerivedRemainingQty > 0m));
+        _logger.LogInformation(
+            "[Pegging][红线] 续排起点断口定位：结果 {Res} 个PI；其中 RoutingOperations 非空 {PiWithRouting} 个 / RoutingDependencies 非空 {PiWithDeps} 个；" +
+            "NextOperationContext 共 {NextCtx} 条（有StartStage {NextStage} / SliceQty>0 {NextQty}），ExistingExecutionContext 共 {ExistCtx} 条（有StartStage {ExistStage} / E>0 {ExistQty}）",
+            results.Count,
+            inputs.Count(i => i.RoutingOperations.Count > 0),
+            inputs.Count(i => i.RoutingDependencies.Count > 0),
+            nextCtx, nextCtxWithStartStage, nextCtxWithQty,
+            existCtx, existCtxWithStage, existCtxWithQty);
 
         // 4) 保存 PI Position 快照 + 数量闭环校验（2号位职责，不修正 5号位 事实）
         await SavePiPositionSnapshotsAsync(planVersionId, inputs, results, wipStageRows, ct);
@@ -2941,13 +3212,553 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// 按当前 Domain 涉及的 MaterialId 完整装载 Routing 三件套（不过滤部门——
-    /// 部门锁定由 1号位消费 MaterialStageDepartmentContexts 时执行，见 ProductionDepartment回复.md）。
+    /// 装载「本次 BOM 上下文下的有效 Stage 集合」——MaterialId → 该物料本次需经过的 StageCode 集合。
+    ///
+    /// 【依据】PM《BOM取用_Pegging_Stage_Routing完整链路说明》§二十一/§二十二：
+    ///   Stage 的存在性与顺序由 `APS_BOM_STAGE_PATH_RAW`（本次 BOM 上下文）决定，
+    ///   **不得从 Routing 反推、不得按 MaterialCode 全局聚合**。本方法按「当前批次的 StagePath」取：
+    ///     · ROOT 行（ParentMaterialCode=NULL）= 订单根产品自身的工艺路径；
+    ///     · EDGE 行（父件→子件）= 该子件自身需经过的工艺路径（做到 IsSupplyThreshold 即可供父件）。
+    ///   同一子件在不同父件下若 Stage 不同，此处取**并集**（保守：宁可多给 Stage 也不漏），
+    ///   避免因漏 Stage 导致 1号位 找不到工序而误判 Unscheduled。
+    ///
+    /// 【无 StagePath 时的兜底】若某物料在本批 StagePath 里无记录（数据缺口 / 采购件），
+    ///   则**不为其限定 Stage**（结果里不含该 MaterialId），由调用方回退「按 MaterialId 全量装载」。
+    /// </summary>
+    private async Task<EffectiveStageLoad> LoadEffectiveStageKeysAsync(
+        int planVersionId,
+        IReadOnlyList<int> materialIds,
+        CancellationToken ct)
+    {
+        if (materialIds.Count == 0)
+            return EffectiveStageLoad.Empty;
+
+        // 1) 当前批次（与 LoadBomSnapshotAsync 同口径：经 OrderBomRequestLink 取 BatchNo）
+        var batchNos = await ResolveLinkedBatchNosAsync(planVersionId);
+        var batchNo = batchNos.FirstOrDefault() ?? string.Empty;
+
+        if (string.IsNullOrEmpty(batchNo))
+        {
+            _logger.LogWarning(
+                "[Pegging] 无 OrderBomRequestLink（PlanVersionId={PlanVersionId}），跳过有效 Stage 过滤（回退按 MaterialId 全量装载）",
+                planVersionId);
+            return EffectiveStageLoad.Empty;
+        }
+
+        // 多批次诊断：本 PV 关联多个 BOM 批次时，取最新一版（与 LoadBomSnapshotAsync 同口径）。
+        // 择最新是既有设计，但必须留痕——否则「取错批次」无从回溯（1号位 核验 §3 类问题的成因即静默）。
+        var distinctBatchCount = batchNos.Distinct(StringComparer.Ordinal).Count();
+        if (distinctBatchCount > 1)
+        {
+            _logger.LogWarning(
+                "[Pegging] 本 PlanVersion 关联 {BatchCount} 个 BOM 批次，有效 Stage 装载取最新批次 {BatchNo}（与 LoadBomSnapshotAsync 同口径）",
+                distinctBatchCount, batchNo);
+        }
+
+        // 2) 物料编码（StagePath 用 MaterialCode 字符串）
+        //    分片：`materialIds` = 本域需求物料，真实规模上千（2026-09-29 真跑：需求 42,193 条 / 物料数千）；
+        //    紧邻的 ③ 步对**由它派生的** `materialCodes` 已经在走 QueryChunkedInAsync —— 同源同量级的这一条却漏了。
+        var materialCodes = (await QueryChunkedInAsync(materialIds, chunk =>
+            _connectionManager.QueryAsync<string>(
+                "SELECT MaterialCode FROM Material WHERE Id IN @Ids",
+                new { Ids = chunk },
+                db: DatabaseId.APS))).ToList();
+
+        if (materialCodes.Count == 0)
+            return EffectiveStageLoad.Empty;
+
+        // 3) 取本批 StagePath 的 (ChildMaterialCode, StageCode, StageSeq)——含 ROOT 与 EDGE 两类。
+        //    StageSeq 必须一起取：PM §七 认定它是顺序的唯一权威，1号位 截断 RequiredStageCode 依赖它
+        //    （原实现只取两组码、返回 HashSet，**顺序在装载第一步即丢失** —— 1号位 核验 §3.2）。
+        //    同一 (Child, Stage) 取 MIN(StageSeq)（本批内同一 Stage 可能出现在多父件/多 BOM 边下）。
+        var stageRows = await QueryChunkedInAsync(materialCodes, chunk =>
+            _connectionManager.QueryAsync<EffectiveStageRow>(
+                @"SELECT ChildMaterialCode, StageCode, MIN(StageSeq) AS StageSeq
+                  FROM APS_BOM_STAGE_PATH_RAW
+                  WHERE BatchNo = @BatchNo
+                    AND ChildMaterialCode IN @Codes
+                    AND StageCode IS NOT NULL
+                  GROUP BY ChildMaterialCode, StageCode",
+                new { BatchNo = batchNo, Codes = chunk },
+                db: DatabaseId.APS));
+
+        // 4) MaterialCode → MaterialId 反查，组装结果
+        //    分片：同上 `materialCodes` 与 `materialIds` 同量级（上千）⇒ 裸 `IN @Codes` 同样会撞 2100。
+        var idByCode = (await QueryChunkedInAsync(materialCodes, chunk =>
+            _connectionManager.QueryAsync<MaterialIdCodeRow>(
+                "SELECT Id, MaterialCode FROM Material WHERE MaterialCode IN @Codes",
+                new { Codes = chunk },
+                db: DatabaseId.APS)))
+            .ToDictionary(r => r.MaterialCode, r => r.Id, StringComparer.Ordinal);
+
+        // 5) 两条产出：集合（供 Routing 三件套存在性过滤）+ 有序链（供 1号位 判断 Stage 先后）
+        var result = new Dictionary<int, HashSet<string>>();
+        var stepsByMaterial = new Dictionary<int, List<StageSequenceStep>>();
+        foreach (var row in stageRows)
+        {
+            if (string.IsNullOrEmpty(row.StageCode)) continue;
+            if (!idByCode.TryGetValue(row.ChildMaterialCode, out var matId)) continue;
+
+            if (!result.TryGetValue(matId, out var set))
+                result[matId] = set = new HashSet<string>(StringComparer.Ordinal);
+            set.Add(row.StageCode);
+
+            if (!stepsByMaterial.TryGetValue(matId, out var steps))
+                stepsByMaterial[matId] = steps = new List<StageSequenceStep>();
+            steps.Add(new StageSequenceStep { StageCode = row.StageCode, StageSeq = row.StageSeq });
+        }
+
+        // 链内按 StageSeq 升序（1号位 撤回上报的硬前提：① 每物料一条完整有序链 ② 每步带 StageSeq 数值）
+        var chains = stepsByMaterial
+            .Select(kv => new StageSequenceChain
+            {
+                MaterialId = kv.Key,
+                Stages = kv.Value.OrderBy(s => s.StageSeq).ToList()
+            })
+            .ToList();
+
+        _logger.LogInformation(
+            "[Pegging] 有效 Stage 装载：需求物料={DemandMats}，命中 StagePath={HitMats}，Stage 组合={Combos}，有序链={Chains}（BatchNo={BatchNo}）",
+            materialIds.Count, result.Count, result.Values.Sum(s => s.Count), chains.Count, batchNo);
+
+        return new EffectiveStageLoad { ByMaterial = result, OrderedChains = chains };
+    }
+
+    /// <summary>
+    /// 「本次 BOM 有效 Stage」装载结果（两种形态，用途不同，勿混用）：
+    /// - `ByMaterial`（集合）：供 Routing 三件套**存在性**过滤（该物料本次有没有这个 Stage）；
+    /// - `OrderedChains`（有序链）：供 1号位 判断 Stage **先后**（`RequiredStageCode` 截断 / `StageLeadTimes` 前后依赖）。
+    /// </summary>
+    private sealed class EffectiveStageLoad
+    {
+        public static readonly EffectiveStageLoad Empty = new();
+
+        public IReadOnlyDictionary<int, HashSet<string>> ByMaterial { get; init; }
+            = new Dictionary<int, HashSet<string>>();
+
+        public IReadOnlyList<StageSequenceChain> OrderedChains { get; init; }
+            = Array.Empty<StageSequenceChain>();
+    }
+
+    /// <summary>StagePath 有效 Stage 行（ChildMaterialCode + StageCode + StageSeq）</summary>
+    private sealed class EffectiveStageRow
+    {
+        public string ChildMaterialCode { get; set; } = string.Empty;
+        public string? StageCode { get; set; }
+        public int StageSeq { get; set; }
+    }
+
+    /// <summary>OrderBomRequestLink 批次行（SQL 已按 SyncedAt DESC 排序，取首个 = 最新批次）</summary>
+    private sealed class BatchLinkRow
+    {
+        public string? BatchNo { get; set; }
+    }
+
+    /// <summary>
+    /// 「三级均未命中」时的兜底提前期（小时）= 3 天。
+    /// PM 2026-09-29 裁决：「未来没有 routing 如果没有数据，则是在 StageLeadTimeParam 中查找，按照三级查找，
+    ///   如果三级均未命中，则记入 STAGE_LEADTIME_MISSING，**并按 3 天兜底**」。
+    /// ⚠️ 与 0号位 §4.4「不得默认 0 小时」不冲突：§4.4 禁的是**默认 0 小时**（= 不给时间），
+    ///    兜底给的是**非 0 的显式值**且同时出码，两者可区分、可审计。
+    /// </summary>
+    private const decimal MissingStageLeadTimeFallbackHours = 72m;
+
+    /// <summary>
+    /// 「三级均未命中 ⇒ 3 天兜底」这条 Fact 的 `MatchLevel` 取值 = **`STAGE_LEADTIME_MISSING`**（PM 原码逐字）。
+    ///
+    /// ⚠️ 2026-09-29 与 1号位 对齐后改名：我方曾自起 `STAGE_LEADTIME_MISSING_3DAY_FALLBACK`，
+    ///   而 1号位 回执《无RoutingStage时间出口字段_字段载体落码提请_v1.0》§四 已把 V1 合法值域**定死为 4 个**：
+    ///   `DEPT_EXACT` / `FACTORY_STAGE_DEFAULT` / `GLOBAL_STAGE_DEFAULT` / `STAGE_LEADTIME_MISSING`，
+    ///   并明文「4 个之外的任何值 ⇒ **契约违例**，不用该值」⇒ 我方的自起名会被消费侧当违例。
+    ///   ⇒ 改回 PM 原码。语义仍清楚：**本条 Fact 带值**（72h），MISSING 指的是「参数未命中」。
+    /// </summary>
+    private const string MissingStageLeadTimeFallbackLevel = "STAGE_LEADTIME_MISSING";
+
+    /// <summary>
+    /// 装载「无 Routing 阶段的提前期」——PM《无Routing Stage统一处理建议》§九：2号位 装载 → 1号位 消费。
+    ///
+    /// 口径：对每个需求物料的每个「本次有效 Stage」，若该 Stage **无任何 RoutingOperation**，
+    ///   则查 `StageLeadTimeParam` 解析提前期。命中梯次 **三级**（2026-09-29 用户明确口径，逐字）：
+    ///     ① `DEPT_EXACT`             = ProductionDeptCode + FactoryCode + StageCode
+    ///     ② `FACTORY_STAGE_DEFAULT`  = FactoryCode + StageCode
+    ///     ③ `GLOBAL_STAGE_DEFAULT`   = **StageCode**（**不带 IsDefault 条件**；见 ResolveStageLeadTime 内注）
+    ///   （旧的 MaterialCode 级 / ProductFamilyCode 级 §4.1 定为「在V1不作为正常有效匹配级别」，**已移除**，
+    ///     遇旧数据由 <see cref="HasLegacyLevelRow"/> 登记兼容告警。）
+    ///   命中即停（同层多条取 Priority 最小）；
+    ///   **走完三级仍未命中** ⇒ 记 `STAGE_LEADTIME_MISSING` 并**按 3 天兜底产出 Fact**（PM 2026-09-29 裁决，见
+    ///   <see cref="MissingStageLeadTimeFallbackHours"/>）——**不再省略**。
+    ///   **兜底只看「算不算命中」，不按成因分治**（甲/乙/丙 都走同一支）——**只有一种情形算未命中：三级全不中**。
+    ///   ⚠️ **2026-09-29 用户更正**：本节原有第二句「命中到参数行但折算值为 0（或负）⇒ 视同未命中」
+    ///   **已作废**。**命中就是命中**：折算值为 0（或负）**仍按命中产出**，`LeadTimeHours = 0`、
+    ///   `MatchLevel` = 实际命中层级（实测 4 行 `*_FINAL` 的 `LeadTimeDays = 0.00`
+    ///   ⇒ 产出 **0 小时 + `FACTORY_STAGE_DEFAULT`**，**不带** `STAGE_LEADTIME_MISSING`）。
+    ///   0 是参数行写下的值，装载层**不得替参数侧改判**；仅单记 `zeroHitCount`（信息级日志）供参数 Owner 查看。
+    ///
+    /// **性能（2026-09-29 修复 N+1）**：循环体内原对每个 `(物料, 阶段)` 调一次
+    ///   `LoadMaterialStageDeptContextAsync(new[] { materialId })` 取部门码 —— 单元素查询 × gapPairs 条数，
+    ///   而 `MaterialStageDeptContext` 实测 813,424 行（`IsCurrent=1`）且无缓存 ⇒ 一次 Pegging 发万级串行往返
+    ///   （实测 PV=539 BOM 范围内 gapPairs = **16,383**；每个 Domain 各来一遍）。
+    ///   现改为**复用调用方已整批装好的 `materialStageDeptContexts`** 建查表（其物料集 = 需求物料 ⊇ gapPairs 物料），
+    ///   循环内零查询；本方法自身仍保留 5 次批量预取（参数表 / 物料 / 产品族 / 部门 / 工厂），无逐行查询。
+    /// </summary>
+    private async System.Threading.Tasks.Task<IReadOnlyList<StageLeadTimeFact>> LoadStageLeadTimesAsync(
+        IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
+        List<RoutingOperation> operations,
+        IReadOnlyList<LogicalProductionDemand> demands,
+        IReadOnlyList<MaterialStageDepartmentContextDto> materialStageDeptContexts)
+    {
+        if (effectiveStages.Count == 0)
+            return Array.Empty<StageLeadTimeFact>();
+
+        // 1) 找出「有效 Stage 但零工序」的 (MaterialId, StageCode)
+        var opsByMatStage = operations
+            .Where(o => !string.IsNullOrEmpty(o.StageCode))
+            .Select(o => (o.MaterialId, o.StageCode!))
+            .ToHashSet();
+
+        var gapPairs = effectiveStages
+            .SelectMany(kv => kv.Value.Select(stage => (MaterialId: kv.Key, StageCode: stage)))
+            .Where(p => !opsByMatStage.Contains((p.MaterialId, p.StageCode)))
+            .ToList();
+
+        if (gapPairs.Count == 0)
+            return Array.Empty<StageLeadTimeFact>();
+
+        // 2) 一次取全参数表（人工维护、体量小；避免 IN 大列表）
+        var paramRows = (await _connectionManager.QueryAsync<StageLeadTimeParamRow>(
+            @"SELECT FactoryCode, StageCode, ProductionDeptCode, MaterialCode, ProductFamilyCode,
+                     LeadTimeDays, LeadTimeHours, Priority, IsDefault,
+                     CAST(CASE WHEN EffectiveFrom IS NULL THEN 1 ELSE 0 END AS bit) AS EffectiveFromNull
+              FROM StageLeadTimeParam
+              WHERE IsActive = 1
+                AND (EffectiveTo   IS NULL OR EffectiveTo   >= CAST(GETDATE() AS DATE))
+                -- ⚠️ 2026-09-29 修复：EffectiveFrom 必须与 EffectiveTo **对称**处理（NULL = 不限）。
+                --    实测 3号位 补进来的 282 行 **EffectiveFrom 全为 NULL**，而 NULL 比较返回 UNKNOWN
+                --    ⇒ 旧谓词 `EffectiveFrom <= GETDATE()` 把这 282 行**全部滤掉**，装载层看到 0 行、
+                --    静默走「整表空」分支 ⇒ 参数表「看起来补完了」，实际一条也没生效。
+                AND (EffectiveFrom IS NULL OR EffectiveFrom <= CAST(GETDATE() AS DATE))",
+            db: DatabaseId.APS)).ToList();
+
+        if (paramRows.Count == 0)
+        {
+            // ⚠️ 2026-09-29 PM 裁决（口径变更）：三级均未命中 ⇒ 记 `STAGE_LEADTIME_MISSING` **并按 3 天兜底**。
+            //    整表为空 = 全部 gapPairs 三级均未命中 ⇒ **不再早退**。旧实现 `return 空` 让 1号位 拿到「无提前期」，
+            //    净效果等价于 0 小时，正是 0号位 §4.4 明令禁止的「默认 0 小时」（省略 ≠ 合规）。
+            //    此处只把「整表空」这个比逐条未命中更强的信号单独吼一声，随后仍走下面的兜底产出。
+            _logger.LogWarning(
+                "[Pegging] StageLeadTimeParam 无任何有效参数行，但存在 {Count} 个「有效 Stage 但无 RoutingOperation」的 (物料,阶段)"
+                + " —— 全部记 STAGE_LEADTIME_MISSING 并按 {Hours} 小时兜底（PM 2026-09-29 裁决；Owner=3号位、粒度=工厂+StageCode+生产部门，待其铺数）",
+                gapPairs.Count, MissingStageLeadTimeFallbackHours);
+        }
+        else
+        {
+            // 生效日期缺口不静默：3号位 补的参数若没填 `EffectiveFrom`，装载层按「不限」采用，
+            // 但必须让它可见 —— 否则「参数到底生效了没有」谁也说不清。
+            var nullFrom = paramRows.Count(r => r.EffectiveFromNull);
+            if (nullFrom > 0)
+            {
+                _logger.LogWarning(
+                    "[Pegging] StageLeadTimeParam 有 {NullFrom}/{Total} 行未填 `EffectiveFrom`（NULL）—— 装载层按「不限」采用"
+                    + "（与 `EffectiveTo IS NULL` 对称）。若 3号位 本意是「尚未生效」，请补日期，否则这批参数已直接生效。",
+                    nullFrom, paramRows.Count);
+            }
+        }
+
+        // 3) 取物料编码 + 产品族 + 工厂（供命中降级）
+        //    分片：`gapPairs` 是**跨全单聚合**的 (物料,阶段) 集合，真实规模下物料数可超 2100
+        //    （同 FillRequiredStageCodesAsync 的实测踩点，2026-09-29）。走统一帮手，别再写裸 `IN @`。
+        var matIds = gapPairs.Select(p => p.MaterialId).Distinct().ToList();
+        var matRows = (await QueryChunkedInAsync(matIds, chunk =>
+            _connectionManager.QueryAsync<StageLeadTimeMatRow>(
+                "SELECT Id, MaterialCode, ProductFamilyId FROM Material WHERE Id IN @Ids",
+                new { Ids = chunk },
+                db: DatabaseId.APS))).ToList();
+        var matById = matRows.ToDictionary(r => r.Id, r => r);
+
+        // 产品族编码（键 = int Id，勿传 StringComparer）
+        var familyCodes = (await _connectionManager.QueryAsync<FamilyCodeRow>(
+            "SELECT Id, Code FROM ProductFamily",
+            db: DatabaseId.APS)).ToDictionary(r => r.Id, r => r.Code);
+
+        // 部门编码（StageLeadTimeParam.ProductionDeptCode 用 DeptCode 而非 Id）
+        var deptCodes = (await _connectionManager.QueryAsync<DeptCodeRow>(
+            "SELECT Id, SourceDeptCode FROM ProductionDepartment WHERE IsActive = 1 AND SourceDeptCode IS NOT NULL",
+            db: DatabaseId.APS)).ToDictionary(r => r.Id, r => r.SourceDeptCode ?? string.Empty);
+
+        // 工厂编码
+        var factoryCodes = (await _connectionManager.QueryAsync<FactoryCodeRow>(
+            "SELECT Id, Code FROM Factory WHERE IsActive = 1",
+            db: DatabaseId.APS)).ToDictionary(r => r.Id, r => r.Code);
+
+        // 物料 → 本次需求的工厂（同一物料可能跨厂，取首个；命中降级用）
+        var factoryByMaterial = demands
+            .GroupBy(d => d.MaterialId)
+            .ToDictionary(g => g.Key, g => g.First().FactoryId);
+
+        // (物料, 阶段) → 首个非空部门码（MSC 给，与 1号位 部门锁定同源）—— **循环外一次建好**。
+        //   数量守恒：`materialStageDeptContexts` 是调用方按 demandMaterialIds 整批装好的，
+        //   而 effectiveStages 的键 ⊆ demandMaterialIds（见 LoadEffectiveStageKeysAsync 的 Id 反查）
+        //   ⇒ 本表覆盖 gapPairs 的全部物料，循环内无需再查库。
+        //   `TryAdd` 保留**首个**非空值 = 原 `FirstOrDefault(dc => !string.IsNullOrEmpty(dc))` 语义
+        //   （同一物料的行在批量查询与单物料查询中均按同一自然序返回，逐物料顺序不变）。
+        var deptCodeByMaterialStage = new Dictionary<(int MaterialId, string StageCode), string>();
+        foreach (var c in materialStageDeptContexts)
+        {
+            if (string.IsNullOrEmpty(c.StageCode)) continue;
+            if (!deptCodes.TryGetValue(c.ProductionDepartmentId, out var dc) || string.IsNullOrEmpty(dc)) continue;
+
+            deptCodeByMaterialStage.TryAdd((c.MaterialId, c.StageCode), dc);
+        }
+
+        var result = new List<StageLeadTimeFact>(gapPairs.Count);
+        var missingCount = 0;
+        // 与 `missingCount` 分开计：「参数行没配」与「配了值 = 0」对参数 Owner 是两件事。
+        // ⚠️ 口径提醒：`zeroHitCount` **不是**未命中 —— 它属于**命中**（0 是参数行写下的值），见下方内注。
+        var zeroHitCount = 0;
+        var legacyLevelCount = 0;
+        var matchLevelTally = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var (materialId, stageCode) in gapPairs)
+        {
+            matById.TryGetValue(materialId, out var mat);
+            var materialCode = mat?.MaterialCode;
+            var familyCode = mat?.ProductFamilyId is int fid && familyCodes.TryGetValue(fid, out var fc) ? fc : null;
+
+            // 该物料本次涉及的部门（MSC 给）→ 取首个用于 DEPT_EXACT 级命中（查表，零查询）
+            var deptCode = deptCodeByMaterialStage.TryGetValue((materialId, stageCode), out var dept)
+                ? dept
+                : null;
+
+            var factoryCode = factoryByMaterial.TryGetValue(materialId, out var fid2)
+                              && factoryCodes.TryGetValue(fid2, out var fcode) ? fcode : null;
+
+            // §4.3 兼容告警：存在已废止的 Material/Family 级旧数据即计数（与本次是否命中无关）。
+            if (HasLegacyLevelRow(paramRows, materialCode, familyCode, factoryCode, stageCode))
+                legacyLevelCount++;
+
+            var hit = ResolveStageLeadTime(paramRows, deptCode, factoryCode, stageCode);
+            if (hit is null)
+            {
+                // ⚠️ 2026-09-29 PM 裁决（口径变更，推翻本节旧写法）：
+                //    「按照三级查找，如果三级均未命中，则记入 STAGE_LEADTIME_MISSING，**并按 3 天兜底**」。
+                // ⇒ **既出码、也产出带值的 Fact**：
+                //    ① 出码：`missingCount` + 告警，让「参数未配」在日志上可见（旧旧实现是静默 continue，缺口不可见）；
+                //    ② 产出：`LeadTimeHours = 72`（3 天）——**不得省略**。省略会让 1号位 拿到「无提前期」，
+                //       净效果等价于 0 小时，正是 0号位 §4.4 禁止的效果；§4.4 禁的是「默认 0 小时」，不是「兜底」。
+                // `MatchLevel` 取 `STAGE_LEADTIME_MISSING`（PM 原码逐字 = 1号位 回执 §四 定死的 4 值之一，
+                //   见 <see cref="MissingStageLeadTimeFallbackLevel"/> 的改名说明）。
+                missingCount++;
+                matchLevelTally[MissingStageLeadTimeFallbackLevel] =
+                    matchLevelTally.TryGetValue(MissingStageLeadTimeFallbackLevel, out var nm) ? nm + 1 : 1;
+
+                result.Add(new StageLeadTimeFact
+                {
+                    MaterialId    = materialId,
+                    StageCode     = stageCode,
+                    LeadTimeHours = MissingStageLeadTimeFallbackHours,
+                    MatchLevel    = MissingStageLeadTimeFallbackLevel
+                });
+                continue;
+            }
+
+            // 换算口径（DTO 注释逐字）：LeadTimeHours > 0 取之，否则按 LeadTimeDays × 24 折算。
+            // 两者均可空（实测 LeadTimeHours 全 NULL、值在 LeadTimeDays）⇒ 先 ?? 归零再判。
+            var hitHours = hit.LeadTimeHours ?? 0m;
+            var leadTimeHours = hitHours > 0m
+                ? hitHours
+                : (hit.LeadTimeDays ?? 0m) * 24m;
+
+            // ⚠️ 2026-09-29 用户更正（口径）：**命中到参数行就是命中** —— 折算值为 0（或负）**不视同未命中**。
+            //    【推翻什么】本节曾写「命中但折算值 ≤ 0 ⇒ 视同未命中、与三级全不中一视同仁走 3 天兜底」，
+            //      该口径**已作废**：0 是参数行**明明白白写下的值**，装载层不得替参数侧改判成 72。
+            //    【实测影响】4 行 `*_FINAL`（BJ/CN/SH/TJ 完工，`LeadTimeDays = 0.00`、`ProductionDeptCode` 空）
+            //      ⇒ 现在产出 **`LeadTimeHours = 0` + `MatchLevel = FACTORY_STAGE_DEFAULT`**，不再带 MISSING 码。
+            //    【只保留可见性】`zeroHitCount` 与 `missingCount` 分开计 + 一条**信息级**日志，
+            //      让参数 Owner 能看见「有 N 行命中的值是 0」，但**不改写它的值、不动它的层级码**。
+            if (leadTimeHours <= 0m) zeroHitCount++;
+
+            matchLevelTally[hit.MatchLevel] = matchLevelTally.TryGetValue(hit.MatchLevel, out var n) ? n + 1 : 1;
+
+            result.Add(new StageLeadTimeFact
+            {
+                MaterialId     = materialId,
+                StageCode      = stageCode,
+                LeadTimeHours  = leadTimeHours,
+                MatchLevel     = hit.MatchLevel
+            });
+        }
+
+        if (result.Count > 0)
+        {
+            _logger.LogInformation(
+                "[Pegging] 无 Routing 阶段提前期装载：缺口 (物料,阶段)={Gap}，产出 Fact={Fact}（其中三级全不中⇒3 天兜底 {Missing} 条；命中级里折算值 = 0 ⇒ 按命中产出 0 小时 {Zero} 条），命中层级={Levels}",
+                gapPairs.Count, result.Count, missingCount, zeroHitCount,
+                string.Join(",", matchLevelTally.Select(kv => $"{kv.Key}={kv.Value}")));
+        }
+
+        if (missingCount > 0)
+        {
+            // STAGE_LEADTIME_MISSING：出码 + **按 3 天兜底产出**（PM 2026-09-29 裁决）。
+            //   注意口径：禁的是「默认 0 小时」（§4.4），不是「兜底」——省略 Fact 才是等价 0 小时的那个错。
+            _logger.LogWarning(
+                "[Pegging] STAGE_LEADTIME_MISSING：{Missing}/{Gap} 个「有效 Stage 但无 RoutingOperation」的 (物料,阶段) 命中链（DEPT_EXACT→FACTORY_STAGE_DEFAULT→GLOBAL_STAGE_DEFAULT）走完仍未命中，已按 {Hours} 小时（3 天）兜底产出（PM 2026-09-29 裁决；不删 Stage、不默认 0 小时，0号位 §4.4）",
+                missingCount, gapPairs.Count, MissingStageLeadTimeFallbackHours);
+        }
+
+        if (zeroHitCount > 0)
+        {
+            // 仅作**事实可见**，不是告警：这批 (物料,阶段) 命中了参数行、值是 0，**按命中产出 0 小时**。
+            //   保留这条是因为「值 = 0」与「压根没配」在报表上看起来一样，参数 Owner 需要能分清。
+            //   ⚠️ 口径已定（2026-09-29 用户更正）：0 = **命中**，不换成 3 天兜底，**勿按缺陷处理**。
+            _logger.LogInformation(
+                "[Pegging] 无 Routing 阶段提前期：{Zero}/{Gap} 个 (物料,阶段) 命中到参数行且折算值为 0（LeadTimeHours 与 LeadTimeDays×24 均 ≤ 0），按**命中**产出 LeadTimeHours=0，层级码 = 实际命中级（**不是** STAGE_LEADTIME_MISSING）。实测为 4 行 `*_FINAL`（完工阶段零时长）",
+                zeroHitCount, gapPairs.Count);
+        }
+
+        if (legacyLevelCount > 0)
+        {
+            // §4.3：不让 1号位 自行解释旧数据。这里只告警不采用——旧口径下这两级比 DEPT 更细、会抢占命中，
+            // 若确有此类行，本次装载结果与旧口径**已经不同**，必须让 3号位 知道去下线/迁移。
+            _logger.LogWarning(
+                "[Pegging] StageLeadTimeParam 兼容告警：{Legacy} 个 (物料,阶段) 存在已废止的 Material/ProductFamily 级参数行（V1 不作为正常有效匹配级别，0号位 §4.1/§4.3），本次装载**已不采用**该两级。请 3号位 下线/迁移该批参数",
+                legacyLevelCount);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 按命中顺序从细到粗降级解析提前期；命中即停，同层取 Priority 最小。返回 null = 全部未命中。
+    /// 层级码：`DEPT_EXACT` / `FACTORY_STAGE_DEFAULT` / `GLOBAL_STAGE_DEFAULT`。
+    ///
+    /// ⚠️ 0号位 2026-09-29《Stage顺序_无RoutingStage_Operation标识与TaskMES粒度》§4.1/§4.3：
+    ///    V1 主业务粒度 = **工厂 + StageCode + 生产部门**；Material 级 / ProductFamily 级
+    ///    「**在V1不作为正常有效匹配级别**」、3号位 后续停止发布 ⇒ **本梯次已移除这两级**。
+    ///    旧口径下 Material/Family 比 DEPT 更细、会**抢占**命中，留着等于继续按废止口径跑。
+    ///    遇旧数据**不静默采用也不静默忽略**，由调用方登记兼容告警（见 <see cref="HasLegacyLevelRow"/>，§4.3）。
+    /// </summary>
+    private static StageLeadTimeParamRow? ResolveStageLeadTime(
+        IReadOnlyList<StageLeadTimeParamRow> rows,
+        string? deptCode,
+        string? factoryCode,
+        string stageCode)
+    {
+        // 各层候选筛选器：(谓词, 层级码)，按从细到粗顺序；第一、二层均含 FactoryCode（冻结口径）
+        bool StageOk(StageLeadTimeParamRow r) =>
+            string.Equals(r.StageCode, stageCode, StringComparison.Ordinal);
+        bool SameFactory(StageLeadTimeParamRow r) => SameFactoryCode(r, factoryCode);
+
+        // ⚠️ 2026-09-29 用户明确口径（**字面**）：第三层就是「Stage」，**不带 `IsDefault` 条件**。
+        //    即：只要该 StageCode 有参数行，第三层就命中；**不再要求该行声明 IsDefault = 1**。
+        //    行为影响：本改动**不改变今天的任何结果** —— 实测 282 行的 `IsDefault` 全 = 1，
+        //    即「带条件」与「不带条件」命中的是同一组行。故这是一次**口径对齐**，不是行为变更。
+        //    已去掉的旧条件曾使 `IsDefault` 成为第三层的门槛；现该列在**本装载链上不再被读取**。
+        var levels = new (Func<StageLeadTimeParamRow, bool> Match, string Level)[]
+        {
+            (r => !string.IsNullOrEmpty(deptCode) && string.Equals(r.ProductionDeptCode, deptCode, StringComparison.Ordinal)
+                  && SameFactory(r) && StageOk(r), "DEPT_EXACT"),
+            (r => SameFactory(r) && StageOk(r),    "FACTORY_STAGE_DEFAULT"),
+            (r => StageOk(r),                      "GLOBAL_STAGE_DEFAULT")
+        };
+
+        foreach (var (match, level) in levels)
+        {
+            var hit = rows.Where(match)
+                          .OrderBy(r => r.Priority)
+                          .FirstOrDefault();
+            if (hit is not null)
+            {
+                hit.MatchLevel = level;
+                return hit;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>工厂口径：参数行未限厂时视为通配（冻结口径，FACTORY_STAGE_DEFAULT 依赖此语义）。</summary>
+    private static bool SameFactoryCode(StageLeadTimeParamRow r, string? factoryCode) =>
+        string.IsNullOrEmpty(factoryCode) || string.Equals(r.FactoryCode, factoryCode, StringComparison.Ordinal);
+
+    /// <summary>
+    /// 是否存在**已被 V1 废止的匹配层级**（Material 级 / ProductFamily 级）的参数行。
+    /// 0号位 2026-09-29 §4.1/§4.3：这两级「在V1不作为正常有效匹配级别」、3号位 后续停止发布。
+    /// 判断与「本次是否命中」**无关**——旧口径下它们比 DEPT 级更细、会优先抢占命中，
+    /// 所以只要存在，本次装载的命中层级与提前期就已经和旧口径不同，必须登记兼容告警
+    /// （§4.3「运行中如遇旧数据，可登记兼容告警，不让1号位自行解释」），而不是静默忽略。
+    /// </summary>
+    private static bool HasLegacyLevelRow(
+        IReadOnlyList<StageLeadTimeParamRow> rows,
+        string? materialCode,
+        string? familyCode,
+        string? factoryCode,
+        string stageCode)
+    {
+        if (string.IsNullOrEmpty(materialCode) && string.IsNullOrEmpty(familyCode))
+            return false;
+
+        return rows.Any(r => SameFactoryCode(r, factoryCode)
+            && string.Equals(r.StageCode, stageCode, StringComparison.Ordinal)
+            && ((!string.IsNullOrEmpty(materialCode)
+                 && string.Equals(r.MaterialCode, materialCode, StringComparison.Ordinal))
+                || (!string.IsNullOrEmpty(familyCode)
+                    && string.Equals(r.ProductFamilyCode, familyCode, StringComparison.Ordinal))));
+    }
+
+    /// <summary>StageLeadTimeParam 参数行（解析用，含命中层级回填）</summary>
+    private sealed class StageLeadTimeParamRow
+    {
+        public string FactoryCode { get; set; } = string.Empty;
+        public string StageCode { get; set; } = string.Empty;
+        public string? ProductionDeptCode { get; set; }
+        public string? MaterialCode { get; set; }
+        public string? ProductFamilyCode { get; set; }
+        // ⚠️ 必须可空：实测 282 行的 `LeadTimeHours` **全为 NULL**、值只落在 `LeadTimeDays`（5.00）。
+        //    非空 decimal 遇上 DBNull 会抛，且会把"没给小时"和"小时=0"混为一谈。
+        public decimal? LeadTimeDays { get; set; }
+        public decimal? LeadTimeHours { get; set; }
+        public int Priority { get; set; }
+        public bool IsDefault { get; set; }
+
+        /// <summary>诊断用：该行的 `EffectiveFrom` 是否为 NULL（= 参数发布方没填生效起点）。</summary>
+        public bool EffectiveFromNull { get; set; }
+
+        /// <summary>命中层级（ResolveStageLeadTime 回填，非表列）</summary>
+        public string MatchLevel { get; set; } = string.Empty;
+    }
+
+    /// <summary>物料编码 + 产品族（提前期命中用）</summary>
+    private sealed class StageLeadTimeMatRow
+    {
+        public int Id { get; set; }
+        public string MaterialCode { get; set; } = string.Empty;
+        public int? ProductFamilyId { get; set; }
+    }
+
+    private sealed class FamilyCodeRow { public int Id { get; set; } public string Code { get; set; } = string.Empty; }
+    private sealed class DeptCodeRow { public int Id { get; set; } public string? SourceDeptCode { get; set; } }
+    private sealed class FactoryCodeRow { public int Id { get; set; } public string Code { get; set; } = string.Empty; }
+
+    /// <summary>MaterialCode → Id 反查行</summary>
+    private sealed class MaterialIdCodeRow
+    {
+        public int Id { get; set; }
+        public string MaterialCode { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// 按当前 Domain 涉及的 MaterialId 装载 Routing 三件套。
+    /// `effectiveStages`（本次 BOM 有效 Stage）非空时按 (MaterialId, StageCode) 过滤——见方法内注释；
+    /// 部门锁定仍由 1号位消费 MaterialStageDepartmentContexts 执行（PM 最小 B）。
     /// 三件套缺失时 1号位将把对应新增生产需求判定为 Unscheduled。
     /// </summary>
     private async Task<(List<RoutingOperation> Operations, List<RoutingDependency> Dependencies, List<OperationResourceEligibility> Eligibility)>
-        LoadRoutingContextAsync(IReadOnlyList<int> materialIds, CancellationToken ct)
+        LoadRoutingContextAsync(
+            IReadOnlyList<int> materialIds,
+            IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
+            CancellationToken ct)
     {
+
         if (materialIds.Count == 0)
             return (new List<RoutingOperation>(), new List<RoutingDependency>(), new List<OperationResourceEligibility>());
 
@@ -2955,10 +3766,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 不污染工艺事实层 RoutingOperation。故此处 LEFT JOIN RoutingPlanningParam 取 TransferBatchSize，
         // 键 = (MaterialId, RouteCode, PathId, OperationCode)——RoutingPlanningParam 非部门维度（无 ProductionDepartmentId），
         // 同一工序跨部门共享同一 TransferBatchSize。无参数行时 TransferBatchSize=NULL，1号位按无阈值跳过。
+        // ro.SetupTime：兼容废弃（v1.2 §20.3/§21）。1号位 2026-09-20 回执确认 Solver 零读取 → 停填（不再 SELECT/装载）；
+        // RoutingOperation.SetupTime 实体属性 + 物理列保留兼容废弃，新 Setup 走 SetupTransitionRule，禁止以此兜底。
         var operations = await QueryChunkedInAsync(materialIds, chunk =>
             _connectionManager.QueryAsync<RoutingOperation>(
                 @"SELECT ro.MaterialId, ro.ProductionDepartmentId, ro.RouteCode, ro.PathId, ro.OperationCode,
-                         ro.OperationName, ro.ProcessType, ro.StageCode, ro.StandardDuration, ro.SetupTime,
+                         ro.OperationName, ro.ProcessType, ro.StageCode, ro.OperationPlanningMode, ro.StandardDuration,
                          rpp.TransferBatchSize, ro.IsActive
                   FROM RoutingOperation ro
                   LEFT JOIN RoutingPlanningParam rpp
@@ -2988,7 +3801,647 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 new { MaterialIds = chunk },
                 db: DatabaseId.APS));
 
+        // ── 按「本次 BOM 有效 Stage」过滤三件套（PM 文档 §二十一/§二十二，2026-09-28）──
+        // 规则：
+        //   ① 工序：只保留 (MaterialId, StageCode) 命中 StagePath 的；
+        //      · 未命中 StagePath 的物料（数据缺口 / 采购件）**不过滤**——保持既有「按 MaterialId 全量」兜底，
+        //        避免因数据缺失把工序全过滤掉导致 1号位 误判 Unscheduled。
+        //   ② 依赖：两端工序都必须存活（否则该边指向被裁掉的 Stage）；
+        //   ③ 资质：按存活的 (MaterialId, ProductionDepartmentId, OperationCode) 三元组过滤。
+        // 注：用「三元组」而非 OperationCode 单键——同一物料的不同 Stage 可能出现相同 OperationCode（实测 117 物料）。
+        if (effectiveStages.Count > 0)
+        {
+            var beforeOps = operations.Count;
+            var beforeDeps = dependencies.Count;
+            var beforeElig = eligibility.Count;
+
+            // ① 工序过滤
+            var keptOps = operations
+                .Where(o => !effectiveStages.TryGetValue(o.MaterialId, out var stages)
+                            || string.IsNullOrEmpty(o.StageCode)
+                            || stages.Contains(o.StageCode))
+                .ToList();
+
+            // 存活工序的三元组（供 ③ 资质过滤：资质自身的自然键 = (MaterialId, Dept, OperationCode)）
+            var keptKeys = keptOps
+                .Select(o => (o.MaterialId, o.ProductionDepartmentId, o.OperationCode))
+                .ToHashSet();
+
+            // ② 依赖：两端工序都必须存活。键 = (MaterialId, OperationCode) —— **不带部门维度**。
+            //    理由（1号位 2026-09-28 回执 §三）：本判据是「工序是否**存在**」而非「选哪个」，
+            //    存在性检查不需要部门维度；而原三元组键会**静默丢掉跨部门/跨 Stage 边** ——
+            //    `RoutingDependency.ProductionDepartmentId` 是单值 int，一条跨部门边两端不可能同时命中同一部门键。
+            //    同名工序在别处存活带来的**假阳性**（边多留一次）由 1号位 `validOperationKeys` 再判一次丢弃，不产生错排。
+            var keptOpCodes = keptOps
+                .Select(o => (o.MaterialId, o.OperationCode))
+                .ToHashSet();
+
+            var keptDeps = dependencies
+                .Where(d => keptOpCodes.Contains((d.MaterialId, d.FromOperationCode))
+                         && keptOpCodes.Contains((d.MaterialId, d.ToOperationCode)))
+                .ToList();
+
+            // ③ 资质：按存活三元组过滤
+            var keptElig = eligibility
+                .Where(e => keptKeys.Contains((e.MaterialId, e.ProductionDepartmentId, e.OperationCode)))
+                .ToList();
+
+            // ── 去静默（1号位 核验 §3.3 / 2026-09-28 回执 §六 第 4 项）──
+            // 被丢的依赖边必须**分类可数**：否则「数据缺口（端点工序根本不存在）」与「合法裁 Stage」
+            // 在日志里无法分辨。实测（2026-09-28，APS_Production）：1,156,465 条活跃依赖边中，
+            // 端点不存在者 1,592/1,602 为 M 系（M101–M104 无设备/配品工序族，见 PM「无设备工序三分类」），非随机脏数据。
+            var loadedOpCodes = operations
+                .Select(o => (o.MaterialId, o.OperationCode))
+                .ToHashSet();
+            var droppedDeps = beforeDeps - keptDeps.Count;
+            var absentDeps = dependencies.Count(d =>
+                !loadedOpCodes.Contains((d.MaterialId, d.FromOperationCode))
+                || !loadedOpCodes.Contains((d.MaterialId, d.ToOperationCode)));
+
+            _logger.LogInformation(
+                "[Pegging] 有效 Stage 过滤：工序 {OpsBefore}→{OpsAfter}，依赖 {DepsBefore}→{DepsAfter}（丢弃 {DepsDropped}：端点工序本批完全不存在 {DepsAbsent} / 仅被 Stage 裁掉 {DepsStageCut}），资质 {EligBefore}→{EligAfter}（需求物料={Mats}，命中 StagePath={HitMats}）",
+                beforeOps, keptOps.Count, beforeDeps, keptDeps.Count,
+                droppedDeps, absentDeps, droppedDeps - absentDeps,
+                beforeElig, keptElig.Count,
+                materialIds.Count, effectiveStages.Count);
+
+            operations = keptOps;
+            dependencies = keptDeps;
+            eligibility = keptElig;
+        }
+
+        // ── S3b 人工槽 eligibility 展开（PM 0923 资源模型裁决）──
+        // ManualCapacitySlot 主关联 = (ProductionDepartmentId, OperationName)——业务工序名才是「小工序」的 key；
+        // OperationCode 只是工艺路线内顺序号（M101/M103…），无业务意义，2026-09-24 已随 5号位 重灌切换主关联。
+        // 对每个启用槽，为该部门下所有 OperationName 匹配的 RoutingOperation 工序追加一条「合成 Resource」的 eligibility，
+        // 合成 ResourceId = ManualSlotResourceOffset + ManualSlotId（与 S3a 装载投影同键）。
+        // 合成键只进运行时 OperationResourceEligibility 列表，不触碰正式表。
+        // 注：匹配键用 OperationName，但 eligible 行的 OperationCode 字段仍落各工序自身顺序号（见下方），
+        //     因为它须与 1号位 按 RoutingOperation.OperationCode 对齐 eligibility 的口径一致。
+        var manualSlots = (await _connectionManager.QueryAsync<ManualCapacitySlotKeyDto>(
+            @"SELECT ManualSlotId, ProductionDepartmentId, OperationName
+                FROM ManualCapacitySlot
+               WHERE IsActive = 1",
+            db: DatabaseId.APS)).ToList();
+
+        if (manualSlots.Count > 0)
+        {
+            var opsByDeptOp = operations
+                .GroupBy(o => (o.ProductionDepartmentId, o.OperationName))
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            var expanded = new List<OperationResourceEligibility>(eligibility);
+            foreach (var slot in manualSlots)
+            {
+                if (!opsByDeptOp.TryGetValue((slot.ProductionDepartmentId, slot.OperationName), out var matchedOps))
+                    continue;
+
+                // Priority：设备(via ODS)小者优先；人工槽作为有限产能兜底，取较大固定值让真实设备优先（暂定，未 PM 裁决）。
+                var syntheticResourceId = SolverResourceProjection.ManualSlotResourceOffset + slot.ManualSlotId;
+                foreach (var op in matchedOps)
+                {
+                    expanded.Add(new OperationResourceEligibility
+                    {
+                        MaterialId           = op.MaterialId,
+                        ProductionDepartmentId = op.ProductionDepartmentId,
+                        RouteCode            = op.RouteCode,
+                        PathId               = op.PathId,
+                        OperationCode        = op.OperationCode,
+                        ResourceId           = syntheticResourceId,
+                        Priority             = 100,
+                        CapacityFactor       = 1.0m,
+                        IsPrimary            = false,
+                        IsActive             = true
+                    });
+                }
+            }
+            eligibility = expanded;
+        }
+
+        // ── 兜底诊断（2026-09-24 用户嘱「加入兜底功能即可，不需过度设计」）：仅日志、不落表、不改排程行为 ──
+        // FINITE_RESOURCE 工序在「设备资质 + 人工槽展开」之后仍零合格资源 = 配置遗漏（新工序未同步建设备资质/人工槽）。
+        // 这类工序会被 1号位 PhaseTwo 标 Unscheduled（结果兜底已有）；此处补一道「定位兜底」，
+        // 让遗漏可一眼定位到 (物料,部门,工序名)，避免像早前配品 M101 那样静默翻 SQL。
+        var eligibleKeys = eligibility
+            .Select(e => (e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.PathId, e.OperationCode))
+            .ToHashSet();
+
+        var gapOps = operations
+            .Where(o => o.OperationPlanningMode == "FINITE_RESOURCE")
+            .Where(o => !eligibleKeys.Contains((o.MaterialId, o.ProductionDepartmentId, o.RouteCode, o.PathId, o.OperationCode)))
+            .ToList();
+
+        if (gapOps.Count > 0)
+        {
+            _logger.LogWarning(
+                "[Pegging] 零合格资源兜底诊断：{Count} 道 FINITE_RESOURCE 工序无设备资质且无人工槽（疑似新工序遗漏配置，1号位将标 Unscheduled）。样例：{Sample}",
+                gapOps.Count,
+                string.Join("; ", gapOps.Take(20).Select(o =>
+                    $"Mat={o.MaterialId},Dept={o.ProductionDepartmentId},Op={o.OperationCode}/{o.OperationName}")));
+        }
+
+        // ── V1 单路径归一化（2026-09-24）：冻结文档 RouteCode='DEFAULT'/PathId=1，MES 数据填入中文工艺路线名，须装载层规范化 ──
+        // 此前原样透传给 1号位 → PhaseOne 按 RouteCode='DEFAULT' 过滤全丢 → 整域 FinalTasks=0。
+        // 归一化后统一写 DEFAULT/PathId=1；同 MaterialId 同 OperationCode 的跨 RouteCode 冲突取首条 + Warning。
+        NormalizeToSingleRoute(operations, "RouteCode归一化", _logger);
+        var opSeen = new HashSet<(int, int, string, int, string)>();
+        var opDeduped = operations
+            .Where(o => opSeen.Add((o.MaterialId, o.ProductionDepartmentId, o.RouteCode, o.PathId, o.OperationCode)))
+            .ToList();
+        if (opDeduped.Count < operations.Count)
+            _logger.LogWarning("[Pegging] RouteCode归一化: 工序去重 {Dup} 条（跨RouteCode同名OpCode冲突）", operations.Count - opDeduped.Count);
+        operations = opDeduped;
+
+        NormalizeToSingleRoute(dependencies, "RouteCode归一化(dep)", _logger);
+        NormalizeToSingleRoute(eligibility, "RouteCode归一化(elig)", _logger);
+
+        // ── 资质/依赖去重：归一化**自己制造的**重复（2026-09-29 真跑实测崩溃点）──
+        // 🔴 现象（Run #3，PlanVersionId=632）：1号位 `PhaseOneConstraintBuilder.BuildOperationResourceEligibility`
+        //    的 `g.ToDictionary(e => e.ResourceId, e => e.CapacityFactor)` 抛
+        //    `An item with the same key has already been added. Key: 14235`，整域求解中断。
+        // 根因：上游 MES 工艺对同一 (物料,部门,小工序) 存有**多条 RouteCode 变体**。实测
+        //    ResourceId=14235 / 物料 5365690 / 部门 1031 / 工序 M102 —— 库内两行 RouteCode 分别为
+        //    `ASSY` 与 `ASSY,组装`，**其余列全同**（Priority 同为 1）。`NormalizeToSingleRoute` 把两行都改写为
+        //    RouteCode='DEFAULT' ⇒ 在 1号位 分组键 `EligibilityLookupKey(MaterialId, ProductionDepartmentId,
+        //    RouteCode, OperationCode)`（PhaseOneConstraintBuilder.cs:1108）下**塌进同一组**，
+        //    组内按 ResourceId 建字典 ⇒ 同键 14235 撞字典。**重复不是查询查出来的，是归一化造出来的。**
+        // 实测规模（2026-09-29，APS_Production，按 1号位 撞键口径 = 分组键 + ResourceId，COUNT(*)>1）：
+        //    **5,533 组 / 98 个 ResourceId / 2,278 个物料** ⇒ 任何真实全量跑必崩；小规模测试撞不到
+        //    （与上面 2100 参数溢出同一类「只有真规模才暴露」）。
+        // 为何工序没崩：紧接着 3714-3720 对 operations 做了同键去重 + Warning；**资质这一路当时漏了**。
+        // 故此处按**与 1号位 完全相同的撞键口径**去重（分组键 4 元 + ResourceId）。
+        // 注：撞键两行在 1号位 可见字段上**逐列等同**（RouteCode 已同归一为 DEFAULT）⇒「取首条」无歧义、
+        //    结果与取哪条无关。**不含 PathId**——1号位 分组键里没有它，带上它就会漏掉真正的撞键行。
+        var eligSeen = new HashSet<(int, int, string, string, int)>();
+        var eligDeduped = eligibility
+            .Where(e => eligSeen.Add((e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.OperationCode, e.ResourceId)))
+            .ToList();
+        if (eligDeduped.Count < eligibility.Count)
+            _logger.LogWarning(
+                "[Pegging] RouteCode归一化(elig): 资质去重 {Dup} 条（跨 RouteCode 变体塌入同键，1号位 分组键=物料+部门+路线+工序，组内按资源建字典）",
+                eligibility.Count - eligDeduped.Count);
+        eligibility = eligDeduped;
+
+        // 依赖同类问题：1号位 装进 `List<DependencyEdge>`（`preds.Add`，非字典 Add）⇒ 重复边**不抛异常**，
+        // 但同一 from→to 会进两次成为**重复前驱边**。按边业务自然键去重；`DependencyType`/`LagTime` 不同的
+        // **真并行边予以保留**（不作合并）。
+        var depSeen = new HashSet<(int, string, string, string, decimal)>();
+        var depDeduped = dependencies
+            .Where(d => depSeen.Add((d.MaterialId, d.FromOperationCode, d.ToOperationCode, d.DependencyType, d.LagTime)))
+            .ToList();
+        if (depDeduped.Count < dependencies.Count)
+            _logger.LogWarning(
+                "[Pegging] RouteCode归一化(dep): 依赖去重 {Dup} 条（跨 RouteCode 变体同边）",
+                dependencies.Count - depDeduped.Count);
+        dependencies = depDeduped;
+
         return (operations, dependencies, eligibility);
+    }
+
+    private static void NormalizeToSingleRoute<T>(List<T> items, string label, ILogger? logger = null) where T : class
+    {
+        var changed = 0;
+        foreach (var item in items)
+        {
+            var rc = item.GetType().GetProperty("RouteCode");
+            var pi = item.GetType().GetProperty("PathId");
+            if (rc != null && rc.CanWrite && rc.GetValue(item) is string rv && rv != "DEFAULT")
+            {
+                rc.SetValue(item, "DEFAULT");
+                changed++;
+            }
+            if (pi != null && pi.CanWrite && pi.GetValue(item) is int pv && pv != 1)
+            {
+                pi.SetValue(item, 1);
+            }
+        }
+        if (changed > 0)
+            logger?.LogDebug("[Pegging] {Label}: 已归一化 {Count} 条 RouteCode→DEFAULT", label, changed);
+    }
+
+    /// <summary>
+    /// ③b 供给阈值 Stage 填值（PM《BOM取用_Pegging_Stage_Routing完整链路说明》§八，2026-09-28）：
+    /// 为每个新增生产需求回填「要做到哪个大工艺阶段即算可供给父件」。
+    ///
+    /// 【2026-09-29：范围扩为**需求 ∪ 承接行**、产出**物料级映射**供两个消费者共用】
+    ///   本方法一次算好 `Dictionary&lt;MaterialId, RequiredStageCode&gt;` 并落 `voucher.RequiredStageByMaterialId`：
+    ///     · 消费者① = `LogicalProductionDemand.RequiredStageCode`（运行输入，Solver 用）；
+    ///     · 消费者② = `PeggingSupplyAllocation.NextRequiredStageCode`（追溯列）。
+    ///   之所以不能只算「需求物料」：PM §十一 界定追溯列的用途是「追溯**为什么这个 Supply 可以承接这个需求**」，
+    ///   追溯对象 = **全部承接关系**；而 `LogicalProductionDemands` **只为「有生产缺口」的需求生成**，
+    ///   纯供给承接的需求不在其中 ⇒ 只按需求物料算，追溯列必然大面积留空
+    ///   （实测 PlanVersionId=540：1,205 行只填出 40 行，而 BOM 侧 30,652 个物料带阈值）。
+    ///   承接行物料取自 `voucher.SupplyAllocations[].SupplyMaterialId`；`ValidateEligibility` 红线1
+    ///   保证供需同物料，故它即需求侧物料，**无需给 `SupplyAllocationItem` 加字段**。
+    ///
+    /// 【主源 = BOM 边的 `ChildRequiredStageCode`（按边、本批上下文）】
+    ///   该字段由 `LoadBomSnapshotAsync` 按 `BatchNo + ResolvedBOMNO` 装载进 `BomEdge`（口径正确），
+    ///   但此前**零消费**（1号位 2026-09-28 核验 §3.5 判为**漏接**）。此处即「翻正主次」：直接在内存消费，
+    ///   不再另发一条全局查询。
+    /// 【兜底 = StagePath 的 `IsSupplyThreshold = 1`】主源为空时按**本次批次**取
+    ///   `StageScopeType='EDGE' AND IsSupplyThreshold=1`。原实现**无 `BatchNo`** 且 `First()` 任取，
+    ///   正是 PM §二十一.3 明令禁止的「跨订单/BOM/父件汇总」形态（1号位 核验 §3.5）。
+    /// 【末位 = null】两级都无 ⇒ 留空 = 保守口径（全工艺完成才可供给，与冻结 DDL 设计决策一致）。
+    ///
+    /// 实测（2026-09-28，APS_Production）：不存在「同一子件多个阈值 Stage」——
+    ///   按 `(BatchNo, ChildMaterialCode)` 与按 `ChildMaterialCode` 全局 `HAVING COUNT(DISTINCT StageCode) &gt; 1`
+    ///   的组数**均为 0**。故当前按边取单值与按物料取单值等价；但**按边取**保住了上下文，
+    ///   多父件/多 BOM 结构一旦出现也不会静默任取（歧义时打 Warning）。
+    ///
+    /// 语义（1号位 2026-09-28 回执 §5.2）：落到 `LogicalProductionDemand.RequiredStageCode` 的值必须是
+    ///   「做到此 Stage 即为终点」；**1号位 消费口径只认该字段、不看来源**。
+    /// </summary>
+    private async System.Threading.Tasks.Task FillRequiredStageCodesAsync(
+        PeggingResultVoucher voucher,
+        BomSnapshot bomSnapshot,
+        long planVersionId,
+        CancellationToken ct)
+    {
+        // ── 目标物料集合 = **需求物料 ∪ 承接行物料** ──
+        //   为何要并承接行：PM §十一 明确本值的第二处用途是「追溯**为什么这个 Supply 可以承接这个需求**」，
+        //   即追溯对象是**全部承接关系**；而 `LogicalProductionDemands` 只为「有生产缺口」的需求生成，
+        //   纯供给承接的需求不在其中。若只按需求物料算，追溯列必然大面积留空。
+        //   承接行 = `SupplyAllocations`；`SupplyAllocationItem` 无需求物料字段，但 `ValidateEligibility`
+        //   红线1（`supply.MaterialId != demand.MaterialId` ⇒ 拒绝）保证供需同物料 ⇒ 用 `SupplyMaterialId` 即可。
+        var targetMaterialIds = voucher.LogicalProductionDemands.Select(d => d.MaterialId)
+            .Concat(voucher.SupplyAllocations.Select(a => a.SupplyMaterialId))
+            .Distinct()
+            .ToList();
+
+        if (targetMaterialIds.Count == 0)
+            return;
+
+        // MaterialId → MaterialCode（键 = int，勿传 StringComparer）
+        // ⚠️ **必须分片**（走 QueryChunkedInAsync）：Dapper 把 `IN @Ids` 展开成**逐个参数**，SQL Server 单次 RPC 上限 2100。
+        //   真实规模实测（2026-09-29，PlanVersionId=632 / 4,109 单）：目标物料数超 2100 ⇒ 本方法抛
+        //   「传入的请求具有过多的参数。该服务器支持最多 2100 个参数」⇒ `Pegging 失败 1/1` ⇒
+        //   Task/Pegging/PSA **全 0**（整条 Pegging 被一个 IN 列表打断，日志里前面所有正常步骤都是假象）。
+        //   小规模测试永远碰不到 —— 只有真实全量跑才暴露。
+        var codeById = (await QueryChunkedInAsync(targetMaterialIds, chunk =>
+                _connectionManager.QueryAsync<MaterialIdCodeRow>(
+                    "SELECT Id, MaterialCode FROM Material WHERE Id IN @Ids",
+                    new { Ids = chunk },
+                    db: DatabaseId.APS)))
+            .ToDictionary(r => r.Id, r => r.MaterialCode);
+
+        if (codeById.Count == 0)
+            return;
+
+        // ── 主源：BOM 边 ChildRequiredStageCode（按边、本批上下文；内存消费，零查询）──
+        var thresholdByChildCode = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var edge in bomSnapshot.ByParent.SelectMany(g => g))
+        {
+            if (string.IsNullOrEmpty(edge.ChildCode)) continue;
+            if (string.IsNullOrEmpty(edge.ChildRequiredStageCode)) continue;
+
+            if (thresholdByChildCode.TryGetValue(edge.ChildCode, out var existing))
+            {
+                if (!string.Equals(existing, edge.ChildRequiredStageCode, StringComparison.Ordinal))
+                {
+                    // 当前数据未出现（实测 0 组）；出现即需业务定性，不得静默任取。
+                    _logger.LogWarning(
+                        "[Pegging] 供给阈值歧义：子件 {ChildCode} 在本次 BOM 的不同父件边上有多个阈值 Stage（{Existing} vs {Incoming}），本次取先遇者，请业务确认口径",
+                        edge.ChildCode, existing, edge.ChildRequiredStageCode);
+                }
+                continue;
+            }
+            thresholdByChildCode[edge.ChildCode] = edge.ChildRequiredStageCode;
+        }
+
+        // 按物料落「阈值映射」——一次算好，两个消费者共用（运行输入 LPD + 追溯列）
+        var stageByMaterialId = new Dictionary<int, string>();
+        foreach (var (matId, code) in codeById)
+        {
+            if (thresholdByChildCode.TryGetValue(code, out var stage))
+                stageByMaterialId[matId] = stage;
+        }
+
+        var filledFromBomEdge = 0;
+        foreach (var demand in voucher.LogicalProductionDemands)
+        {
+            if (!string.IsNullOrEmpty(demand.RequiredStageCode)) continue;
+            if (!stageByMaterialId.TryGetValue(demand.MaterialId, out var stage)) continue;
+
+            demand.RequiredStageCode = stage;
+            filledFromBomEdge++;
+        }
+
+        // ── 兜底：StagePath EDGE + IsSupplyThreshold=1，**按本次批次**（PM §二十一.3：不得跨订单/BOM 汇总）──
+        var stillPendingMaterialIds = codeById.Keys
+            .Where(id => !stageByMaterialId.ContainsKey(id))
+            .ToList();
+        var filledFromStagePath = 0;
+        var usedBatchNo = "(未解析)";
+        if (stillPendingMaterialIds.Count > 0)
+        {
+            var batchNo = (await ResolveLinkedBatchNosAsync(planVersionId)).FirstOrDefault();
+            if (string.IsNullOrEmpty(batchNo))
+            {
+                _logger.LogWarning(
+                    "[Pegging] 供给阈值兜底未执行：无 OrderBomRequestLink（PlanVersionId={PlanVersionId}），{Count} 个物料留空（保守口径）",
+                    planVersionId, stillPendingMaterialIds.Count);
+            }
+            else
+            {
+                usedBatchNo = batchNo;
+                var codes = stillPendingMaterialIds
+                    .Select(id => codeById.TryGetValue(id, out var c) ? c : null)
+                    .Where(c => !string.IsNullOrEmpty(c))
+                    .Select(c => c!)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+
+                var thresholdRows = await QueryChunkedInAsync(codes, chunk =>
+                    _connectionManager.QueryAsync<EffectiveStageRow>(
+                        @"SELECT DISTINCT ChildMaterialCode, StageCode
+                          FROM APS_BOM_STAGE_PATH_RAW
+                          WHERE BatchNo = @BatchNo
+                            AND StageScopeType = 'EDGE'
+                            AND IsSupplyThreshold = 1
+                            AND StageCode IS NOT NULL
+                            AND ChildMaterialCode IN @Codes",
+                        new { BatchNo = batchNo, Codes = chunk },
+                        db: DatabaseId.APS));
+
+                var thresholdByCode = thresholdRows
+                    .Where(r => !string.IsNullOrEmpty(r.StageCode))
+                    .GroupBy(r => r.ChildMaterialCode, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.First().StageCode!, StringComparer.Ordinal);
+
+                foreach (var id in stillPendingMaterialIds)
+                {
+                    if (!codeById.TryGetValue(id, out var code)) continue;
+                    if (!thresholdByCode.TryGetValue(code, out var stage)) continue;
+
+                    stageByMaterialId[id] = stage;
+                    filledFromStagePath++;
+                }
+            }
+        }
+
+        // 兜底结果回填「仍未取值」的运行输入（主源循环已填的不重复动）
+        foreach (var demand in voucher.LogicalProductionDemands)
+        {
+            if (!string.IsNullOrEmpty(demand.RequiredStageCode)) continue;
+            if (!stageByMaterialId.TryGetValue(demand.MaterialId, out var stage)) continue;
+
+            demand.RequiredStageCode = stage;
+        }
+
+        // ── 落给追溯列消费（PM §十一 第二处保留）──
+        // 追溯列按**承接行自身物料**直接命中，不经 `LogicalProductionDemand.DemandKey` 中转
+        // （LPD 只为有生产缺口的需求生成 ⇒ 中转必然漏掉纯供给承接行）。
+        voucher.RequiredStageByMaterialId = stageByMaterialId;
+
+        var unresolved = voucher.LogicalProductionDemands.Count(d => string.IsNullOrEmpty(d.RequiredStageCode));
+        _logger.LogInformation(
+            "[Pegging] 供给阈值 Stage 回填：主源 BOM 边填需求 {FromEdge} 个 / 兜底 StagePath(本批 {BatchNo}) 补物料 {FromPath} 个 / 物料映射共 {MapSize} 个 / 需求仍留空 {Unresolved} 个（需求总数 {Total}，承接行总数 {AllocTotal}）",
+            filledFromBomEdge, usedBatchNo, filledFromStagePath, stageByMaterialId.Count, unresolved,
+            voucher.LogicalProductionDemands.Count, voucher.SupplyAllocations.Count);
+    }
+
+    /// <summary>
+    /// **AllocationTaskShare 不变量校验（PM《回复0928-2》§三/§六 裁决，fail-closed）**
+    ///
+    /// PM 冻结的 4 条不变量：
+    /// - **Inv1** 每 `(AllocationSequence, FinalDraftId)` 至多一行 —— 防止一个 Task 重复写份额；
+    /// - **Inv2** 同 `AllocationSequence` 的 `Σ ShareQty` == 该 seq 全部 Demand 的 `NetOutputQty` 之和（补差闭合）；
+    /// - **Inv3** 按 `DemandKey` 聚合不得因「一个 TaskNo 多 Operation Task」膨胀 —— 由 Inv1 + 「仅末端 Task 记份额」
+    ///   共同在**产出侧**保证；其**落库后**的 DB 级校验见 `ValidateStoredShareInvariantsAsync`；
+    /// - **Inv4** 没有生产任务不得产生份额。
+    ///
+    /// **为何 fail-closed**：PM §六 明确「防重复不是显示问题，而是 Candidate 正确性的前置条件」——
+    /// 份额一旦膨胀，`ComputeChangeSeedKeysAsync` 的 `SUM(ShareQty) BY DemandKey` 基线立即错误，
+    /// 导致候选排程定位到错误的受影响范围。宁可不落库，也不给候选留错误基线（与「禁止静默回退」红线一致）。
+    /// </summary>
+    private void ValidateAllocationShareInvariants(
+        DomainSolveResult solveResult,
+        PeggingResultVoucher voucher,
+        IReadOnlyDictionary<string, long> finalDraftToTaskId)
+    {
+        if (solveResult.AllocationShares.Count == 0)
+            return;
+
+        var errors = new List<string>();
+
+        // Inv1：同 (AllocationSequence, FinalDraftId) 多行
+        var inv1 = solveResult.AllocationShares
+            .GroupBy(s => (s.AllocationSequence, s.FinalDraftId))
+            .Where(g => g.Count() > 1)
+            .Take(5)
+            .Select(g => $"(seq={g.Key.AllocationSequence}, draft={g.Key.FinalDraftId})×{g.Count()}")
+            .ToList();
+        if (inv1.Count > 0)
+            errors.Add($"Inv1 同分配+同Task多行：{string.Join("; ", inv1)}");
+
+        // Inv4：份额指向的 Draft 无对应生产任务
+        var inv4 = solveResult.AllocationShares
+            .Where(s => !finalDraftToTaskId.ContainsKey(s.FinalDraftId))
+            .Select(s => s.FinalDraftId)
+            .Distinct(StringComparer.Ordinal)
+            .Take(5)
+            .ToList();
+        if (inv4.Count > 0)
+            errors.Add($"Inv4 份额指向无生产任务的Draft：{string.Join("; ", inv4)}");
+
+        // Inv2：按 AllocationSequence 闭合（闭合目标 = 该 seq 全部 Demand 的 NetOutputQty 之和）
+        var expectedByAlloc = voucher.LogicalProductionDemands
+            .GroupBy(d => d.AllocationSequence)
+            .ToDictionary(g => g.Key, g => g.Sum(d => d.NetOutputQty));
+        var actualByAlloc = solveResult.AllocationShares
+            .GroupBy(s => s.AllocationSequence)
+            .ToDictionary(g => g.Key, g => g.Sum(s => s.ComponentQty));
+
+        foreach (var kv in actualByAlloc)
+        {
+            if (!expectedByAlloc.TryGetValue(kv.Key, out var expected))
+            {
+                errors.Add($"Inv2 seq={kv.Key} 有份额但无对应 Demand");
+                continue;
+            }
+            if (Math.Abs(kv.Value - expected) > 0.001m)
+                errors.Add($"Inv2 seq={kv.Key} ΣShareQty={kv.Value} ≠ ΣNetOutputQty={expected}");
+        }
+
+        if (errors.Count > 0)
+        {
+            foreach (var e in errors)
+                _logger.LogError("[AllocationTaskShare] 不变量校验失败: {Error}", e);
+            throw new InvalidOperationException(
+                $"AllocationTaskShare 不变量校验失败（{errors.Count} 项）——已阻止落库，避免污染 Candidate 变化基线：{string.Join(" | ", errors)}");
+        }
+
+        _logger.LogInformation(
+            "[AllocationTaskShare] 不变量校验通过：份额行={Rows}，分配数={Allocs}",
+            solveResult.AllocationShares.Count, actualByAlloc.Count);
+    }
+
+    /// <summary>
+    /// **落库后 DB 级份额不变量校验**（PM《回复0928-2》§六：Candidate ChangeSeed **读取前**必须校验）。
+    ///
+    /// 与 `ValidateAllocationShareInvariants`（产出侧、内存）互补：本方法查**已落库**的 Base 版本，
+    /// 覆盖「历史数据被其它路径写脏」的情形（唯一约束要到阶段C 才加，故此刻必须靠读取前校验兜住）。
+    /// 查 Inv1 / Inv3 / Inv4；任一 &gt; 0 即 fail-closed。
+    /// </summary>
+    private async System.Threading.Tasks.Task ValidateStoredShareInvariantsAsync(int planVersionId)
+    {
+        var row = await _connectionManager.QueryFirstOrDefaultAsync<ShareInvariantRow>(
+            @"SELECT
+                (SELECT COUNT(*) FROM (
+                    SELECT AllocationSequence, TaskId FROM AllocationTaskShare
+                    WHERE PlanVersionId = @PlanVersionId
+                    GROUP BY AllocationSequence, TaskId HAVING COUNT(*) > 1) a) AS Inv1,
+                (SELECT COUNT(*) FROM (
+                    SELECT s.AllocationSequence, t.TaskNo FROM AllocationTaskShare s
+                    JOIN [Task] t ON t.Id = s.TaskId
+                    WHERE s.PlanVersionId = @PlanVersionId
+                    GROUP BY s.AllocationSequence, t.TaskNo HAVING COUNT(DISTINCT s.TaskId) > 1) b) AS Inv3,
+                (SELECT COUNT(*) FROM AllocationTaskShare s
+                 WHERE s.PlanVersionId = @PlanVersionId
+                   AND NOT EXISTS (SELECT 1 FROM [Task] t WHERE t.Id = s.TaskId)) AS Inv4",
+            new { PlanVersionId = planVersionId },
+            db: DatabaseId.APS);
+
+        var inv1 = row?.Inv1 ?? 0;
+        var inv3 = row?.Inv3 ?? 0;
+        var inv4 = row?.Inv4 ?? 0;
+
+        if (inv1 > 0 || inv3 > 0 || inv4 > 0)
+        {
+            _logger.LogError(
+                "[AllocationTaskShare] 落库数据不变量校验失败（PlanVersionId={PlanVersionId}）：Inv1={Inv1}, Inv3={Inv3}, Inv4={Inv4}",
+                planVersionId, inv1, inv3, inv4);
+            throw new InvalidOperationException(
+                $"AllocationTaskShare 落库数据违反不变量（PlanVersionId={planVersionId}）：Inv1={inv1}, Inv3={inv3}, Inv4={inv4} —— 拒绝据此计算 Candidate ChangeSeed（份额膨胀会直接污染变化基线）");
+        }
+    }
+
+    /// <summary>份额不变量 DB 校验结果行</summary>
+    private sealed class ShareInvariantRow
+    {
+        public int Inv1 { get; set; }
+        public int Inv3 { get; set; }
+        public int Inv4 { get; set; }
+    }
+
+    /// <summary>
+    /// 组装 PM《Stage、生产部门、Routing、Dependency、StageLeadTimeParam 接口裁决回复》(2026-09-28) §三
+    /// 定义的 **`EffectiveStagePath`**：2号位 提供给 1号位 的**业务事实** =
+    /// `MaterialId + StageCode + StageSeq + ProductionDepartmentId`（四条一组，不是只有码与序号）。
+    ///
+    /// 【部门来源】`MaterialStageDeptContext` —— PM §四/§六 逐字：
+    ///   「StageCode 不能直接决定生产部门，必须通过 MaterialStageDeptContext 确定」「Stage 不是部门，
+    ///    Stage 必须经过 Master 裁决」。
+    /// 【null 语义】MSC 无 (MaterialId, StageCode) 映射 ⇒ 该步部门未知，**不推导、不猜**；
+    ///   1号位 按既有最小B 口径记 `MISSING_PRODUCTION_DEPARTMENT_CONTEXT` 并置 Unscheduled。
+    /// 【PM §三 分工】2号位 只提供业务事实，**不生成 Solver 内部对象**（StageDependency 由 1号位 自建）。
+    /// </summary>
+    private static List<StageSequenceChain> BuildEffectiveStagePaths(
+        IReadOnlyList<StageSequenceChain> chains,
+        IReadOnlyList<MaterialStageDepartmentContextDto> deptContexts)
+    {
+        var deptByMaterialStage = deptContexts
+            .GroupBy(c => (c.MaterialId, c.StageCode))
+            .ToDictionary(g => g.Key, g => g.First().ProductionDepartmentId);
+
+        return chains
+            .Select(chain => new StageSequenceChain
+            {
+                MaterialId = chain.MaterialId,
+                Stages = chain.Stages
+                    .Select(s => new StageSequenceStep
+                    {
+                        StageCode = s.StageCode,
+                        StageSeq  = s.StageSeq,
+                        ProductionDepartmentId =
+                            deptByMaterialStage.TryGetValue((chain.MaterialId, s.StageCode), out var dept)
+                                ? dept
+                                : null
+                    })
+                    .ToList()
+            })
+            .ToList();
+    }
+
+    /// <summary>
+    /// 解析「本次 BOM 批次」——与 `LoadBomSnapshotAsync` 同口径：
+    /// 经 `OrderBomRequestLink` 取本 PlanVersion 关联的批次；SQL 已按 `SyncedAt DESC` 排序，
+    /// 故返回列表的**首个 = 最新批次**。返回**全部**关联批次，供调用方同时派生「最新批次」与「多批次诊断」。
+    /// </summary>
+    private async Task<List<string>> ResolveLinkedBatchNosAsync(long planVersionId)
+    {
+        var rows = await _connectionManager.QueryAsync<BatchLinkRow>(
+            @"SELECT r.BatchNo
+              FROM OrderBomRequestLink r
+              INNER JOIN [Order] o ON o.Id = r.OrderId
+              WHERE o.PlanVersionId = @PlanVersionId AND r.BatchNo IS NOT NULL
+              ORDER BY r.SyncedAt DESC",
+            new { PlanVersionId = planVersionId },
+            db: DatabaseId.APS);
+
+        return rows.Select(r => r.BatchNo ?? string.Empty)
+                   .Where(b => !string.IsNullOrEmpty(b))
+                   .ToList();
+    }
+
+    /// <summary>
+    /// 解析「生产指示号 → 本次 BOM 批次」：经 `[Order].MTS_InstructionNo` + `OrderBomRequestLink` 桥接。
+    ///
+    /// 用途：`LoadPiPositionsAsync` 的 Stage 顺序装载要**按每条 WIP 行自身的 PI 所属批次**收窄
+    /// （而非全局 `MIN(StageSeq)`，PM §二十一.3）。一个 PI 若关联多个批次（异常情形），
+    /// 取**字典序最小**者以保证结果稳定可复现——不取「最新」，避免同一份输入两次运行得到不同 Stage 顺序。
+    /// </summary>
+    private async Task<Dictionary<string, string>> LoadBatchByPiAsync(List<string> piNos)
+    {
+        var batchByPi = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (piNos.Count == 0)
+            return batchByPi;
+
+        var rows = await QueryChunkedInAsync(piNos, chunk =>
+            _connectionManager.QueryAsync<PiBatchRow>(
+                @"SELECT DISTINCT o.MTS_InstructionNo, r.BatchNo
+                  FROM [Order] o
+                  INNER JOIN OrderBomRequestLink r ON r.OrderId = o.Id
+                  WHERE o.MTS_InstructionNo IN @PiNos AND r.BatchNo IS NOT NULL",
+                new { PiNos = chunk },
+                db: DatabaseId.APS));
+
+        var ambiguous = 0;
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrEmpty(row.MTS_InstructionNo)) continue;
+            if (string.IsNullOrEmpty(row.BatchNo)) continue;
+
+            if (batchByPi.TryGetValue(row.MTS_InstructionNo, out var existing))
+            {
+                if (!string.Equals(existing, row.BatchNo, StringComparison.Ordinal))
+                {
+                    ambiguous++;
+                    if (string.CompareOrdinal(row.BatchNo, existing) >= 0) continue;
+                }
+                else
+                {
+                    continue;
+                }
+            }
+            batchByPi[row.MTS_InstructionNo] = row.BatchNo;
+        }
+
+        if (ambiguous > 0)
+        {
+            _logger.LogWarning(
+                "[Pegging] {Count} 个生产指示号关联了多个 BOM 批次，Stage 顺序装载取字典序最小批次以保证可复现（请核 PI 与批次的对应关系）",
+                ambiguous);
+        }
+
+        return batchByPi;
+    }
+
+    /// <summary>生产指示号 → BOM 批次 行</summary>
+    private sealed class PiBatchRow
+    {
+        public string? MTS_InstructionNo { get; set; }
+        public string? BatchNo { get; set; }
     }
 
     /// <summary>
@@ -3076,28 +4529,77 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         int planVersionId,
         CancellationToken ct)
     {
-        var rows = (await _connectionManager.QueryAsync<BomRawRow>(
-            @"SELECT b.ParentMaterialCode,
-                     b.ChildMaterialCode,
-                     ISNULL(mc.Id, 0)          AS ChildMaterialId,
-                     b.Quantity,
-                     b.Level,
-                     b.LLC,
-                     b.IsLeaf,
-                     ISNULL(mc.IsPurchased, 0) AS IsPurchased,
-                     b.ChildRequiredStageCode
-              FROM APS_BOM_RAW b
-              LEFT JOIN Material mc ON mc.MaterialCode = b.ChildMaterialCode
-              WHERE b.BatchNo = ISNULL(
-                  (SELECT TOP 1 r.BatchNo
-                   FROM OrderBomRequestLink r
-                   INNER JOIN [Order] o ON o.Id = r.OrderId
-                   WHERE o.PlanVersionId = @PlanVersionId
-                   ORDER BY r.SyncedAt DESC),
-                  (SELECT TOP 1 BatchNo FROM APS_BOM_RAW ORDER BY SyncedAt DESC)
-              )",
+        // 【2026-09-28 收窄】按 `OrderBomRequestLink.ResolvedBOMNO` 限定「本 PV 订单实际使用的 BOM」，
+// 替代原「只按 BatchNo 取整批」——实测（PV539+540）3,672 BOMNO → 486（13%），
+// 行数 3,272,701 → 846,170（**砍掉 74%**）。PM《BOM取用链接说明》§9.2 明文：
+// 「使用 BatchNo + ResolvedBOMNO 进入 APS_BOM_RAW 得到本次 BOM 父子结构」。
+// 兜底：该 PV 无 OrderBomRequestLink（如手工建的测试 PV）⇒ 不过滤 BOMNO，保持既有整批行为。
+        var resolvedBomNos = (await _connectionManager.QueryAsync<string>(
+            @"SELECT DISTINCT r.ResolvedBOMNO
+              FROM OrderBomRequestLink r
+              INNER JOIN [Order] o ON o.Id = r.OrderId
+              WHERE o.PlanVersionId = @PlanVersionId AND r.ResolvedBOMNO IS NOT NULL",
             new { PlanVersionId = planVersionId },
             db: DatabaseId.APS)).ToList();
+
+        // 【2026-09-29 分片】`IN @ResolvedBomNos` 的列表 = 本 PV 用到的**全部** BOMNO（上面注释的收窄口径实测 486，
+        //   但那是 PV539/540；全量 FAMILY_X 域可上千）⇒ 裸 `IN` 会撞 2100，把 BOM 快照整个取空（下游全判无 BOM）。
+        //   主查询是「按 BatchNo 过滤 APS_BOM_RAW + LEFT JOIN Material」的单次取数，**无聚合、无跨行 ORDER BY**，
+        //   故按 BOMNO 分批取并集与单条 `IN` 等价。
+        //   兜底路径（该 PV 无 OrderBomRequestLink ⇒ resolvedBomNos 为空）保持**单跑整批**，与旧实现逐字一致。
+        async Task<List<BomRawRow>> LoadBomRowsAsync(IReadOnlyList<string>? bomNos)
+        {
+            var loaded = await _connectionManager.QueryAsync<BomRawRow>(
+                @"SELECT b.ParentMaterialCode,
+                         b.ChildMaterialCode,
+                         ISNULL(mc.Id, 0)          AS ChildMaterialId,
+                         b.Quantity,
+                         b.Level,
+                         b.LLC,
+                         b.IsLeaf,
+                         ISNULL(mc.IsPurchased, 0) AS IsPurchased,
+                         b.ChildRequiredStageCode
+                  FROM APS_BOM_RAW b
+                  LEFT JOIN Material mc ON mc.MaterialCode = b.ChildMaterialCode
+                  WHERE b.BatchNo = ISNULL(
+                      (SELECT TOP 1 r.BatchNo
+                       FROM OrderBomRequestLink r
+                       INNER JOIN [Order] o ON o.Id = r.OrderId
+                       WHERE o.PlanVersionId = @PlanVersionId
+                       ORDER BY r.SyncedAt DESC),
+                      (SELECT TOP 1 BatchNo FROM APS_BOM_RAW ORDER BY SyncedAt DESC)
+                  )
+                    AND (@HasBomNoFilter = 0 OR b.BOMNO IN @ResolvedBomNos)",
+                new
+                {
+                    PlanVersionId = planVersionId,
+                    HasBomNoFilter = bomNos is { Count: > 0 } ? 1 : 0,
+                    ResolvedBomNos = bomNos is { Count: > 0 } ? bomNos : new List<string> { "" }
+                },
+                db: DatabaseId.APS);
+            return loaded.ToList();
+        }
+
+        var rows = new List<BomRawRow>();
+        if (resolvedBomNos.Count == 0)
+        {
+            rows.AddRange(await LoadBomRowsAsync(null));
+        }
+        else
+        {
+            for (var offset = 0; offset < resolvedBomNos.Count; offset += SqlServerInParameterLimit)
+            {
+                var chunk = resolvedBomNos.Skip(offset).Take(SqlServerInParameterLimit).ToList();
+                rows.AddRange(await LoadBomRowsAsync(chunk));
+            }
+        }
+
+        if (resolvedBomNos.Count > 0)
+        {
+            _logger.LogInformation(
+                "[Pegging] BOM 快照按 ResolvedBOMNO 收窄：{BomNos} 个 BOMNO，装载 {Rows} 行（PlanVersionId={PlanVersionId}）",
+                resolvedBomNos.Count, rows.Count, planVersionId);
+        }
 
         if (rows.Count == 0)
         {
@@ -3142,6 +4644,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     private sealed class OrderPeggingRow
     {
         public long     OrderId          { get; set; }
+        public long?    OrderCanonicalId { get; set; }
         public int      MaterialId       { get; set; }
         public string   MaterialCode     { get; set; } = string.Empty;
         public int      FactoryId        { get; set; }
@@ -3163,6 +4666,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var rows = await QueryChunkedInAsync(request.OrderIds, chunk =>
             _connectionManager.QueryAsync<OrderPeggingRow>(
                 @"SELECT o.Id          AS OrderId,
+                         o.OrderCanonicalId,
                          o.MaterialId,
                          m.MaterialCode,
                          o.FactoryId,
@@ -3214,9 +4718,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     }
 
     /// <summary>
-    /// 旧主链 DFS 循环（阶段2 S2.3 从 ExecutePeggingLoopAsync 原封抽出，语义零变化）：
+    /// 旧 DFS 循环（阶段2 S2.3 从 ExecutePeggingLoopAsync 原封抽出，语义零变化）：
     /// 按 DemandSequence 升序逐订单从根物料递归展开 BOM，在每个节点对 SupplyPool 贪婪扣减。
-    /// RunDualCompareAsync 据此跑「旧」侧；待双跑通过（PM 门槛2）后本方法即被 RunBfsLoop 替换主链。
+    /// 已弃旧（2026-09-18 用户裁决：路径级 visited 无记忆化，真实 BOM 上共享子件指数重遍历不收敛）。
+    /// 主链已切 <see cref="RunBfsLoop"/>；本方法仅保留给 <see cref="RunDualCompareAsync"/> 跑「旧」侧对照，非每日排程路径。
     /// </summary>
     private PeggingResultVoucher RunDfsLoop(
         IReadOnlyList<OrderPeggingRow> orders,
@@ -3375,26 +4880,32 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         gross, level, demandSequence, bom, supplyPool, voucher,
                         consumerLogicalDemandKey: null, consumerMaterialId: 0);
 
-                    if (outcome is null) continue;                    // 无生产（真实供给补足/采购占位/失败）：不下钻、无血缘
-                    if (outcome.ProducerLogicalDemandKey is null) continue; // 防御：NEW_REQUIREMENT 生产恒有 LPD 身份
-                    produced[SupplyPool.BuildKey(node.MaterialCode, node.FactoryId)] = outcome;
-
-                    // 血缘建边（父 → 本物料生产）：每条父边独立，RequiredQty = 父净产出 × 配比。
+                    // 血缘建边（父 → 本物料需求/生产）：只要父件有净产出，无论本节点是否生产，都产 link。
+                    // Case B（子件全库存/采购占位）：ProducerLogicalDemandKey=null，仍保留「父需求→子需求」真相（0910 §二十）。
                     // 与旧 DFS 差异：旧在 NetAndAllocate 内建「单 consumer」边；BFS 一个节点多父，在此按 ParentEdges 逐边建。
                     foreach (var edge in node.ParentEdges)
                     {
                         if (!produced.TryGetValue(SupplyPool.BuildKey(edge.ParentMaterialCode, node.FactoryId), out var parent))
                             continue;
+                        // ⚠ parent.ProducerLogicalDemandKey! 安全不变式：produced 仅在本方法内「ProducerLogicalDemandKey is null 卫语句」之后才写入，
+                        // 故父件有生产 → 其 LPD 键必非空，此处 ! 非掩盖空值；若日后放开该卫语句（如采购占位也入字典），
+                        // 此 ! 会静默失守（ConsumerLogicalDemandKey=null），须同步改。（符号锚·勿行号引用——行号会随注释自身插入而漂移）
                         voucher.MaterialRequirementLinks.Add(new Core.Dto.MaterialRequirementLink
                         {
                             ConsumerLogicalDemandKey   = parent.ProducerLogicalDemandKey!,
-                            ProducerLogicalDemandKey   = outcome.ProducerLogicalDemandKey!,
+                            ProducerLogicalDemandKey   = outcome?.ProducerLogicalDemandKey,
                             ConsumerMaterialId         = edge.ParentMaterialId,
                             ProducerMaterialId         = node.MaterialId,
+                            // ChildDemandKey 与 NetAndAllocate 内 demandKey 同格式（ORDER_{OrderId}_{MaterialCode}_{FactoryId}）
+                            ChildDemandKey             = $"ORDER_{order.OrderId}_{node.MaterialCode}_{node.FactoryId}",
                             RequiredQty                = parent.ProducedQty * edge.QtyPerUnit,
-                            ProducerAllocationSequence = outcome.ProducerAllocationSequence
+                            ProducerAllocationSequence = outcome?.ProducerAllocationSequence ?? 0
                         });
                     }
+
+                    if (outcome is null) continue;                    // 无生产（真实供给补足/采购占位/失败）：不下钻、不存 produced
+                    if (outcome.ProducerLogicalDemandKey is null) continue; // 防御：NEW_REQUIREMENT 生产恒有 LPD 身份
+                    produced[SupplyPool.BuildKey(node.MaterialCode, node.FactoryId)] = outcome;
                 }
             }
         }
@@ -3652,6 +5163,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var demands = orders.Select(o => new UpstreamDemand
         {
             DemandKey    = o.OrderId.ToString(),
+            OrderCanonicalId = o.OrderCanonicalId,
             OrderType    = o.OrderType,
             CustomerTier = o.CustomerTier,
             DueDate      = o.DueDate,
@@ -3670,6 +5182,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(strategyProfileVersionId.Value, ct);
 
+        // S5（PM 0923）：EXPEDITE 身份 = ScopeJsonV2.OrderTargets.OrderCanonicalId，仅 PriorityMode=EXPEDITE 时生效；
+        // 作为「可调整 Demand 排序前置竞争层」传给 Executor（V1 全量重排：expedite 需求整体前置，层内仍按冻结策略竞争）。
+        var expediteOrderCanonicalIds = await LoadExpediteOrderCanonicalIdsAsync(request, ct);
+
         // 方案A：外部按 CalculationLayer 调用 Executor —— 只对「第一层：顶层独立需求（订单）」取当前层 Segments
         const int currentCalculationLayer = 1;
         var layerConfig = new DemandPriorityConfig
@@ -3679,7 +5195,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 .ToList()
         };
 
-        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, layerConfig);
+        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, layerConfig, expediteOrderCanonicalIds);
 
         var map = new Dictionary<long, int>();
         foreach (var demand in sorted)
@@ -3691,6 +5207,35 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         }
 
         return map;
+    }
+
+    /// <summary>
+    /// S5（PM 0923）：解析本 Run 的 EXPEDITE 目标订单集合。
+    /// 仅当 ScopeJsonV2.PriorityMode == EXPEDITE 且 OrderTargets 非空时，返回 OrderCanonicalId 去重集合；否则空集。
+    /// </summary>
+    private async Task<IReadOnlySet<long>> LoadExpediteOrderCanonicalIdsAsync(
+        PeggingExecutionRequest request,
+        CancellationToken ct)
+    {
+        var scheduleRunId = request.SchedulingContext?.ScheduleRunId;
+        if (scheduleRunId == null || scheduleRunId <= 0)
+            return new HashSet<long>();
+
+        var scopeJson = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT ScopeJson FROM ScheduleRun WHERE Id = @Id",
+            new { Id = scheduleRunId.Value }, db: DatabaseId.APS);
+
+        if (string.IsNullOrWhiteSpace(scopeJson))
+            return new HashSet<long>();
+
+        var scope = JsonSerializer.Deserialize<ScopeJsonV2>(scopeJson, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+        if (scope == null || scope.PriorityMode != PriorityMode.Expedite || scope.OrderTargets is not { Count: > 0 })
+            return new HashSet<long>();
+
+        return scope.OrderTargets.Select(t => t.OrderCanonicalId).ToHashSet();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4119,6 +5664,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // §5.2 DemandBalance：构建需求侧内存账本
         var demand = new DemandBalance
         {
+            // 【2026-09-29 修复】`RequiredQty` 是 `init` 属性，此前**从未赋值** ⇒ 恒为默认值 0。
+            //   它是**不可变的需求节点总量**，与 `RemainingQty`（遍历中递减）不同：后者可扣减，它必须保持初始值。
+            //   漏赋的直接后果：`TryAtomicAllocation` 落 `SupplyAllocationItem.DemandQuantity = demand.RequiredQty`
+            //   ⇒ `PeggingSupplyAllocation.DemandQty` **全表 0**（实测 PV632：53,651/53,651 行 = 0，而 AllocatedQty 正常）。
+            //   注意它**不影响分配结果**（分配只读 RemainingQty），只污染落库追溯列 —— 故两轮真跑均未暴露。
+            RequiredQty = demandQty,
             RemainingQty = demandQty,
             MaterialId = materialId,
             MaterialCode = materialCode,
@@ -4336,6 +5887,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         int basePlanVersionId,
         PeggingResultVoucher voucher)
     {
+        // PM《回复0928-2》§六 裁决：ChangeSeed **读取前**必须先校验 Base 侧份额无重复 ——
+        // 本方法的 `SUM(ShareQty) BY DemandKey` 是 Candidate 变化基线的唯一来源，膨胀即误判。
+        await ValidateStoredShareInvariantsAsync(basePlanVersionId);
+
         var baseRows = await _connectionManager.QueryAsync<DemandKeyQtyRow>(
             @"SELECT DemandKey, SUM(ShareQty) AS Qty
               FROM AllocationTaskShare
@@ -4417,6 +5972,145 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         return constraints;
     }
 
+    /// <summary>
+    /// ScopeJsonV2 → RunScope 投影（M2）。从 ScheduleRun.ScopeJson 反序列化，按 1号位 内存键体系投影。
+    /// OrderCanonicalId / TaskId 在投影层终止，不进 Solver 契约。null = FULL 语义。
+    /// </summary>
+    private async Task<RunScope?> BuildRunScopeAsync(
+        PeggingExecutionRequest request,
+        PeggingResultVoucher voucher,
+        int? basePlanVersionId,
+        CancellationToken ct)
+    {
+        var scheduleRunId = request.SchedulingContext?.ScheduleRunId;
+        if (scheduleRunId == null || scheduleRunId <= 0)
+            return null;
+
+        var scopeJson = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT ScopeJson FROM ScheduleRun WHERE Id = @Id",
+            new { Id = scheduleRunId.Value }, db: DatabaseId.APS);
+
+        if (string.IsNullOrWhiteSpace(scopeJson))
+            return null;
+
+        var scope = JsonSerializer.Deserialize<ScopeJsonV2>(scopeJson, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+        if (scope == null)
+            return null;
+
+        // 1号位 §三 补充1：Trigger 零值防御（八码从 1 起，非法值 fail-closed）
+        if (!Enum.IsDefined(scope.Trigger) || (int)scope.Trigger is < 1 or > 8)
+        {
+            throw new InvalidOperationException(
+                $"ScopeJsonV2.Trigger 非法值: {(int)scope.Trigger}（不在八码 1~8 范围内）");
+        }
+
+        // DueDateOverrides：OrderCanonicalId → LogicalDemandKey（仅 ManualTargetDueDate 非空行投影）
+        IReadOnlyList<DueDateOverride> dueDateOverrides = Array.Empty<DueDateOverride>();
+        if (scope.OrderTargets is { Count: > 0 })
+        {
+            var targets = scope.OrderTargets
+                .Where(t => t.ManualTargetDueDate.HasValue)
+                .ToList();
+            if (targets.Count > 0)
+            {
+                var ocIds = targets.Select(t => t.OrderCanonicalId).Distinct().ToList();
+                // 分片：`ocIds` = ScopeJson.OrderTargets 里带人工目标交期的订单（批量插单/改期可上千）
+                //   ⇒ 裸 `IN @OcIds` 会撞 2100，整个 DueDateOverride 投影静默落空。走统一帮手。
+                var orderRows = await QueryChunkedInAsync(ocIds, chunk =>
+                    _connectionManager.QueryAsync<dynamic>(
+                        @"SELECT obl.OrderId, obl.OrderCanonicalId
+                          FROM OrderBomRequestLink obl
+                          WHERE obl.OrderCanonicalId IN @OcIds AND obl.PlanVersionId = @PvId",
+                        new { OcIds = chunk, PvId = request.PlanVersionId }, db: DatabaseId.APS));
+                var orderIdByOcId = orderRows
+                    .ToDictionary(r => (long)r.OrderCanonicalId, r => (long)r.OrderId);
+
+                // DueDateOverride 的键是 LogicalDemandKey（Run 内语义，非跨版本比对键）。
+                // 跨版本比对键统一用 DemandKey（1号位 回执 20260923 §2.4），此变量勿与 DemandKey 字段混淆。
+                var logicalDemandKeyByOrderId = voucher.LogicalProductionDemands
+                    .Where(d => d.OrderId.HasValue)
+                    .GroupBy(d => d.OrderId!.Value)
+                    .ToDictionary(g => g.Key, g => g.First().LogicalDemandKey);
+
+                var list = new List<DueDateOverride>(targets.Count);
+                foreach (var t in targets)
+                {
+                    if (orderIdByOcId.TryGetValue(t.OrderCanonicalId, out var orderId)
+                        && logicalDemandKeyByOrderId.TryGetValue(orderId, out var logicalDemandKey))
+                    {
+                        list.Add(new DueDateOverride
+                        {
+                            LogicalDemandKey = logicalDemandKey,
+                            ManualTargetDueDate = t.ManualTargetDueDate!.Value
+                        });
+                    }
+                }
+                dueDateOverrides = list;
+            }
+        }
+
+        // TaskTargetOverrides：TaskId → (DraftId, OperationCode)（Pegging 结果回查）
+        IReadOnlyList<TaskTargetOverride> taskTargetOverrides = Array.Empty<TaskTargetOverride>();
+        if (scope.TaskTargets is { Count: > 0 } && basePlanVersionId.HasValue)
+        {
+            var taskIds = scope.TaskTargets.Select(t => t.TaskId).Distinct().ToList();
+            // 分片：`taskIds` = ScopeJson.TaskTargets 的人工指定任务（批量调整可上千）⇒ 同 DueDateOverride，走统一帮手。
+            var taskRows = await QueryChunkedInAsync(taskIds, chunk =>
+                _connectionManager.QueryAsync<dynamic>(
+                    @"SELECT Id, SourceDraftId, OperationCode
+                      FROM [Task]
+                      WHERE Id IN @Ids AND PlanVersionId = @PvId",
+                    new { Ids = chunk, PvId = basePlanVersionId.Value }, db: DatabaseId.APS));
+            var taskByKey = taskRows
+                .ToDictionary(r => (long)r.Id, r => (
+                    DraftId: (string?)r.SourceDraftId,
+                    OpCode: (string?)r.OperationCode));
+
+            var list = new List<TaskTargetOverride>(scope.TaskTargets.Count);
+            var missCount = 0;
+            foreach (var t in scope.TaskTargets)
+            {
+                if (taskByKey.TryGetValue(t.TaskId, out var row))
+                {
+                    list.Add(new TaskTargetOverride
+                    {
+                        DraftId = row.DraftId ?? string.Empty,
+                        OperationCode = row.OpCode ?? string.Empty,
+                        TargetTime = t.TargetTime
+                    });
+                }
+                else
+                {
+                    // 3号位 协助项（2026-09-21）：TaskId 未命中 (DraftId, OperationCode) 时不再静默跳过，
+                    // 计数告警（TaskId 自增键漂移/归档会导致软目标静默丢失，车间无感）。
+                    missCount++;
+                }
+            }
+            if (missCount > 0)
+            {
+                _logger.LogWarning(
+                    "[Pegging][ScopeJsonV2] TaskTargets 投影未命中 {MissCount} 行（TaskId 漂移或已归档，软目标未下达 Solver）",
+                    missCount);
+            }
+            taskTargetOverrides = list;
+        }
+
+        return new RunScope
+        {
+            Trigger = scope.Trigger,
+            PriorityMode = scope.PriorityMode,
+            InScopeLogicalDemandKeys = Array.Empty<string>(),  // 冻结 v1.7 §69：影响范围由 1号位 从变化 Seed 动态传播推导；2号位 只转 ChangeSeed/TaskTarget/ChangedResourceIds，不预填可移动集合
+            DueDateOverrides = dueDateOverrides,
+            TaskTargetOverrides = taskTargetOverrides,
+            ChangedResourceIds = scope.ChangedResourceIds ?? Array.Empty<int>(),
+            // BusinessScope：3号位 生成 → 2号位 原样透传（不判权限）；null 交 1号位 无授权 fail-safe。
+            BusinessScope = scope.BusinessScope
+        };
+    }
+
     private IReadOnlyList<ResourceDefinition> BuildResourceDefinitions(Core.Models.Scheduling.SchedulingContext? context)
     {
         if (context == null || context.Resources.Count == 0)
@@ -4429,7 +6123,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             resources.Add(new ResourceDefinition
             {
                 ResourceId = int.TryParse(res.ResourceId, out var rid) ? rid : 0,
-                ResourceCode = res.ResourceName,
+                ResourceCode = res.ResourceCode,
                 FactoryCode = res.FactoryId,
                 Capacity = res.CapacityFactor
             });

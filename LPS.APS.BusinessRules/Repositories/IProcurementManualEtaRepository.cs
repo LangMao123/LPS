@@ -36,6 +36,13 @@ public interface IProcurementManualEtaRepository
         CancellationToken ct = default);
 
     /// <summary>
+    /// 全量查询所有有效（IsActive=1）Manual ETA 覆盖（供排程装载构建查找表）。
+    /// 覆盖表是人工维护、天然小，全量查 + 内存按业务键精确匹配，避免大 IN 列表超 SQL Server 2100 参数上限
+    /// （1号位 2026-09-21 催办：LoadSupplyPoolAsync 传 distinct MaterialId=36k / PONo=56k 超限）。
+    /// </summary>
+    Task<List<ProcurementManualEtaOverride>> GetActiveOverridesAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// 根据业务键查询单条Manual ETA
     /// </summary>
     /// <param name="poNo">采购订单号</param>

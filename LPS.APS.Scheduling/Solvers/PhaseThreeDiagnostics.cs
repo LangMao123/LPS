@@ -50,7 +50,8 @@ internal class PhaseThreeDiagnostics
             if (demandTasks.Count == 0) continue;
 
             var lastTask = demandTasks.Last();
-            var delay = lastTask.PlannedEndTime - demand.RequiredAvailableTime;
+            var effectiveDue = constraints.EffectiveDue(demand);   // M5 第一批：延期诊断口径用覆盖交期
+            var delay = lastTask.PlannedEndTime - effectiveDue;
 
             if (delay > TimeSpan.Zero)
             {
@@ -73,7 +74,7 @@ internal class PhaseThreeDiagnostics
                     ReasonCode = reasonCode,
                     Severity = "HIGH",
                     ImpactHours = (decimal)delay.TotalHours,
-                    EvidenceJson = $"{{\"RequiredTime\":\"{demand.RequiredAvailableTime:O}\",\"ActualTime\":\"{lastTask.PlannedEndTime:O}\"}}"
+                    EvidenceJson = $"{{\"RequiredTime\":\"{effectiveDue:O}\",\"ActualTime\":\"{lastTask.PlannedEndTime:O}\"}}"
                 });
             }
         }
@@ -187,7 +188,7 @@ internal class PhaseThreeDiagnostics
 
         // 3. Setup 边际延期：去掉 Setup 即不延期 → 延期由 Setup 时间决定
         if (lastTask.SetupTime > 0m &&
-            lastTask.PlannedEndTime.AddMinutes(-(double)lastTask.SetupTime) <= demand.RequiredAvailableTime)
+            lastTask.PlannedEndTime.AddMinutes(-(double)lastTask.SetupTime) <= constraints.EffectiveDue(demand))
         {
             return "SETUP_CONSTRAINT";
         }
@@ -205,7 +206,15 @@ internal class PhaseThreeDiagnostics
         }
 
         // 5. 资源容量不足
-        var resourceIds = demandTasks.Select(t => t.ResourceId).Distinct().ToList();
+        // 非资源 Task 跳过：ResourceId 为 null（UNCONSTRAINED/WAIT_ONLY）不占资源，不进入资源键统计
+        var resourceIds = new List<int>();
+        foreach (var task in demandTasks)
+        {
+            if (task.ResourceId is int rid && !resourceIds.Contains(rid))
+            {
+                resourceIds.Add(rid);
+            }
+        }
         var resourceUtilization = CalculateResourceUtilization(
             demandTasks,
             constraints,
@@ -220,9 +229,19 @@ internal class PhaseThreeDiagnostics
         // 6. 工艺路线资格降级：任务落到的资源不在该工序资格集内（Routing Fallback）
         foreach (var task in demandTasks)
         {
-            var eligibilityKey = $"{task.MaterialId}::{task.RouteCode ?? "DEFAULT"}::{task.OperationCode}";
+            // 非资源 Task 跳过：ResourceId 为 null 时无落点资源，不存在「资格降级」判定
+            if (task.ResourceId is not int taskResourceId) continue;
+
+            // 0号位 2026-09-29 裁决 §5.3：资格键升维为 EligibilityLookupKey（含 ProductionDepartmentId）。
+            // FinalTaskDraft 无部门字段 ⇒ 从本次请求的 Routing 图按 (StageCode, OperationCode) 反查节点取部门。
+            // 反查不到时按旧行为跳过该项判定（不新增失败路径）。
+            if (!TryResolveEligibilityKey(task, constraints, out var eligibilityKey))
+            {
+                continue;
+            }
+
             if (constraints.OperationResourceEligibility.TryGetValue(eligibilityKey, out var eligibleResources) &&
-                !eligibleResources.Contains(task.ResourceId))
+                !eligibleResources.Contains(taskResourceId))
             {
                 return "ROUTING_ELIGIBILITY";
             }
@@ -230,6 +249,40 @@ internal class PhaseThreeDiagnostics
 
         // 7. 默认原因：前序延期或其他约束
         return "PREDECESSOR_DELAY";
+    }
+
+    /// <summary>
+    /// 由 FinalTaskDraft 反查资格键 EligibilityLookupKey。
+    /// MaterialId 取任务自身；ProductionDepartmentId / RouteCode 取本次请求 Routing 图内
+    /// 按 (StageCode, OperationCode) 命中的节点（FinalTaskDraft 无部门字段，只能反查）。
+    /// 反查失败返回 false —— 调用方按既有语义跳过该项资格判定，不猜、不新增失败路径。
+    /// </summary>
+    private static bool TryResolveEligibilityKey(
+        FinalTaskDraft task,
+        ConstraintContext constraints,
+        out EligibilityLookupKey key)
+    {
+        key = default;
+
+        if (!constraints.RoutingGraphs.TryGetValue(task.MaterialId, out var routeGraphs))
+        {
+            return false;
+        }
+
+        if (!routeGraphs.TryGetValue(task.RouteCode ?? "DEFAULT", out var graph))
+        {
+            return false;
+        }
+
+        if (!graph.Operations.TryGetValue(
+                OperationNodeKey.Of(task.StageCode, task.OperationCode), out var node))
+        {
+            return false;
+        }
+
+        key = new EligibilityLookupKey(
+            task.MaterialId, node.ProductionDepartmentId, node.RouteCode, node.OperationCode);
+        return true;
     }
 
     /// <summary>
@@ -265,9 +318,12 @@ internal class PhaseThreeDiagnostics
 
         foreach (var task in demandTasks)
         {
+            // 非资源 Task 跳过：ResourceId 为 null 不占资源，不可能与任何资源阻挡块重叠
+            if (task.ResourceId is not int taskResourceId) continue;
+
             foreach (var block in blocks)
             {
-                if (block.ResourceId == task.ResourceId &&
+                if (block.ResourceId == taskResourceId &&
                     Overlaps(task.PlannedStartTime, task.PlannedEndTime, block.Start, block.End))
                 {
                     crossDomain = block.Cross;
@@ -300,7 +356,8 @@ internal class PhaseThreeDiagnostics
 
         foreach (var group in tasksByResource)
         {
-            var resourceId = group.Key;
+            // 非资源 Task 跳过：ResourceId 为 null 不占资源，不进入利用率/日历查表
+            if (group.Key is not int resourceId) continue;
 
             // 计算总占用时间
             var totalOccupiedMinutes = group

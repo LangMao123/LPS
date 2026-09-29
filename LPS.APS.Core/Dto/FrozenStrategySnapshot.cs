@@ -230,11 +230,9 @@ public sealed class SetupParams
 {
     // 2026-09-16 v1.2 废止属性式换型维度（Mold/Tool/Material/Color，原 Dimensions 字段）：
     // 换型规则改走 RuleSetVersion 的 SetupTransitionRule（EXACT/DEFAULT），本块不再承载换型维度。
-    // 以下两个算法数值后续随 §六.1 契约对齐迁移到 ParameterSetVersion，暂留以保编译。
-    public double DefaultSetupMinutes { get; set; } = 30;
-    public int SetupLookAheadSize { get; set; } = 5;
+    // 原 DefaultSetupMinutes / SetupLookAheadSize 两个旧锚已于 2026-09-20 退役（2号位删字段，生产零读者）。
 
-    // 三预算参数（2026-09-20 1号位 提值，3号位 落 ParameterSetVersion 治理槽位）：
+    // 预算参数（2026-09-20 1号位 提值，3号位 落 ParameterSetVersion 治理槽位）：
     // 均为「次数」量纲，非毫秒——保证输入+同种子 → 同搜索轨迹 → 结果可重放（审计/回归依赖确定性）。
     public int SetupSearchBudget { get; set; } = 500;              // 有界搜索预算：单「可移动段」邻域算子总尝试次数上限，允许范围 [100, 5000]
     public int SetupMaxNeighborhoodTries { get; set; } = 50;       // 最大邻域尝试次数：连续无改善（Level 3 目标未下降）上限，活跃改善即清零重计，允许范围 [10, 500]

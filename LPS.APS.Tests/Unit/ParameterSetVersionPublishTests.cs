@@ -92,7 +92,7 @@ public class ParameterSetVersionPublishTests
                 IsPrimaryObjective = true
             },
             Split = new LPS.APS.Core.Dto.SplitParams { MaxOptimizationSplitCount = 3, MinBatchQty = 1 },
-            Setup = new LPS.APS.Core.Dto.SetupParams { DefaultSetupMinutes = 30, SetupLookAheadSize = 5 },
+            Setup = new LPS.APS.Core.Dto.SetupParams(),
             StageOverlap = new LPS.APS.Core.Dto.StageOverlapParams { AllowOverlap = true, ThresholdPercent = 50 }
         });
 

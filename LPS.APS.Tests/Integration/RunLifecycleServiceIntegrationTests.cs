@@ -79,6 +79,12 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             .Setup(o => o.RunSchedulingAndFinalizeAsync(
                 It.IsAny<int>(), It.IsAny<int>(), It.IsAny<long>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new SchedulingRunResult { IsSuccess = true });
+        // P1-03：FAILED 恢复内联执行 seam（ExecuteRunAsync）默认全成功
+        schedulingOrchestrator
+            .Setup(o => o.ExecuteRunAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SchedulingRunResult { IsSuccess = true });
+
+        var scheduleRunService = new Mock<IScheduleRunService>();
 
         _service = new RunLifecycleService(
             _scheduleRunRepo,
@@ -89,6 +95,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             auditRepo,
             dataScopeService.Object,
             schedulingOrchestrator.Object,
+            scheduleRunService.Object,
             loggerFactory.CreateLogger<RunLifecycleService>());
     }
 
@@ -132,6 +139,12 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         var oldRun = await _scheduleRunRepo.GetByIdAsync(_testScheduleRunId);
         oldRun!.Status.Should().Be("FAILED");
         oldRun.ErrorMessage.Should().Be("致命错误");
+
+        // P1-03：恢复壳落库（一域一壳 2 个 RECOVERY 壳，Status='Created'，SourceScheduleRunId=新 Run）
+        var shells = await _planVersionRepo.GetByScheduleRunIdAsync(_testRecoveredRunId, CancellationToken.None);
+        shells.Should().HaveCount(2);
+        shells.Should().OnlyContain(s => s.VersionCategory == "RECOVERY" && s.Status == "Created");
+        shells.Select(s => s.DomainKey).Should().BeEquivalentTo(new[] { "D1", "D2" });
     }
 
     [SkippableFact]
@@ -515,6 +528,8 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         }
         if (_testRecoveredRunId > 0)
         {
+            // P1-03：恢复会一域一壳写入 RECOVERY PlanVersion（SourceScheduleRunId=新 Run），须先删壳再删 Run，避免 FK 冲突
+            await _cm.ExecuteAsync("DELETE FROM PlanVersion WHERE SourceScheduleRunId = @Id", new { Id = _testRecoveredRunId }, db: DatabaseId.APS);
             await _cm.ExecuteAsync("DELETE FROM ScheduleRun WHERE Id = @Id", new { Id = _testRecoveredRunId }, db: DatabaseId.APS);
         }
         if (_testStrategyProfileVersionId > 0)

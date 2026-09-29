@@ -8,6 +8,7 @@ using LPS.APS.Application.Extensions;
 using LPS.APS.BusinessRules.Extensions;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Extensions;
+using LPS.APS.Engine.Repositories.Governance;
 using LPS.APS.Scheduling.Extensions;
 using LPS.APS.Core.Interfaces;
 using Microsoft.Extensions.DependencyInjection;
@@ -44,6 +45,7 @@ public class ContinuityRedLineIntegrationTest
         // 联调专用 fixture（与 RealSchedulingIntegrationTest 一致，测试专用不得进生产 DI）
         services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         services.AddScoped<IFrozenStrategySnapshotProvider, FrozenStrategySnapshotFixtureProvider>();
+        // S-3：SetupTransitionRuleRepository 已撤销（承载 = RuleSetVersion.ContentSnapshotJson 子块，Provider 装配第⑦块）
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Information).AddProvider(new ConsoleOutLoggerProvider()));
         services.AddScoped<SchedulingOrchestrator>();
         services.AddScoped<DatabaseConnectionManager>();

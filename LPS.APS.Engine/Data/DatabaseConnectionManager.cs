@@ -238,6 +238,33 @@ public class DatabaseConnectionManager : IDisposable
     }
 
     /// <summary>
+    /// 批量插入（SqlBulkCopy）到调用方提供的事务连接（参与该事务，回滚即撤销）。
+    /// 供 BOM 接货在 ExecuteInTransactionAsync 内写 OrderBomRequestLink 使用，
+    /// 避免在事务持有同一库信号量期间再经 GetConnectionAsync 取连接造成死锁。
+    /// </summary>
+    public async Task BulkInsertToTransactionAsync(
+        DataTable dataTable,
+        string tableName,
+        SqlConnection destinationConnection,
+        SqlTransaction destinationTransaction,
+        int timeoutSeconds = 600)
+    {
+        using var bulkCopy = new SqlBulkCopy(destinationConnection, SqlBulkCopyOptions.Default, destinationTransaction)
+        {
+            DestinationTableName = tableName,
+            BulkCopyTimeout = timeoutSeconds,
+            BatchSize = 50000
+        };
+
+        foreach (DataColumn column in dataTable.Columns)
+        {
+            bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+        }
+
+        await bulkCopy.WriteToServerAsync(dataTable);
+    }
+
+    /// <summary>
     /// 执行事务操作
     /// </summary>
     public async Task<T> ExecuteInTransactionAsync<T>(Func<IDbConnection, IDbTransaction, Task<T>> operation, DatabaseId db = DatabaseId.APS)
@@ -346,6 +373,70 @@ public class DatabaseConnectionManager : IDisposable
         {
             ReleaseConnection(sourceDb);
             ReleaseConnection(destinationDb);
+        }
+    }
+
+    /// <summary>
+    /// 跨库流式传输（参与目标库事务版）：从源库流式读取，SqlBulkCopy 写入调用方提供的事务连接上的目标表。
+    /// 与 BulkCopyFromReaderAsync 的区别：目标连接/事务由调用方传入（用于包在 ExecuteInTransactionAsync 内），
+    /// 本方法只负责打开并释放「源库」连接；⚠️ 若 sourceDb == destinationDb 会因同库信号量重入死锁，调用方须保证跨库。
+    /// </summary>
+    public async Task BulkCopyFromReaderToTransactionAsync(
+        string sourceSql,
+        object? sourceParameters,
+        DatabaseId sourceDb,
+        string destinationTable,
+        SqlConnection destinationConnection,
+        SqlTransaction destinationTransaction,
+        IDictionary<string, string>? columnMappings = null,
+        int batchSize = 10000,
+        int timeoutSeconds = 600)
+    {
+        var sourceConnection = await GetConnectionAsync(sourceDb);
+        try
+        {
+            var sqlSourceConn = (SqlConnection)sourceConnection;
+
+            using var command = new SqlCommand(sourceSql, sqlSourceConn);
+            command.CommandTimeout = timeoutSeconds;
+
+            if (sourceParameters != null)
+            {
+                foreach (var prop in sourceParameters.GetType().GetProperties())
+                {
+                    command.Parameters.AddWithValue($"@{prop.Name}", prop.GetValue(sourceParameters) ?? DBNull.Value);
+                }
+            }
+
+            using var reader = await command.ExecuteReaderAsync();
+            using var bulkCopy = new SqlBulkCopy(destinationConnection, SqlBulkCopyOptions.Default, destinationTransaction)
+            {
+                DestinationTableName = destinationTable,
+                BatchSize = batchSize,
+                BulkCopyTimeout = timeoutSeconds
+            };
+
+            if (columnMappings != null)
+            {
+                foreach (var mapping in columnMappings)
+                {
+                    bulkCopy.ColumnMappings.Add(mapping.Key, mapping.Value);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    var name = reader.GetName(i);
+                    bulkCopy.ColumnMappings.Add(name, name);
+                }
+            }
+
+            await bulkCopy.WriteToServerAsync(reader);
+        }
+        finally
+        {
+            ReleaseConnection(sourceDb);
         }
     }
 

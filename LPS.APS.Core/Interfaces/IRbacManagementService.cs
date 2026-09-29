@@ -12,8 +12,8 @@ public interface IRbacManagementService
 {
     // ==================== 用户 ====================
 
-    /// <summary>查询用户列表（不含已删除用户）</summary>
-    Task<IReadOnlyList<UserSummaryDto>> GetUsersAsync(CancellationToken cancellationToken = default);
+    /// <summary>查询用户列表（分页；不含已删除用户。R2 契约）</summary>
+    Task<PageResult<UserSummaryDto>> GetUsersPagedAsync(int page, int pageSize, string? keyword, string? status, CancellationToken cancellationToken = default);
 
     /// <summary>创建用户（密码 PBKDF2-SHA256 哈希后落库）</summary>
     Task<UserSummaryDto> CreateUserAsync(CreateUserRequest request, int operatorId, CancellationToken cancellationToken = default);
@@ -29,8 +29,8 @@ public interface IRbacManagementService
 
     // ==================== 角色 ====================
 
-    /// <summary>查询角色列表（含停用角色）</summary>
-    Task<IReadOnlyList<RoleSummaryDto>> GetRolesAsync(CancellationToken cancellationToken = default);
+    /// <summary>查询角色列表（分页；含停用角色。R2 契约）</summary>
+    Task<PageResult<RoleSummaryDto>> GetRolesPagedAsync(int page, int pageSize, string? keyword, bool? isSystem, CancellationToken cancellationToken = default);
 
     /// <summary>创建角色</summary>
     Task<RoleSummaryDto> CreateRoleAsync(CreateRoleRequest request, int operatorId, CancellationToken cancellationToken = default);
@@ -46,16 +46,16 @@ public interface IRbacManagementService
 
     // ==================== 权限 ====================
 
-    /// <summary>查询权限列表（含停用权限）</summary>
-    Task<IReadOnlyList<PermissionSummaryDto>> GetPermissionsAsync(CancellationToken cancellationToken = default);
+    /// <summary>查询权限列表（分页；含停用权限。R2 契约）</summary>
+    Task<PageResult<PermissionSummaryDto>> GetPermissionsPagedAsync(int page, int pageSize, string? module, string? actionType, string? keyword, CancellationToken cancellationToken = default);
 
     /// <summary>创建权限</summary>
     Task<PermissionSummaryDto> CreatePermissionAsync(CreatePermissionRequest request, int operatorId, CancellationToken cancellationToken = default);
 
     // ==================== 业务范围策略 ====================
 
-    /// <summary>查询业务范围策略列表</summary>
-    Task<IReadOnlyList<DataScopePolicyDto>> GetDataScopePoliciesAsync(CancellationToken cancellationToken = default);
+    /// <summary>查询业务范围策略列表（分页；仅启用的策略。R2 契约）</summary>
+    Task<PageResult<DataScopePolicyDto>> GetScopesPagedAsync(int page, int pageSize, string? scopeType, string? keyword, CancellationToken cancellationToken = default);
 
     /// <summary>创建业务范围策略</summary>
     Task<DataScopePolicyDto> CreateDataScopePolicyAsync(CreateDataScopePolicyRequest request, int operatorId, CancellationToken cancellationToken = default);
@@ -85,4 +85,21 @@ public interface IRbacManagementService
 
     /// <summary>读回角色当前业务范围分配（仅 IsEnabled=1 策略）</summary>
     Task<IReadOnlyList<DataScopePolicyDto>> GetRoleScopesAsync(int roleId, CancellationToken cancellationToken = default);
+
+    // ==================== 测试数据清理与批量删除（R1 / R4） ====================
+
+    /// <summary>清理测试数据（按命名规则软删 verify 残留：用户/角色软删，权限停用）</summary>
+    Task<TestDataCleanupResult> CleanupTestDataAsync(int operatorId, CancellationToken cancellationToken = default);
+
+    /// <summary>批量删除用户（软删；自删保护 + 最后 auth.manage 保护）</summary>
+    Task<BatchDeleteResult> DeleteUsersBatchAsync(IReadOnlyList<int> userIds, int operatorId, CancellationToken cancellationToken = default);
+
+    /// <summary>批量删除角色（软删；系统角色保护）</summary>
+    Task<BatchDeleteResult> DeleteRolesBatchAsync(IReadOnlyList<int> roleIds, int operatorId, CancellationToken cancellationToken = default);
+
+    /// <summary>批量删除权限（停用 IsActive=false，保留 RolePermission 关联，不解绑）</summary>
+    Task<BatchDeleteResult> DeletePermissionsBatchAsync(IReadOnlyList<int> permissionIds, int operatorId, CancellationToken cancellationToken = default);
+
+    /// <summary>批量删除业务范围策略（停用 IsEnabled=0）</summary>
+    Task<BatchDeleteResult> DeleteScopesBatchAsync(IReadOnlyList<int> policyIds, int operatorId, CancellationToken cancellationToken = default);
 }

@@ -1,5 +1,6 @@
 using System.Data;
 using Dapper;
+using Microsoft.Data.SqlClient;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Services.Sync.Dto;
 using Microsoft.Extensions.Logging;
@@ -76,91 +77,96 @@ public class BOMResultPullService : IBOMResultPullService
             "批次校验通过: BatchNo={BatchNo}, Status={Status}, ExpandedRowCount={ExpandedRowCount}",
             batchNo, request.Status, request.ExpandedRowCount);
 
+        // ═══════════════════════════════════════════
+        // Step 2-5c 前置：源 SQL 与列映射（纯声明，事务内外皆可用）
+        // ═══════════════════════════════════════════
+        var sourceSql = @"
+            SELECT
+                BatchNo,
+                BOMNO,
+                ParentMaterialCode,
+                ChildMaterialCode,
+                Quantity,
+                Level,
+                ChildRequiredStageCode,
+                ChildRequiredFactory
+            FROM MES_APS_BOM_Workset
+            WHERE BatchNo = @BatchNo
+            ORDER BY Level, ParentMaterialCode";
+
+        var columnMappings = new Dictionary<string, string>
+        {
+            ["BatchNo"] = "BatchNo",
+            ["BOMNO"] = "BOMNO",
+            ["ParentMaterialCode"] = "ParentMaterialCode",
+            ["ChildMaterialCode"] = "ChildMaterialCode",
+            ["Quantity"] = "Quantity",
+            ["Level"] = "Level",
+            ["ChildRequiredStageCode"] = "ChildRequiredStageCode",
+            ["ChildRequiredFactory"] = "ChildRequiredFactory"
+        };
+
         try
         {
-            // ═══════════════════════════════════════════
-            // Step 2: 清空 APS_BOM_RAW 全表（排程只用最新批次，历史不保留）
-            // ═══════════════════════════════════════════
-            await _connectionManager.ExecuteAsync(
-                "TRUNCATE TABLE APS_BOM_RAW",
-                db: DatabaseId.APS);
+            var llcResult = (MaxLevel: 0, LeafCount: 0, TotalRows: 0);
 
             // ═══════════════════════════════════════════
-            // Step 3: 流式拉取 ODS → APS（DbDataReader → SqlBulkCopy）
-            // ⚠️ 全程流式处理，百万行不膨胀内存
+            // Step 2-5c：清空 + 回填 + LLC + StageDetail + Link 全部包在一个 APS 事务内。
+            // 任一步失败整体回滚，不残留「已 TRUNCATE 未回填」的空表（原实现无事务，失败即空）。
+            // ⚠️ 事务持有 APS 信号量期间，禁止再经 _connectionManager 以 db:APS 取连接（同库信号量重入会死锁）：
+            //    APS 读写全部直接走事务连接；ODS 读仍走连接管理器（异库信号量，不冲突）。
             // ═══════════════════════════════════════════
-            var sourceSql = @"
-                SELECT 
-                    BatchNo,
-                    BOMNO,
-                    ParentMaterialCode,
-                    ChildMaterialCode,
-                    Quantity,
-                    Level,
-                    ChildRequiredStageCode,
-                    ChildRequiredFactory
-                FROM MES_APS_BOM_Workset
-                WHERE BatchNo = @BatchNo
-                ORDER BY Level, ParentMaterialCode";
-
-            var columnMappings = new Dictionary<string, string>
+            var pulledCount = await _connectionManager.ExecuteInTransactionAsync(async (connection, transaction) =>
             {
-                ["BatchNo"] = "BatchNo",
-                ["BOMNO"] = "BOMNO",
-                ["ParentMaterialCode"] = "ParentMaterialCode",
-                ["ChildMaterialCode"] = "ChildMaterialCode",
-                ["Quantity"] = "Quantity",
-                ["Level"] = "Level",
-                ["ChildRequiredStageCode"] = "ChildRequiredStageCode",
-                ["ChildRequiredFactory"] = "ChildRequiredFactory"
-            };
+                var sqlConn = (SqlConnection)connection;
+                var sqlTx = (SqlTransaction)transaction;
 
-            await _connectionManager.BulkCopyFromReaderAsync(
-                sourceSql: sourceSql,
-                sourceParameters: new { BatchNo = batchNo },
-                sourceDb: DatabaseId.ODS,
-                destinationTable: "APS_BOM_RAW",
-                destinationDb: DatabaseId.APS,
-                columnMappings: columnMappings,
-                batchSize: 10000,
-                timeoutSeconds: 600);
+                // Step 2: 清空 APS_BOM_RAW 全表（排程只用最新批次，历史不保留；事务内可回滚）
+                await sqlConn.ExecuteAsync("TRUNCATE TABLE APS_BOM_RAW", transaction: sqlTx);
 
-            // ═══════════════════════════════════════════
-            // Step 4: 验证拉取行数
-            // ═══════════════════════════════════════════
-            var pulledCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
-                "SELECT COUNT(*) FROM APS_BOM_RAW WHERE BatchNo = @BatchNo",
-                new { BatchNo = batchNo },
-                db: DatabaseId.APS);
+                // Step 3: 流式拉取 ODS → APS（DbDataReader → SqlBulkCopy，参与事务）
+                await _connectionManager.BulkCopyFromReaderToTransactionAsync(
+                    sourceSql: sourceSql,
+                    sourceParameters: new { BatchNo = batchNo },
+                    sourceDb: DatabaseId.ODS,
+                    destinationTable: "APS_BOM_RAW",
+                    destinationConnection: sqlConn,
+                    destinationTransaction: sqlTx,
+                    columnMappings: columnMappings,
+                    batchSize: 10000,
+                    timeoutSeconds: 600);
 
-            if (pulledCount != request.ExpandedRowCount)
-            {
-                _logger.LogWarning(
-                    "拉取行数与预期不完全匹配: 实际={PulledCount}, 预期={ExpectedCount} (BatchNo={BatchNo})",
-                    pulledCount, request.ExpandedRowCount, batchNo);
-            }
+                // Step 4: 验证拉取行数
+                var pulled = await sqlConn.ExecuteScalarAsync<int>(
+                    "SELECT COUNT(*) FROM APS_BOM_RAW WHERE BatchNo = @BatchNo",
+                    new { BatchNo = batchNo },
+                    transaction: sqlTx);
 
-            // ═══════════════════════════════════════════
-            // Step 5: 计算低阶码（§2.4.1 sp_CalculateLLC）
-            // ═══════════════════════════════════════════
-            _logger.LogInformation("LLC计算开始: BatchNo={BatchNo}", batchNo);
-            var llcResult = await CalculateLLCAsync(batchNo);
-            _logger.LogInformation(
-                "LLC计算完成: BatchNo={BatchNo}, 最大层级={MaxLevel}, 叶子节点={LeafCount}, 总行数={TotalRows}",
-                batchNo, llcResult.MaxLevel, llcResult.LeafCount, llcResult.TotalRows);
+                if (pulled != request.ExpandedRowCount)
+                {
+                    _logger.LogWarning(
+                        "拉取行数与预期不完全匹配: 实际={PulledCount}, 预期={ExpectedCount} (BatchNo={BatchNo})",
+                        pulled, request.ExpandedRowCount, batchNo);
+                }
 
-            // ═══════════════════════════════════════════
-            // Step 5b: 拉取 StageDetail → APS_BOM_STAGE_PATH_RAW（v5.0.7同批次）
-            // ═══════════════════════════════════════════
-            await PullStageDetailAsync(batchNo);
+                // Step 5: 计算低阶码（§2.4.1 sp_CalculateLLC）
+                _logger.LogInformation("LLC计算开始: BatchNo={BatchNo}", batchNo);
+                llcResult = await CalculateLLCAsync(sqlConn, sqlTx, batchNo);
+                _logger.LogInformation(
+                    "LLC计算完成: BatchNo={BatchNo}, 最大层级={MaxLevel}, 叶子节点={LeafCount}, 总行数={TotalRows}",
+                    batchNo, llcResult.MaxLevel, llcResult.LeafCount, llcResult.TotalRows);
+
+                // Step 5b: 拉取 StageDetail → APS_BOM_STAGE_PATH_RAW（同批次，事务内）
+                await PullStageDetailAsync(sqlConn, sqlTx, batchNo);
+
+                // Step 5c: 生成 OrderBomRequestLink（v5.0.31 Order→BOM追溯链闭合）
+                await GenerateOrderBomRequestLinkAsync(sqlConn, sqlTx, batchNo, planVersionIds);
+
+                return pulled;
+            }, DatabaseId.APS);
 
             // ═══════════════════════════════════════════
-            // Step 5c: 生成 OrderBomRequestLink（v5.0.31 Order→BOM追溯链闭合）
-            // ═══════════════════════════════════════════
-            await GenerateOrderBomRequestLinkAsync(batchNo, planVersionIds);
-
-            // ═══════════════════════════════════════════
-            // Step 6: 更新ODS批次状态为 CONSUMED
+            // Step 6: 更新 ODS 批次状态为 CONSUMED（事务提交后执行；失败则批次保持 READY，下次重试自愈）
             // ═══════════════════════════════════════════
             await _connectionManager.ExecuteAsync(
                 "UPDATE MES_API_BOM_Request SET Status = 'CONSUMED' WHERE BatchNo = @BatchNo",
@@ -203,17 +209,15 @@ public class BOMResultPullService : IBOMResultPullService
     /// 拉取 StageDetail 阶段路径数据到 APS_BOM_STAGE_PATH_RAW（v5.0.7新增，与 APS_BOM_RAW 同批次）
     /// 数据来源：ODS库 MES_APS_BOM_Workset_StageDetail（含 EDGE + ROOT 两类记录）
     /// </summary>
-    private async Task PullStageDetailAsync(string batchNo)
+    private async Task PullStageDetailAsync(SqlConnection connection, SqlTransaction transaction, string batchNo)
     {
         _logger.LogInformation("StageDetail拉取开始: BatchNo={BatchNo}", batchNo);
 
-        // 清空全表（与 APS_BOM_RAW 同策略，只保留最新批次）
-        await _connectionManager.ExecuteAsync(
-            "TRUNCATE TABLE APS_BOM_STAGE_PATH_RAW",
-            db: DatabaseId.APS);
+        // 清空全表（与 APS_BOM_RAW 同策略，只保留最新批次；事务内可回滚）
+        await connection.ExecuteAsync("TRUNCATE TABLE APS_BOM_STAGE_PATH_RAW", transaction: transaction);
 
         var sourceSql = @"
-            SELECT 
+            SELECT
                 BatchNo,
                 BOMNO,
                 StageScopeType,
@@ -238,20 +242,21 @@ public class BOMResultPullService : IBOMResultPullService
             ["IsSupplyThreshold"] = "IsSupplyThreshold"
         };
 
-        await _connectionManager.BulkCopyFromReaderAsync(
+        await _connectionManager.BulkCopyFromReaderToTransactionAsync(
             sourceSql: sourceSql,
             sourceParameters: new { BatchNo = batchNo },
             sourceDb: DatabaseId.ODS,
             destinationTable: "APS_BOM_STAGE_PATH_RAW",
-            destinationDb: DatabaseId.APS,
+            destinationConnection: connection,
+            destinationTransaction: transaction,
             columnMappings: columnMappings,
             batchSize: 10000,
             timeoutSeconds: 600);
 
-        var pulledCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+        var pulledCount = await connection.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM APS_BOM_STAGE_PATH_RAW WHERE BatchNo = @BatchNo",
             new { BatchNo = batchNo },
-            db: DatabaseId.APS);
+            transaction: transaction);
 
         _logger.LogInformation("StageDetail拉取完成: BatchNo={BatchNo}, 行数={PulledCount}", batchNo, pulledCount);
     }
@@ -260,7 +265,8 @@ public class BOMResultPullService : IBOMResultPullService
     /// 调用 sp_CalculateLLC 计算低阶码（§2.4.1）
     /// 在 APS 本地库执行，仅针对当批 APS_BOM_RAW 活跃工作集
     /// </summary>
-    private async Task<(int MaxLevel, int LeafCount, int TotalRows)> CalculateLLCAsync(string batchNo)
+    private async Task<(int MaxLevel, int LeafCount, int TotalRows)> CalculateLLCAsync(
+        SqlConnection connection, SqlTransaction transaction, string batchNo)
     {
         var spParams = new DynamicParameters();
         spParams.Add("@BatchNo", batchNo);
@@ -268,11 +274,11 @@ public class BOMResultPullService : IBOMResultPullService
         spParams.Add("@LeafCount", dbType: DbType.Int32, direction: ParameterDirection.Output);
         spParams.Add("@TotalRows", dbType: DbType.Int32, direction: ParameterDirection.Output);
 
-        await _connectionManager.ExecuteAsync(
+        await connection.ExecuteAsync(
             "sp_CalculateLLC",
             spParams,
-            CommandType.StoredProcedure,
-            DatabaseId.APS,
+            commandType: CommandType.StoredProcedure,
+            transaction: transaction,
             commandTimeout: 600);
 
         return (
@@ -301,7 +307,8 @@ public class BOMResultPullService : IBOMResultPullService
     /// 数据源：ODS.MES_API_BOM_Request_Detail + ODS.MES_APS_BOM_Workset
     /// 映射：APS.[Order] 跨本批全部 Domain PlanVersion（每顶层 Order 只归一个真实 Domain）按 OrderCanonicalId 查找 OrderId + PlanVersionId
     /// </summary>
-    private async Task GenerateOrderBomRequestLinkAsync(string batchNo, IReadOnlyList<int> planVersionIds)
+    private async Task GenerateOrderBomRequestLinkAsync(
+        SqlConnection connection, SqlTransaction transaction, string batchNo, IReadOnlyList<int> planVersionIds)
     {
         _logger.LogInformation("OrderBomRequestLink生成开始: BatchNo={BatchNo}, PlanVersionCount={PlanVersionCount}",
             batchNo, planVersionIds.Count);
@@ -349,15 +356,15 @@ public class BOMResultPullService : IBOMResultPullService
             WHERE PlanVersionId IN @PlanVersionIds
               AND OrderCanonicalId IS NOT NULL";
 
-        var orderMap = (await _connectionManager.QueryAsync<BomLinkOrderDto>(
-            orderSql, new { PlanVersionIds = planVersionIds }, db: DatabaseId.APS))
+        var orderMap = (await connection.QueryAsync<BomLinkOrderDto>(
+            orderSql, new { PlanVersionIds = planVersionIds }, transaction: transaction))
             .ToDictionary(o => o.OrderCanonicalId);
 
         // 4. 幂等保护：清理该批次旧 Link 数据
-        var deletedCount = await _connectionManager.ExecuteAsync(
+        var deletedCount = await connection.ExecuteAsync(
             "DELETE FROM OrderBomRequestLink WHERE BatchNo = @BatchNo AND PlanVersionId IN @PlanVersionIds",
             new { BatchNo = batchNo, PlanVersionIds = planVersionIds },
-            db: DatabaseId.APS);
+            transaction: transaction);
 
         if (deletedCount > 0)
         {
@@ -432,7 +439,7 @@ public class BOMResultPullService : IBOMResultPullService
         // 全部 SKIPPED（无任何 Order 命中本批 PlanVersion）时表为空，跳过写入以避免空 DataTable 的 BulkCopy 边界。
         if (dataTable.Rows.Count > 0)
         {
-            await _connectionManager.BulkInsertAsync(dataTable, "OrderBomRequestLink", DatabaseId.APS);
+            await _connectionManager.BulkInsertToTransactionAsync(dataTable, "OrderBomRequestLink", connection, transaction);
         }
 
         _logger.LogInformation(

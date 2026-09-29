@@ -58,10 +58,22 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? status = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 50,
+        [FromQuery] int pageIndex = 0,
+        [FromQuery] int pageSize = 0,
         CancellationToken cancellationToken = default)
     {
         try
         {
+            // 分页换算：兼容前端 pageIndex/pageSize（1 起）与后端 skip/take（0 起）。
+            // pageIndex/pageSize 优先；均未传时回退 skip/take 默认。
+            if (pageSize > 0) take = pageSize;
+            if (pageIndex > 0)
+            {
+                skip = (pageIndex - 1) * take;
+            }
+            if (skip < 0) skip = 0;
+            if (take < 1) take = 50;
+
             var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
 
             // 校验：非空入参必须落在授权范围（Global 全放行，无范围全拒绝）

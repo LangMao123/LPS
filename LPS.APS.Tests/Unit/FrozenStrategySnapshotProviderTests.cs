@@ -100,7 +100,7 @@ public class FrozenStrategySnapshotProviderTests
                 {
                     Mode = SolverStrategyMode.Forward,
                     OnTimeTarget = new OnTimeTargetParams { TargetPercent = 90, IsPrimaryObjective = true },
-                    Setup = new SetupParams { DefaultSetupMinutes = 30, SetupLookAheadSize = 5 }
+                    Setup = new SetupParams()
                 },
                 new CandidateGuardrailBlock
                 {
@@ -223,7 +223,7 @@ public class FrozenStrategySnapshotProviderTests
         {
             Mode = SolverStrategyMode.Backward,
             OnTimeTarget = new OnTimeTargetParams { TargetPercent = 85 },
-            Setup = new SetupParams { DefaultSetupMinutes = 45, SetupLookAheadSize = 4 }
+            Setup = new SetupParams()
         });
 
         var candidateGuardrailJson = JsonSerializer.Serialize(new CandidateGuardrailBlock
@@ -293,8 +293,6 @@ public class FrozenStrategySnapshotProviderTests
         // R14~R17 真实重放断言（P0-02：不能只断言 NotNull，须断言具体值等于该版本 JSON 中内容）
         snapshot.SolverStrategy.Mode.Should().Be(SolverStrategyMode.Backward);
         snapshot.SolverStrategy.OnTimeTarget.TargetPercent.Should().Be(85);
-        snapshot.SolverStrategy.Setup.DefaultSetupMinutes.Should().Be(45);
-        snapshot.SolverStrategy.Setup.SetupLookAheadSize.Should().Be(4);
 
         snapshot.CandidateGuardrail.NormalMs.Should().Be(70_000);
         snapshot.CandidateGuardrail.SoftMs.Should().Be(110_000);

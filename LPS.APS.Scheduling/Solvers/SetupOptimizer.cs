@@ -1,6 +1,7 @@
 namespace LPS.APS.Scheduling.Solvers;
 
 using LPS.APS.Core.Dto;
+using LPS.APS.Shared.Models;
 
 /// <summary>
 /// Setup 换型规则解析骨架（v1.2 收口版规则模型）。
@@ -56,11 +57,32 @@ public class SetupOptimizer
         RuleMissing
     }
 
+    /// <summary>
+    /// SetupOutcome → 落库值（大写 4 态字符串）。契约源：0号位 20260922 裁决
+    /// （Task.SetupSource 保留，枚举统一 4 态，不采用 5 值；SAME_PRODUCT/NONE 不作正式值）。
+    /// 映射：ExactHit→EXACT、DefaultHit→DEFAULT、SameProductZero→DEFAULT
+    /// （同产品连续无显式规则 = 业务默认不换型，非独立来源）、
+    /// RuleMissing→SETUP_RULE_MISSING_ZERO_FALLBACK、InitialState→INITIAL_SETUP_STATE。
+    /// 2号位 只承载原样落库，枚举→4 态转换在 1号位（本方法）。
+    /// </summary>
+    public static string SetupOutcomeToSource(SetupOutcome outcome) => outcome switch
+    {
+        SetupOutcome.ExactHit => "EXACT",
+        SetupOutcome.DefaultHit => "DEFAULT",
+        SetupOutcome.SameProductZero => "DEFAULT",
+        SetupOutcome.RuleMissing => RuleMissingZeroFallbackType,
+        SetupOutcome.InitialState => InitialSetupStateType,
+        _ => RuleMissingZeroFallbackType
+    };
+
     /// <summary>Setup 追踪统一 TraceType（0号位 20260917 正式回复 §5.1：TIME_CALCULATION）。</summary>
     public const string TraceType = "TIME_CALCULATION";
 
     /// <summary>初始设备状态解释类型符号锚（ExplainTrace 内部类型，非 ScheduleExplanationFact.ReasonCode——0号位 裁决项4 §5.1，INFO 级）。</summary>
     public const string InitialSetupStateType = "INITIAL_SETUP_STATE";
+
+    /// <summary>DEFAULT 回退解释类型符号锚（0号位 正式回复 §5.2，INFO 级；定名 DEFAULT_SETUP_FALLBACK——2号位 20260920 回执建议，1号位 采纳，待三方词表终对齐）。</summary>
+    public const string DefaultSetupFallbackType = "DEFAULT_SETUP_FALLBACK";
 
     /// <summary>换型规则缺失 0 分钟兜底解释类型符号锚（0号位 裁决项4 §5.3，WARNING 级；同时进 4号位「换型规则缺失/0分钟兜底」数据质量查询）。
     /// ContextData 需含 productionDepartmentId/stageCode/operationCode/resourceId/fromMaterialId/toMaterialId/setupMinutes——
@@ -85,6 +107,16 @@ public class SetupOptimizer
     /// <param name="exactRules">EXACT 产品转换规则（2号位 装载，Phase1 适配传入）。</param>
     /// <param name="defaultRules">DEFAULT 工序+设备规则（同上）。</param>
     public SetupResolution ResolveSetup(
+        string operationCode,
+        int resourceId,
+        int? fromMaterialId,
+        int toMaterialId,
+        IReadOnlyDictionary<SetupExactKey, decimal> exactRules,
+        IReadOnlyDictionary<SetupDefaultKey, decimal> defaultRules)
+        => ResolveSetupCore(operationCode, resourceId, fromMaterialId, toMaterialId, exactRules, defaultRules);
+
+    /// <summary>纯函数解析核心（item1 接线阶段二：供 Phase2/Phase4 静态复用，实例方法 ResolveSetup 委托于此，行为一致）。</summary>
+    internal static SetupResolution ResolveSetupCore(
         string operationCode,
         int resourceId,
         int? fromMaterialId,
@@ -116,12 +148,12 @@ public class SetupOptimizer
         }
 
         // 第二优先：当前工序+当前设备默认规则（§四）。
-        // 追踪规格：0号位 正式回复 §5.2（正常 fallback，INFO 轻量追踪；解释类型符号待 1/2/3号位 三方统一）。
+        // 追踪规格：0号位 正式回复 §5.2（正常 fallback，INFO 轻量追踪；符号采 2号位 20260920 建议 DEFAULT_SETUP_FALLBACK）。
         if (defaultRules.TryGetValue(new SetupDefaultKey(operationCode, resourceId), out var defaultMinutes))
         {
             return new SetupResolution(defaultMinutes, SetupOutcome.DefaultHit,
                 "未命中明确产品转换规则，使用当前工序/设备默认换型时间。",
-                "INFO", null);
+                "INFO", DefaultSetupFallbackType);
         }
 
         // 第三优先：无规则 → 0 分钟 + 必须记录缺失解释（§5；禁止任何额外 fallback）。
@@ -200,4 +232,165 @@ public class SetupOptimizer
 
         return windows;
     }
+
+    /// <summary>
+    /// P1-02 item1 接线（阶段二）：动态 Setup 感知的槽查找（v1.2 §12：Setup 从初始 Resource/时间槽候选评价阶段就参与）。
+    /// 鸡生蛋问题——Setup 取决于槽起点的前产品、前产品取决于槽位置、槽位置取决于 Setup 总时长——用有界迭代解：
+    /// 以 floor 处前产品估算 Setup → 搜槽 → 用槽起点真实前产品重解析 → 更短则原窗必容得下（收敛返回）；
+    /// 更长则以新值重搜。maxIterations 内未收敛则按最后解析值终搜一次（残余偏差由 Phase4 邻接重算/夜间 FULL 修正）。
+    /// </summary>
+    /// <param name="floor">最早占用开始时间（物料/依赖等下界，占用口径与 Phase2/Phase4 FindForwardSlot 用法一致）。</param>
+    /// <param name="processDuration">加工时长（不含 Setup）。</param>
+    /// <param name="findSlot">各 Phase 自己的日历感知槽查找：(最早开始, 含 Setup 总时长) → 占用窗；null = 无可行槽。</param>
+    /// <returns>(占用窗[含Setup], Setup分钟, 解析结果)；null = 无可行槽。追踪三元组的写出待 ExplainTrace 载体（2号位 DTO）落地。</returns>
+    internal static (TimeWindow Slot, decimal SetupMinutes, SetupResolution Resolution)? FindSlotWithDynamicSetup(
+        DateTime floor,
+        TimeSpan processDuration,
+        int resourceId,
+        string operationCode,
+        int toMaterialId,
+        ResourceProductTimeline timeline,
+        IReadOnlyDictionary<SetupExactKey, decimal> exactRules,
+        IReadOnlyDictionary<SetupDefaultKey, decimal> defaultRules,
+        Func<DateTime, TimeSpan, TimeWindow?> findSlot,
+        int maxIterations = 3)
+    {
+        var resolution = ResolveSetupCore(operationCode, resourceId,
+            timeline.GetPrevMaterial(resourceId, floor), toMaterialId, exactRules, defaultRules);
+
+        for (int i = 0; i < maxIterations; i++)
+        {
+            var slot = findSlot(floor, processDuration + TimeSpan.FromMinutes((double)resolution.SetupMinutes));
+            if (slot == null) return null;
+
+            var atSlot = ResolveSetupCore(operationCode, resourceId,
+                timeline.GetPrevMaterial(resourceId, slot.Value.Start), toMaterialId, exactRules, defaultRules);
+
+            if (atSlot.SetupMinutes <= resolution.SetupMinutes)
+            {
+                // 解析值 ≤ 搜索值：占用窗按真实 Setup 重算，必落在已验证的日历窗/空闲段内 → 收敛
+                var occ = new TimeWindow(slot.Value.Start,
+                    slot.Value.Start + TimeSpan.FromMinutes((double)atSlot.SetupMinutes) + processDuration);
+                return (occ, atSlot.SetupMinutes, atSlot);
+            }
+
+            resolution = atSlot;   // 变大：以新 Setup 重搜
+        }
+
+        // 有界未收敛：按最后解析值终搜一次
+        var finalSlot = findSlot(floor, processDuration + TimeSpan.FromMinutes((double)resolution.SetupMinutes));
+        if (finalSlot == null) return null;
+        var finalOcc = new TimeWindow(finalSlot.Value.Start,
+            finalSlot.Value.Start + TimeSpan.FromMinutes((double)resolution.SetupMinutes) + processDuration);
+        return (finalOcc, resolution.SetupMinutes, resolution);
+    }
+}
+
+/// <summary>
+/// P1-02 item1 接线（阶段二）：资源级「已排产品时间线」。
+/// 维护 ResourceId → 按占用结束时间升序的 (End, MaterialId) 列表，支撑 v1.2 语义
+/// 「FromMaterial = 当前设备上一相邻 Task 的产品」——按**时间邻接**查询（最晚 End ≤ 我的占用起点），
+/// 而非按放置顺序（任务可能被排进中间空档，放置序 ≠ 时间序）。
+///
+/// 口径：
+/// - 锁定继承 Task（Firm/Frozen/Execution）计入——它们是「可追溯上一产品」（v1.2 §14.3）；
+/// - ExternalDomain ResourceBlocks 不计入——阻挡块不是 Task、无产品语义（查不到更早 Task 时按初始设备状态）；
+/// - 放置/移动/合并时由调用方同步 Place/Remove（与 resourceOccupancy 成对维护）。
+/// 性能：二分查询 O(log n) + 有序插入；10万 Task 规模标定如现瓶颈再换结构（性能标定阶段处理）。
+/// </summary>
+internal sealed class ResourceProductTimeline
+{
+    private readonly Dictionary<int, List<(DateTime End, int MaterialId)>> _byResource = new();
+
+    /// <summary>从既有 Task 集合构建（Phase2 Schedule 入口重置 / Phase4 兜底重跑时用）。</summary>
+    public static ResourceProductTimeline FromTasks(IEnumerable<FinalTaskDraft> tasks)
+    {
+        var timeline = new ResourceProductTimeline();
+        foreach (var t in tasks)
+        {
+            // 非资源 Task（ResourceId=NULL）不占资源，不进产品时间线
+            if (t.ResourceId is not int rid) continue;
+            timeline.Place(rid, t.PlannedEndTime, t.MaterialId);
+        }
+        return timeline;
+    }
+
+    /// <summary>上一相邻 Task 产品：最晚占用结束时间 ≤ occStart 者；null = 无可追溯上一产品（初始设备状态，Setup=0）。</summary>
+    public int? GetPrevMaterial(int resourceId, DateTime occStart)
+    {
+        if (!_byResource.TryGetValue(resourceId, out var list) || list.Count == 0)
+            return null;
+
+        // 二分：最右一个 End <= occStart
+        int lo = 0, hi = list.Count - 1, ans = -1;
+        while (lo <= hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (list[mid].End <= occStart) { ans = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return ans >= 0 ? list[ans].MaterialId : null;
+    }
+
+    /// <summary>登记一个已放置 Task 的产品与占用结束时间（有序插入）。</summary>
+    public void Place(int resourceId, DateTime occEnd, int materialId)
+    {
+        if (!_byResource.TryGetValue(resourceId, out var list))
+        {
+            list = new List<(DateTime, int)>();
+            _byResource[resourceId] = list;
+        }
+
+        int lo = 0, hi = list.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (list[mid].End < occEnd) lo = mid + 1;
+            else hi = mid;
+        }
+        list.Insert(lo, (occEnd, materialId));
+    }
+
+    /// <summary>移除一个 Task 的登记（移动/重建前调用；按 End+MaterialId 匹配第一条）。</summary>
+    public void Remove(int resourceId, DateTime occEnd, int materialId)
+    {
+        if (!_byResource.TryGetValue(resourceId, out var list))
+            return;
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (list[i].End == occEnd && list[i].MaterialId == materialId)
+            {
+                list.RemoveAt(i);
+                return;
+            }
+        }
+    }
+}
+
+/// <summary>
+/// P1-02 item1（夜间 FULL）：确定性伪随机源（LCG，Knuth MMIX 常数）。
+/// 不用 BCL Random——其算法跨 .NET 版本可变，会破坏「同 Run 重放同结果」（Run 重放/审计/回归依赖确定性）。
+/// 种子由 ScheduleRunId/PlanVersionId 派生：同一 Run 重放 → 同一搜索轨迹 → 同一结果。
+/// public：性能标定工装（LPS.APS.Tests/Benchmarks/SolverBenchmark）复用同一 LCG，保证基准与生产轨迹一致
+/// （Scheduling 无 InternalsVisibleTo(Tests)，故放宽可见性；无签名变化）。
+/// </summary>
+public sealed class DeterministicRandom
+{
+    private ulong _state;
+
+    public DeterministicRandom(long seed)
+    {
+        _state = unchecked((ulong)seed * 6364136223846793005UL + 1442695040888963407UL);
+    }
+
+    public uint NextUInt()
+    {
+        _state = unchecked(_state * 6364136223846793005UL + 1442695040888963407UL);
+        return (uint)(_state >> 33);   // 高位质量更好
+    }
+
+    /// <summary>[0, maxExclusive) 均匀整数；maxExclusive ≤ 0 返回 0。</summary>
+    public int Next(int maxExclusive)
+        => maxExclusive <= 0 ? 0 : (int)(NextUInt() % (uint)maxExclusive);
 }

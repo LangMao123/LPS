@@ -18,6 +18,9 @@ public sealed class CandidateRunCreateSpec
     /// <summary>目标 Domain（白天候选严格单 Domain；对应 PlanVersion.DomainKey 与 ExpectedDomainKeysJson）</summary>
     public string DomainKey { get; set; } = string.Empty;
 
+    /// <summary>局部重排范围载荷（ScopeJsonV2；承载 ScheduleRun.ScopeJson）。缺省 null = 不承载结构化范围（旧调用兼容）</summary>
+    public ScopeJsonV2? Scope { get; set; }
+
     /// <summary>所基于的当前 ACTIVE 计划版本（可选；缺省由服务按 DomainKey 解析当前 ACTIVE，无 ACTIVE 拒绝）</summary>
     public int? BasePlanVersionId { get; set; }
 

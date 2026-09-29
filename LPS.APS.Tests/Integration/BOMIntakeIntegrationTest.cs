@@ -16,13 +16,31 @@ namespace LPS.APS.Tests.Integration;
 /// 与 NightlyBatchOrchestrator 解耦，单独触发「找最近 READY 批次 → 接货」，供白天补接货 / 联调。
 /// 接货落库到 APS_BOM_RAW + APS_BOM_STAGE_PATH_RAW（StagePath 事实源，跨版本连续性 E>0 的关键上游）。
 /// </summary>
+/// <remarks>
+/// 【2026-09-29 修复】原为无闸门 `[Fact]`，两个问题：
+/// <list type="number">
+/// <item>
+/// <b>它是破坏性写</b>：BOM 接货对 <c>APS_BOM_RAW</c> / <c>APS_BOM_STAGE_PATH_RAW</c> 等表**整表 TRUNCATE**
+/// 后重灌当批（见 `aps_bom` 接货事故的教训）⇒ 每次 `dotnet test` 都在**无提示地清表重灌**。
+/// 现与 `RealDomainFullRunTest` 统一：须显式设 <c>APS_REAL_DOMAIN_RUN=1</c> 才运行。
+/// </item>
+/// <item>
+/// <b>红灯是环境态、不是缺陷</b>：原断言「必须找到 READY 批次」，但上游 ERP 没产新批次时
+/// 「无 READY 批次」是**正常状态** ⇒ 该测试会在没有新 BOM 的日子恒红。现改为 <c>Skip</c>。
+/// </item>
+/// </list>
+/// </remarks>
 public class BOMIntakeIntegrationTest
 {
-    private const int PlanVersionId = 328; // FAMILY_X（OrderBomRequestLink 映射用，单 Domain 唯一命中）
+    // 328 = CNT_FAMILYX（CONTINUITY，长驻真实版本，OrderBomRequestLink 映射用、单 Domain 唯一命中）
+    private const int PlanVersionId = 328;
 
-    [Fact(DisplayName = "独立接货：拉取最近 READY BOM 批次并落库（APS_BOM_RAW + APS_BOM_STAGE_PATH_RAW）")]
+    [SkippableFact(DisplayName = "独立接货：拉取最近 READY BOM 批次并落库（APS_BOM_RAW + APS_BOM_STAGE_PATH_RAW）")]
     public async Task IntakeLatestReadyBatchAsync()
     {
+        Skip.IfNot(Environment.GetEnvironmentVariable("APS_REAL_DOMAIN_RUN") == "1",
+            "BOM 接货会整表 TRUNCATE 后重灌；须显式设 APS_REAL_DOMAIN_RUN=1 才运行。");
+
         var services = new ServiceCollection();
         var configuration = new ConfigurationBuilder()
             .AddJsonFile("appsettings.Test.json", optional: false)
@@ -41,7 +59,10 @@ public class BOMIntakeIntegrationTest
         Console.WriteLine(
             $"[接货] IntakePerformed={result.IntakePerformed}, BatchNo={result.BatchNo ?? "<无READY批次>"}, PulledCount={result.PulledCount}");
 
-        Assert.True(result.IntakePerformed, "未找到 READY 状态的 BOM 批次，接货未执行");
+        // 「无 READY 批次」= 上游 ERP 尚未产批，属**正常环境态**，不是缺陷 ⇒ Skip 而非 Fail
+        // （原 `Assert.True` 会把正常态报成红灯，见类 remarks）。
+        Skip.IfNot(result.IntakePerformed,
+            $"上游无 READY 状态的 BOM 批次（BatchNo={result.BatchNo ?? "<无>"}），接货未执行 —— 环境态，非缺陷。");
 
         // 落库硬证据：接货后两表的当批行数 + StagePath 覆盖的物料数
         var bomRowCount = await conn.QueryFirstOrDefaultAsync<int>(

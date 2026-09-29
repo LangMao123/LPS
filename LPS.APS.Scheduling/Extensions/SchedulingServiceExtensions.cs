@@ -17,12 +17,10 @@ public static class SchedulingServiceExtensions
         // 注册1号位核心接口（IFiniteCapacityScheduler）——唯一真实生产入口，内部走 SolveAsync → Phase1-5
         services.AddSingleton<IFiniteCapacityScheduler, FiniteCapacitySolver>();
 
-        // 【遗留注册】以下两个组件均为死代码/未启用（见各自文件头注释）：
-        // - TimeSlotFinder：只被 FiniteCapacitySolver 的死代码 Solve()/Reschedule() 使用
-        // - SetupOptimizer：FiniteCapacitySolver 构造时实例化但从不调用
-        // 生产流程不依赖它们，保留注册仅为避免 DI 缺失报错 / 历史兼容，可后续清理。
-        services.AddSingleton<TimeSlotFinder>();
-        services.AddSingleton<SetupOptimizer>();
+        // 死代码清理批次（20260923）：原 TimeSlotFinder / SetupOptimizer 实例注册已移除——
+        // TimeSlotFinder 随死代码文件一并删除；SetupOptimizer 实例无消费方
+        // （Phase1/2/4/5 只调其静态方法，已 grep 确认全仓无 GetService<SetupOptimizer>() / new SetupOptimizer()）。
+        // 如后续确需实例化，请在此重新注册。
 
         return services;
     }

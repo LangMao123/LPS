@@ -71,6 +71,30 @@ public static class PermissionCodes
     /// <summary>Demand Protection 释放</summary>
     public const string DemandProtectionRelease = "aps.demand_protection.release";
 
+    // ---------- Setup 换型 ----------
+    /// <summary>查看 Setup 换型规则</summary>
+    public const string SetupView = "aps.setup.view";
+    /// <summary>维护 Setup 换型规则</summary>
+    public const string SetupEdit = "aps.setup.edit";
+    /// <summary>发布 Setup 换型规则版本</summary>
+    public const string SetupPublish = "aps.setup.publish";
+
+    // ---------- ResourceCalendar 设备资源日历 ----------
+    /// <summary>查看设备资源日历</summary>
+    public const string ResourceCalendarView = "aps.resource_calendar.view";
+    /// <summary>维护设备资源日历</summary>
+    public const string ResourceCalendarEdit = "aps.resource_calendar.edit";
+    /// <summary>删除设备资源日历</summary>
+    public const string ResourceCalendarDelete = "aps.resource_calendar.delete";
+
+    // ---------- ManualCapacity 人工能力槽 ----------
+    /// <summary>查看人工能力槽</summary>
+    public const string ManualCapacityView = "aps.manual_capacity.view";
+    /// <summary>维护人工能力槽</summary>
+    public const string ManualCapacityEdit = "aps.manual_capacity.edit";
+    /// <summary>删除人工能力槽</summary>
+    public const string ManualCapacityDelete = "aps.manual_capacity.delete";
+
     // ---------- MES ----------
     /// <summary>查看 MES 状态</summary>
     public const string MesView = "aps.mes.view";
@@ -95,7 +119,7 @@ public static class PermissionCodes
     /// <summary>查看审计日志</summary>
     public const string AuditView = "aps.audit.view";
 
-    /// <summary>全部 V1 功能权限点（34 码，供策略注册遍历；与 Auth DDL v1.3 冻结种子一一对应）</summary>
+    /// <summary>全部 V1 功能权限点（43 码，供策略注册遍历；34 码基线 + Setup 换型 3 码 + ResourceCalendar 3 码 + ManualCapacity 3 码，后两者为 5号位 权限码申请 2026-09-24 新增）</summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
         PlanView, PlanRun, PlanCompare, PlanExport,
@@ -106,6 +130,9 @@ public static class PermissionCodes
         StrategyView, StrategyEdit, StrategyPublish,
         ManualEtaView, ManualEtaMaintain, ManualEtaCancel,
         DemandProtectionView, DemandProtectionRelease,
+        SetupView, SetupEdit, SetupPublish,
+        ResourceCalendarView, ResourceCalendarEdit, ResourceCalendarDelete,
+        ManualCapacityView, ManualCapacityEdit, ManualCapacityDelete,
         MesView, MesControlledOperation,
         AuthUserView, AuthManage, AuthRoleView, AuthRoleEdit, AuthPermissionAssign, AuthScopeAssign,
         AuditView

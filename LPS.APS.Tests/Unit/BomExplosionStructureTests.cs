@@ -121,6 +121,26 @@ public class BomExplosionStructureTests
     }
 
     [Fact]
+    public void 共享子件更深路径_最深层下推到其子件()
+    {
+        // 记忆化重写的关键回归：D 先经 A→D（level1）被枚举（含其子件 E），后又经
+        // A→B→C→D（level3）重回。最深层（LLC）须把 D 抬到 3，并把 E 一并下推到 4——
+        // 不能因「D 已枚举」而把 E 冻结在 level2。
+        var s = Structure(
+            null,
+            ("A", "D", 4, 1m),
+            ("D", "E", 5, 1m),
+            ("A", "B", 2, 1m),
+            ("B", "C", 3, 1m),
+            ("C", "D", 4, 1m));
+
+        var nodes = Service.ExplodeOrderStructure(s, Demand("A"));
+
+        NodeOf("D", nodes).Level.Should().Be(3);
+        NodeOf("E", nodes).Level.Should().Be(4); // 经最深 D 下推，而非浅层 2
+    }
+
+    [Fact]
     public void 真实环_收敛_不记环边不抬层()
     {
         // A→B→A：round 回到 root 被截断，A 仍是 level 0 无父边、B level 1 父边=[A]。

@@ -2,11 +2,12 @@ namespace LPS.APS.Core.Entities.APS;
 
 /// <summary>
 /// 产品转换换型规则（SetupTransitionRule）
-/// 对应 APS_Production.SetupTransitionRule（DDL v5.1.8 §3.10.x，2026-09-17）
+/// 承载：RuleSetVersion.ContentSnapshotJson.SetupTransitionRules 子块（JSON 数组，重构 S-7 契约登记，零 DDL；
+/// 原独立物理表 APS_Production.SetupTransitionRule 条目已撤销，待 2号位 D-1 DROP 闭环）。
 /// 依据：《APS V1 Setup换型规则与有限产能优化——冻结文档修改指导 v1.2（最终收口版，2026-09-16）》§九/§十。
 /// 红线：
 ///   - 规则随 RuleSetVersionId 冻结，已 PUBLISHED 版本禁止原地修改（沿用 RuleSetVersion 治理口径）；
-///   - 唯一性由「发布前冲突校验（3号位）」保证，DB 过滤唯一索引仅兜底（红线 #3：不得依赖 DB 约束保证完整性）；
+///   - 唯一性由「发布前冲突预校验（3号位）」保证（红线 #3：不得依赖 DB 约束保证完整性）；
 ///   - RuleType 取值见 <see cref="SetupTransitionRuleType"/>（EXACT / DEFAULT）。
 /// 开发者：3号位（Setup规则治理）。
 /// </summary>

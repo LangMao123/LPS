@@ -8,6 +8,7 @@ using LPS.APS.Application.Extensions;
 using LPS.APS.BusinessRules.Extensions;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Extensions;
+using LPS.APS.Engine.Repositories.Governance;
 using LPS.APS.Scheduling.Extensions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Dto;
@@ -62,6 +63,7 @@ public class BomDualRunIntegrationTest
         // 联调专用 fixture（与 ContinuityRedLineIntegrationTest 一致，测试专用不得进生产 DI）
         services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         services.AddScoped<IFrozenStrategySnapshotProvider, FrozenStrategySnapshotFixtureProvider>();
+        // S-3：SetupTransitionRuleRepository 已撤销（承载 = RuleSetVersion.ContentSnapshotJson 子块，Provider 装配第⑦块）
         // LogLevel.Error：双跑只关心最终 7 项报告 + 硬超时结论；LoadSupplyPoolAsync 会对 3292 张 PI 逐条刷
         // 「Position 差异」Warning（5号位 CalculatePiInventoryPositions 已知问题），Information/Warning 会拖死 I/O。
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddProvider(new ConsoleOutLoggerProvider()));

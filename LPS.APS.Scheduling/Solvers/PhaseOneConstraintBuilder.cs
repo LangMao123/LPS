@@ -28,6 +28,12 @@ internal class PhaseOneConstraintBuilder
         var context = new ConstraintContext();
 
         // ═══════════════════════════════════════════════
+        // 0.0 StageSeq 全序校验（B-1，0号位 2026-09-29 裁决 §二）
+        //     冲突物料记入 context.StageSequenceConflictMaterialIds ⇒ 下游不生成正式计划
+        // ═══════════════════════════════════════════════
+        ValidateStageSequences(request, context);
+
+        // ═══════════════════════════════════════════════
         // 0. 部门锁定（最小 B）：按 (MaterialId, StageCode) → ProductionDepartmentId
         //    过滤 Routing 三件套；缺失 Context 的 Material 记入 context.MissingDepartmentContextMaterialIds
         // ═══════════════════════════════════════════════
@@ -76,7 +82,56 @@ internal class PhaseOneConstraintBuilder
         // ═══════════════════════════════════════════════
         BuildResourceBlocks(request, context);
 
+        // ═══════════════════════════════════════════════
+        // 7. 装载 Setup 换型规则（P1-02 item1：第⑦块 → EXACT/DEFAULT 查找字典）
+        // ═══════════════════════════════════════════════
+        BuildSetupTransitionRules(request, context);
+
+        // ═══════════════════════════════════════════════
+        // 8. 装载 RunScope（M5 第一批：Run 级交期覆盖 + Task 软目标）
+        // ═══════════════════════════════════════════════
+        BuildRunScope(request, context);
+
         return context;
+    }
+
+    /// <summary>
+    /// B-1：StageSeq 全序校验（0号位 2026-09-29 裁决 §二，逐字口径）。
+    ///
+    /// 裁决原文要点：
+    /// - §2.1 `StageSeq` 采用**全序链**语义，不采用「相同 StageSeq 表示并行 Stage」的偏序语义；
+    ///   唯一性范围是**一个已解析好的具体 StageSequenceChain 内**，不是 Material 全局；
+    /// - §2.2 同 StageCode 重复 → 取最小 StageSeq 收敛（DTO 既有兼容规则，「可以继续保留」）；
+    ///   收敛后**不同 StageCode 不得拥有相同 StageSeq**；
+    /// - §2.3 若冲突：不允许静默按数组顺序、不允许静默并行、输出明确 Issue、
+    ///   **不生成可能顺序错误的正式计划**。
+    ///
+    /// 本方法只做「校验 + 登记冲突」，**不**在此建立有序链：有序链是 ④（无 Routing Stage 的
+    /// StageTimingNode 时间层）的输入，尚无消费者，提前落库即死代码。冲突登记本身已是完整能力
+    /// ——它直接改变该物料需求的排程结果（Unscheduled + 明确 Reason）。
+    /// </summary>
+    private void ValidateStageSequences(DomainSolveRequest request, ConstraintContext context)
+    {
+        foreach (var chain in request.StageSequenceChains)
+        {
+            // ① 同 StageCode 取最小 StageSeq 收敛（裁决 §2.2 明文保留的既有兼容规则）。
+            //    2号位 装载时已做（StageSequenceChain 文档「同一 StageCode 取最小 StageSeq」），
+            //    此处再收敛一次是防御：契约口径不因上游实现细节而失效。
+            var converged = chain.Stages
+                .GroupBy(s => s.StageCode ?? string.Empty, StringComparer.Ordinal)
+                .Select(g => g.OrderBy(s => s.StageSeq).First())
+                .ToList();
+
+            // ② 全序校验：收敛后不同 StageCode 的 StageSeq 必须互不相同
+            var hasDuplicateSeq = converged
+                .GroupBy(s => s.StageSeq)
+                .Any(g => g.Count() > 1);
+
+            if (hasDuplicateSeq)
+            {
+                context.StageSequenceConflictMaterialIds.Add(chain.MaterialId);
+            }
+        }
     }
 
     /// <summary>
@@ -101,6 +156,10 @@ internal class PhaseOneConstraintBuilder
         //    即使其缺 Department Context 也不应误杀当前剩余 Routing。
         //    无 Start 信息的需求（新单从首工序起）仍校验全量 Stage。
         var reachableStages = BuildReachableStages(request);
+
+        // 供 Phase5 计算「无 Routing Stage」时间节点（0号位 2026-09-29 裁决 §十四第4项）。
+        // 见 ConstraintContext.EffectiveStages 注释：语义不变，仅把原本的局部变量挂出来复用。
+        context.EffectiveStages = reachableStages;
         foreach (var op in request.RoutingOperations)
         {
             var stageCode = op.StageCode ?? string.Empty;
@@ -139,6 +198,15 @@ internal class PhaseOneConstraintBuilder
             }
 
             var stageCode = op.StageCode ?? string.Empty;
+
+            // P1-06 对齐：与第一轮同口径——无需求 Material 不参与部门锁定；范围外 Stage
+            // （续排起点之前已完成）不参与，避免索引 deptContext 时 KeyNotFound。
+            if (!reachableStages.TryGetValue(op.MaterialId, out var inScopeStages2) ||
+                !inScopeStages2.Contains(stageCode))
+            {
+                continue;
+            }
+
             var expectedDeptId = deptContext[(op.MaterialId, stageCode)];
 
             if (op.ProductionDepartmentId != expectedDeptId)
@@ -150,11 +218,27 @@ internal class PhaseOneConstraintBuilder
             validOperationKeys.Add((op.MaterialId, op.ProductionDepartmentId, op.RouteCode, op.OperationCode));
         }
 
-        // 3. 过滤 RoutingDependency：两端 Operation 都必须合法，且部门与锁定 Operation 一致
+        // 3. 过滤 RoutingDependency：两端 Operation 都必须已锁定。
+        // ⚠ PM 0928-1 §五 终裁：「跨 Stage Dependency 不能要求 FromDepartment = ToDepartment，
+        //   否则会错误限制真实制造流程」——`RoutingDependency.ProductionDepartmentId` 是**单值**，
+        //   跨 Stage 边两端分属不同部门时，该行无论填哪个部门值都不可能同时命中两端 ⇒ 必被误杀。
+        //   故此处按 (MaterialId, RouteCode, OperationCode) 判定：lockedOperations 已在上面按各自
+        //   Stage 的期望部门过滤过，键内已隐含「部门正确」，无需再要求 dep 的部门值同时命中两端。
+        //   同 Stage 边**零回归**（其 dep 部门本就等于两端部门）。
+        //
+        // ⚠ 残留（诚实登记，不静默）：本层只能用三元组做**必要**条件 —— `RoutingDependency` 契约内
+        //   无 StageCode，无法在此判定边的 Stage 归属。同码跨 Stage 时，「另一 Stage 的同名工序仍在锁定集内」
+        //   会让一条本应随其 Stage 一起被剔除的边在此存活。精确 Stage 归属在 `BuildRoutingGraphs` 里
+        //   由图内节点反查消解（唯一 ⇒ 取；歧义 ⇒ 计数 + 丢边，不猜）。已核：同 Stage 边不会误接
+        //   （同部门 ⇒ 两端节点都锁定 ⇒ 消解歧义 ⇒ 丢边计数，不产生错边）。
+        var lockedOperationKeys = lockedOperations
+            .Select(op => (op.MaterialId, op.RouteCode, op.OperationCode))
+            .ToHashSet();
+
         lockedDependencies = request.RoutingDependencies
             .Where(dep =>
-                validOperationKeys.Contains((dep.MaterialId, dep.ProductionDepartmentId, dep.RouteCode, dep.FromOperationCode)) &&
-                validOperationKeys.Contains((dep.MaterialId, dep.ProductionDepartmentId, dep.RouteCode, dep.ToOperationCode)))
+                lockedOperationKeys.Contains((dep.MaterialId, dep.RouteCode, dep.FromOperationCode)) &&
+                lockedOperationKeys.Contains((dep.MaterialId, dep.RouteCode, dep.ToOperationCode)))
             .ToList();
 
         // 4. 过滤 OperationResourceEligibility：Operation 必须合法，且部门与锁定 Operation 一致
@@ -175,7 +259,7 @@ internal class PhaseOneConstraintBuilder
     {
         var result = new Dictionary<int, HashSet<string>>();
 
-        // 预处理：物料 → (工序码 → StageCode) 与依赖邻接表（V1 默认 DEFAULT 路径）
+        // 预处理：物料 → 工序行 与依赖行（V1 默认 DEFAULT 路径）
         var opsByMaterial = request.RoutingOperations
             .GroupBy(op => op.MaterialId)
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -197,34 +281,63 @@ internal class PhaseOneConstraintBuilder
                 result[demand.MaterialId] = stageSet;
             }
 
-            // 工序码 → StageCode（仅 DEFAULT 路径，V1 单路径）
-            var opCodeToStage = ops
+            // 工序节点集合（仅 DEFAULT 路径，V1 单路径）：键 = (StageCode, OperationCode)。
+            // ⚠ 0号位 2026-09-29 裁决 §5.3：原实现是「工序码 → StageCode」单键 + First() 任取，
+            //   同码跨 Stage 时会**判错整个可达 Stage 集合**（连带影响 P1-06 缺失判定与部门锁定范围），
+            //   比单点覆盖更严重。此处升维。
+            var nodes = ops
                 .Where(op => op.RouteCode == "DEFAULT")
-                .GroupBy(op => op.OperationCode)
-                .ToDictionary(g => g.Key, g => g.First().StageCode ?? string.Empty);
+                .GroupBy(op => OperationNodeKey.Of(op.StageCode, op.OperationCode))
+                .ToDictionary(g => g.Key, g => g.First());
+
+            // 工序码 → 候选节点键（消解依赖端点 / 起点工序用；同码跨 Stage 时 >1 个候选）
+            var nodesByOperationCode = new Dictionary<string, List<OperationNodeKey>>();
+            foreach (var nodeKey in nodes.Keys)
+            {
+                if (!nodesByOperationCode.TryGetValue(nodeKey.OperationCode, out var keyList))
+                {
+                    keyList = new List<OperationNodeKey>();
+                    nodesByOperationCode[nodeKey.OperationCode] = keyList;
+                }
+
+                keyList.Add(nodeKey);
+            }
 
             // 依赖邻接表：From → List&lt;To&gt; + 入度（用于识别根工序）
-            var adjacency = new Dictionary<string, List<string>>();
-            var inDegree = new Dictionary<string, int>();
-            foreach (var opCode in opCodeToStage.Keys)
+            var adjacency = new Dictionary<OperationNodeKey, List<OperationNodeKey>>();
+            var inDegree = new Dictionary<OperationNodeKey, int>();
+            foreach (var nodeKey in nodes.Keys)
             {
-                inDegree[opCode] = 0;
+                inDegree[nodeKey] = 0;
             }
 
             if (depsByMaterial.TryGetValue(demand.MaterialId, out var deps))
             {
                 foreach (var dep in deps.Where(d => d.RouteCode == "DEFAULT"))
                 {
-                    if (!adjacency.TryGetValue(dep.FromOperationCode, out var tos))
-                    {
-                        tos = new List<string>();
-                        adjacency[dep.FromOperationCode] = tos;
-                    }
-                    tos.Add(dep.ToOperationCode);
+                    var fromKey = nodesByOperationCode.TryGetValue(dep.FromOperationCode, out var fromCandidates)
+                        ? ResolveNodeKey(fromCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                        : null;
 
-                    if (inDegree.ContainsKey(dep.ToOperationCode))
+                    var toKey = nodesByOperationCode.TryGetValue(dep.ToOperationCode, out var toCandidates)
+                        ? ResolveNodeKey(toCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                        : null;
+
+                    if (fromKey == null || toKey == null)
                     {
-                        inDegree[dep.ToOperationCode]++;
+                        continue; // 无法消解 ⇒ 不猜（丢边由 BuildRoutingGraphs 统一计数）
+                    }
+
+                    if (!adjacency.TryGetValue(fromKey.Value, out var tos))
+                    {
+                        tos = new List<OperationNodeKey>();
+                        adjacency[fromKey.Value] = tos;
+                    }
+                    tos.Add(toKey.Value);
+
+                    if (inDegree.ContainsKey(toKey.Value))
+                    {
+                        inDegree[toKey.Value]++;
                     }
                 }
             }
@@ -232,36 +345,45 @@ internal class PhaseOneConstraintBuilder
             // 起点工序集合
             var hasStartOperation = !string.IsNullOrWhiteSpace(demand.StartOperationCode);
             var hasStartStage = !string.IsNullOrWhiteSpace(demand.StartStageCode);
-            var startOps = new List<string>();
+            var startOps = new List<OperationNodeKey>();
 
             if (hasStartOperation)
             {
-                // 5号位 交付的工序级起点：精确到单个工序
-                if (opCodeToStage.ContainsKey(demand.StartOperationCode!))
+                // 5号位 交付的工序级起点。同码跨 Stage 时须用 StartStageCode 收窄，否则会把
+                // 另一 Stage 的同名工序也当作起点（旧实现按工序码单键命中，是同一根因的另一面）。
+                if (nodesByOperationCode.TryGetValue(demand.StartOperationCode!, out var startCandidates))
                 {
-                    startOps.Add(demand.StartOperationCode!);
+                    foreach (var candidate in startCandidates)
+                    {
+                        if (hasStartStage && candidate.StageCode != demand.StartStageCode)
+                        {
+                            continue;
+                        }
+
+                        startOps.Add(candidate);
+                    }
                 }
             }
             else
             {
                 // 无工序级起点：新单从根工序起；若有 StartStageCode 则收窄到该 Stage 的根工序
-                foreach (var opCode in opCodeToStage.Keys)
+                foreach (var nodeKey in nodes.Keys)
                 {
-                    if (inDegree[opCode] != 0)
+                    if (inDegree[nodeKey] != 0)
                     {
                         continue; // 非根工序
                     }
-                    if (hasStartStage && opCodeToStage[opCode] != demand.StartStageCode)
+                    if (hasStartStage && nodeKey.StageCode != demand.StartStageCode)
                     {
                         continue; // 不在起始 Stage
                     }
-                    startOps.Add(opCode);
+                    startOps.Add(nodeKey);
                 }
             }
 
             // BFS 可达工序 → 收集 StageCode
-            var visited = new HashSet<string>();
-            var queue = new Queue<string>();
+            var visited = new HashSet<OperationNodeKey>();
+            var queue = new Queue<OperationNodeKey>();
             foreach (var s in startOps)
             {
                 if (visited.Add(s))
@@ -273,10 +395,7 @@ internal class PhaseOneConstraintBuilder
             while (queue.Count > 0)
             {
                 var cur = queue.Dequeue();
-                if (opCodeToStage.TryGetValue(cur, out var stage))
-                {
-                    stageSet.Add(stage);
-                }
+                stageSet.Add(cur.StageCode); // 键即含 Stage，不再有「查不到」分支
 
                 if (adjacency.TryGetValue(cur, out var tos))
                 {
@@ -320,39 +439,83 @@ internal class PhaseOneConstraintBuilder
             {
                 var graph = new RoutingGraph();
 
-                // 构建工序节点
+                // 构建工序节点：键 = (StageCode, OperationCode)（0号位 2026-09-29 裁决 §5.2/§5.3）
                 foreach (var op in routeOps)
                 {
-                    graph.Operations[op.OperationCode] = new OperationNode
+                    var nodeKey = OperationNodeKey.Of(op.StageCode, op.OperationCode);
+
+                    if (graph.Operations.ContainsKey(nodeKey))
+                    {
+                        // 同 (StageCode, OperationCode) 重复行 = MES 数据异常。
+                        // 旧实现是**静默覆盖**（后者覆盖前者 ⇒ 边被错接）；此处改为保留首行 + 计数，不静默。
+                        context.DuplicateOperationNodeKeyCount++;
+                        continue;
+                    }
+
+                    graph.Operations[nodeKey] = new OperationNode
                     {
                         OperationCode = op.OperationCode,
                         OperationName = op.OperationName,
                         ProcessType = op.ProcessType,
                         StageCode = op.StageCode,
                         StandardDuration = op.StandardDuration,
-                        SetupTime = op.SetupTime,
+                        // item1 接线（阶段二）：不再拷贝 op.SetupTime——v1.2 §1.2/§20.3 废止其运行真相地位，
+                        // Setup 一律走 SetupTransitionRule 规则查找（SetupExactRules/SetupDefaultRules）。
                         TransferBatchSize = op.TransferBatchSize,
+                        OperationPlanningMode = op.OperationPlanningMode ?? "FINITE_RESOURCE",
                         RouteCode = op.RouteCode,
-                        PathId = op.PathId
+                        PathId = op.PathId,
+                        ProductionDepartmentId = op.ProductionDepartmentId
                     };
                 }
 
                 // 构建依赖边
+                // ⚠ 契约 RoutingDependency **无 StageCode 字段**（只有 From/ToOperationCode + 单值
+                //   ProductionDepartmentId）⇒ 边的 Stage 归属必须从本图节点反查消解。消解不唯一时
+                //   计数并丢弃该边，**不猜**（0号位 §5.3「禁止半升级」+ 不静默原则）。
                 var dependencies = routingDependencies
                     .Where(dep => dep.MaterialId == materialId && dep.RouteCode == routeCode)
                     .ToList();
 
-                foreach (var dep in dependencies)
+                // 工序码 → 候选节点键索引（消解依赖端点用；同码跨 Stage 时 >1 个候选）
+                var nodesByOperationCode = new Dictionary<string, List<OperationNodeKey>>();
+                foreach (var nodeKey in graph.Operations.Keys)
                 {
-                    if (!graph.Dependencies.ContainsKey(dep.ToOperationCode))
+                    if (!nodesByOperationCode.TryGetValue(nodeKey.OperationCode, out var keyList))
                     {
-                        graph.Dependencies[dep.ToOperationCode] = new List<DependencyEdge>();
+                        keyList = new List<OperationNodeKey>();
+                        nodesByOperationCode[nodeKey.OperationCode] = keyList;
                     }
 
-                    graph.Dependencies[dep.ToOperationCode].Add(new DependencyEdge
+                    keyList.Add(nodeKey);
+                }
+
+                foreach (var dep in dependencies)
+                {
+                    var fromKey = nodesByOperationCode.TryGetValue(dep.FromOperationCode, out var fromCandidates)
+                        ? ResolveNodeKey(fromCandidates, k => graph.Operations[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                        : null;
+
+                    var toKey = nodesByOperationCode.TryGetValue(dep.ToOperationCode, out var toCandidates)
+                        ? ResolveNodeKey(toCandidates, k => graph.Operations[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                        : null;
+
+                    if (fromKey == null || toKey == null)
                     {
-                        FromOperationCode = dep.FromOperationCode,
-                        ToOperationCode = dep.ToOperationCode,
+                        context.UnresolvedDependencyEdgeCount++;
+                        continue;
+                    }
+
+                    if (!graph.Dependencies.TryGetValue(toKey.Value, out var preds))
+                    {
+                        preds = new List<DependencyEdge>();
+                        graph.Dependencies[toKey.Value] = preds;
+                    }
+
+                    preds.Add(new DependencyEdge
+                    {
+                        From = fromKey.Value,
+                        To = toKey.Value,
                         DependencyType = dep.DependencyType,
                         LagTime = dep.LagTime
                     });
@@ -361,7 +524,7 @@ internal class PhaseOneConstraintBuilder
                 // 识别根工序（无前驱的工序）
                 var allToOps = graph.Dependencies.Keys.ToHashSet();
                 graph.RootOperations = graph.Operations.Keys
-                    .Where(opCode => !allToOps.Contains(opCode))
+                    .Where(nodeKey => !allToOps.Contains(nodeKey))
                     .ToList();
 
                 routeGraphs[routeCode] = graph;
@@ -369,6 +532,48 @@ internal class PhaseOneConstraintBuilder
 
             context.RoutingGraphs[materialId] = routeGraphs;
         }
+    }
+
+    /// <summary>
+    /// 从候选节点中消解出唯一节点键：
+    ///   ① 唯一 → 直接取（跨 Stage 边的常规情形）；
+    ///   ② 多个（2号位 实测 117 物料同码跨 Stage）→ 用部门区分（部门是「物料×阶段」联合属性）；
+    ///   ③ 仍不唯一 → 返回 null，调用方计数丢弃，**不猜**。
+    /// 契约 <c>RoutingDependency</c> 无 StageCode 字段（只有单值 ProductionDepartmentId），
+    /// 故同码跨 Stage 时只能靠部门消解 —— 这是该契约下能做到的最强口径。
+    /// </summary>
+    private static OperationNodeKey? ResolveNodeKey(
+        IReadOnlyList<OperationNodeKey> candidates,
+        Func<OperationNodeKey, int> departmentOf,
+        int departmentId)
+    {
+        if (candidates.Count == 0)
+        {
+            return null; // 悬空：端点不在本上下文
+        }
+
+        if (candidates.Count == 1)
+        {
+            return candidates[0];
+        }
+
+        OperationNodeKey? byDepartment = null;
+        foreach (var key in candidates)
+        {
+            if (departmentOf(key) != departmentId)
+            {
+                continue;
+            }
+
+            if (byDepartment != null)
+            {
+                return null; // 部门也不唯一 ⇒ 歧义，不猜
+            }
+
+            byDepartment = key;
+        }
+
+        return byDepartment; // null = 无法消解
     }
 
     /// <summary>
@@ -412,14 +617,23 @@ internal class PhaseOneConstraintBuilder
 
         foreach (var link in links)
         {
+            // 0910 §二十 Case B：子件全库存 / 采购占位 → ProducerLogicalDemandKey = null
+            //（2号位 20260924 方案 (a) 落码：link 仍产，但无子件生产身份）。
+            // null 不进 DAG（不参与跨物料时序）；link 本身仍保留「父需求→子需求」真相。
+            // 显式判空（而非依赖 Contains(null)==false）：语义更清楚，且消除 CS8604。
+            var child = link.ProducerLogicalDemandKey;
+            if (child is null)
+            {
+                continue;
+            }
+
             // 只处理两端节点都在当前 Demand 集合内的 link（防御：忽略脏数据/域外引用）
-            if (!allDemandKeys.Contains(link.ProducerLogicalDemandKey) ||
+            if (!allDemandKeys.Contains(child) ||
                 !allDemandKeys.Contains(link.ConsumerLogicalDemandKey))
             {
                 continue;
             }
 
-            var child = link.ProducerLogicalDemandKey;
             var parent = link.ConsumerLogicalDemandKey;
 
             if (!childrenToParents.TryGetValue(child, out var parents))
@@ -517,11 +731,14 @@ internal class PhaseOneConstraintBuilder
         List<OperationResourceEligibility> eligibilities,
         ConstraintContext context)
     {
-        // 按 (MaterialId, RouteCode, OperationCode) → ResourceId 列表（按 Priority 排序）
+        // 按 EligibilityLookupKey(MaterialId, ProductionDepartmentId, RouteCode, OperationCode) → ResourceId 列表（按 Priority 排序）
         // P0-01修复：使用冻结接口 OperationResourceEligibility，不再使用旧的 ResourceEligibility
         // 第4轮C1修复：索引加入MaterialId，避免不同物料共享资源资格
+        // 0号位 2026-09-29 §5.3 落实：**补上 ProductionDepartmentId** —— 上游 lockedEligibilities 已按
+        //   四元组（含部门）过滤，故此处以同一四元组分组才是自洽口径；旧三元键会把两个部门的同名工序
+        //   资格合并成一份（跨部门串资源）。契约无 StageCode 字段，无法再细到 Stage（残留已在键类型上注明）。
         var eligibilityGroups = eligibilities
-            .GroupBy(e => $"{e.MaterialId}::{e.RouteCode}::{e.OperationCode}")
+            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.OperationCode))
             .ToDictionary(
                 g => g.Key,
                 g => g.OrderBy(e => e.Priority)
@@ -532,10 +749,10 @@ internal class PhaseOneConstraintBuilder
         context.OperationResourceEligibility = eligibilityGroups;
 
         // P0-04修复：同时构建 ResourceCapacityFactors 映射
-        // 第4轮C1修复：索引加入MaterialId
-        // (MaterialId::RouteCode::OperationCode, ResourceId) → CapacityFactor
+        // 第4轮C1修复：索引加入MaterialId；本次再补部门（同上）
+        // (EligibilityLookupKey, ResourceId) → CapacityFactor
         var capacityFactors = eligibilities
-            .GroupBy(e => $"{e.MaterialId}::{e.RouteCode}::{e.OperationCode}")
+            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.OperationCode))
             .ToDictionary(
                 g => g.Key,
                 g => g.ToDictionary(
@@ -671,6 +888,43 @@ internal class PhaseOneConstraintBuilder
 
         context.ResourceBlocks = blocksByResource;
     }
+
+    /// <summary>
+    /// P1-02 item1 接线（阶段一）：装载第⑦块冻结 Setup 换型规则 → 运行时 EXACT/DEFAULT 查找字典。
+    /// 数据链路（0号位 裁决项2）：RuleSetVersion 已发布规则 → 本 Run 一次性 FrozenStrategySnapshot.SetupTransitionRules
+    /// → 2号位 按 Domain（Dept+Stage）裁剪投影进 SolverStrategySnapshot（r13392）→ 此处经
+    /// SetupOptimizer.BuildRuleLookups 适配（EXACT/DEFAULT 按 RuleType 分流、无效行防御跳过、同键取第一条不随机）。
+    /// Solver 运行中不查 3号位 规则库；规则为空 = 无规则（三层命中按 0 分钟 + 追踪兜底）。
+    /// </summary>
+    private void BuildSetupTransitionRules(DomainSolveRequest request, ConstraintContext context)
+    {
+        var (exact, defaults) = SetupOptimizer.BuildRuleLookups(request.StrategySnapshot?.SetupTransitionRules);
+        context.SetupExactRules = exact;
+        context.SetupDefaultRules = defaults;
+    }
+
+    /// <summary>
+    /// M5 第一批：装载 RunScope 投影（Run 级交期覆盖 + Task 软目标）成内存词典。
+    /// 键体系已由 2号位 转为内存键（DueDateOverrides=LogicalDemandKey；TaskTargetOverrides=(DraftId, OperationCode)）。
+    /// null/空 RunScope = FULL 语义 → 两词典均空，现有行为零改变（向后兼容）。
+    /// </summary>
+    private void BuildRunScope(DomainSolveRequest request, ConstraintContext context)
+    {
+        var scope = request.RunScope;
+        if (scope == null) return;
+
+        foreach (var o in scope.DueDateOverrides)
+        {
+            if (!string.IsNullOrEmpty(o.LogicalDemandKey))
+                context.DueDateOverrides[o.LogicalDemandKey] = o.ManualTargetDueDate;
+        }
+
+        foreach (var t in scope.TaskTargetOverrides)
+        {
+            if (!string.IsNullOrEmpty(t.DraftId) && !string.IsNullOrEmpty(t.OperationCode))
+                context.TaskTargetOverrides[(t.DraftId, t.OperationCode)] = t.TargetTime;
+        }
+    }
 }
 
 /// <summary>
@@ -684,15 +938,31 @@ internal class ConstraintContext
     public Dictionary<int, Dictionary<string, RoutingGraph>> RoutingGraphs { get; set; } = new();
 
     /// <summary>
-    /// 工序资源资格：(MaterialId, RouteCode, OperationCode) → 合法 ResourceId 列表（按优先级排序）
+    /// 本次求解范围内的可达 Stage：MaterialId → StageCode 集合（Phase1 <c>BuildReachableStages</c> 产出）。
+    ///
+    /// 【为什么需要】0号位 2026-09-29 裁决 §十四第4项：无 Routing 的 Stage 要建纯内存时间节点。
+    ///   判定「哪些 Stage 在本需求范围内、但没有任何 RoutingOperation」必须用**本求解范围**，
+    ///   不能用全量 BOM StagePath —— 否则会把 StartOperation/StartStage 之前已完成、
+    ///   本次根本不求解的 Stage 也算进来，凭空多出提前期。
+    ///   （该集合原为 <c>BuildReachableStages</c> 的局部变量，P1-06 起只用于部门缺失判定；
+    ///   此处挂到 Context 上供 Phase5 复用，**语义不变、不改任何既有判定**。）
     /// </summary>
-    public Dictionary<string, List<int>> OperationResourceEligibility { get; set; } = new();
+    public Dictionary<int, HashSet<string>> EffectiveStages { get; set; } = new();
 
     /// <summary>
-    /// P0-04修复：工序资源产能系数映射：(RouteCode::OperationCode, ResourceId) → CapacityFactor
+    /// 工序资源资格：<see cref="EligibilityLookupKey"/> → 合法 ResourceId 列表（按优先级排序）。
+    /// ⚠ 旧键为字符串 <c>"{MaterialId}::{RouteCode}::{OperationCode}"</c> —— **缺部门维度**，
+    /// 会把「同物料同工序码但分属不同部门」的两套资格**合并成一份** ⇒ 跨部门串资源。
+    /// 现键补上 ProductionDepartmentId，与部门锁定谓词（<c>validOperationKeys</c>）同口径。
+    /// 残留：契约 <c>OperationResourceEligibility</c> 无 StageCode 字段，无法再细到 Stage（见 <see cref="EligibilityLookupKey"/> 注释）。
+    /// </summary>
+    public Dictionary<EligibilityLookupKey, List<int>> OperationResourceEligibility { get; set; } = new();
+
+    /// <summary>
+    /// P0-04修复：工序资源产能系数映射：(<see cref="EligibilityLookupKey"/>, ResourceId) → CapacityFactor
     /// 用于Duration计算：StandardDuration × PlannedProcessQty ÷ CapacityFactor
     /// </summary>
-    public Dictionary<string, Dictionary<int, decimal>> ResourceCapacityFactors { get; set; } = new();
+    public Dictionary<EligibilityLookupKey, Dictionary<int, decimal>> ResourceCapacityFactors { get; set; } = new();
 
     /// <summary>
     /// 资源编码映射：ResourceId → ResourceCode（源 ResourceDefinition.ResourceCode）。
@@ -706,6 +976,43 @@ internal class ConstraintContext
     /// 空编码（string.Empty）不纳入，避免无效键。
     /// </summary>
     public Dictionary<string, int> ResourceIdsByCode { get; set; } = new();
+
+    /// <summary>
+    /// Setup EXACT 换型规则（P1-02 item1 接线）：(当前工序, 当前设备, 前产品, 后产品) → 换型分钟。
+    /// 方向性键（A→B ≠ B→A）；源 = 第⑦块 SetupTransitionRules（2号位 按 Domain 裁剪投影，r13392）。
+    /// </summary>
+    public Dictionary<SetupOptimizer.SetupExactKey, decimal> SetupExactRules { get; set; } = new();
+
+    /// <summary>Setup DEFAULT 换型规则：(当前工序, 当前设备) → 默认换型分钟（同源；EXACT 未命中时第二优先）。</summary>
+    public Dictionary<SetupOptimizer.SetupDefaultKey, decimal> SetupDefaultRules { get; set; } = new();
+
+    /// <summary>
+    /// 资源级已排产品时间线（item1 接线阶段二）：FromMaterial = 时间邻接的上一 Task 产品。
+    /// Phase2 Schedule 入口以锁定继承 Task 重置种子，放置/移动/合并时与 resourceOccupancy 成对维护；
+    /// Phase4 兜底重跑 Schedule 时自动重置。
+    /// </summary>
+    public ResourceProductTimeline ProductTimeline { get; set; } = new();
+
+    /// <summary>
+    /// M5 第一批：Run 级交期覆盖 LogicalDemandKey → ManualTargetDueDate（OrderCanonicalId 已由 2号位 按需求展开，
+    /// 仅非空手工目标交期行投影；空 = 无覆盖）。Phase2/3/5 经 <see cref="EffectiveDue"/> 统一取「覆盖 ?? RequiredAvailableTime」。
+    /// </summary>
+    public Dictionary<string, DateTime> DueDateOverrides { get; set; } = new();
+
+    /// <summary>M5 第一批：Task 软目标 (DraftId=SourceDraftId, OperationCode) → TargetTime（软偏好，非硬约束，未达走决策说明）。</summary>
+    public Dictionary<(string DraftId, string OperationCode), DateTime> TaskTargetOverrides { get; set; } = new();
+
+    /// <summary>
+    /// B.2 求解过程追溯收集器：各阶段产出的「决策说明」（非排程结果，**不进 ReasonCode 体系** —— 0号位 Q4 裁决）。
+    /// Phase2/4 产出，Phase5 经 <c>DomainSolveResult.SolveTraceNotes</c> 导出，2号位 原样落库/透传。
+    /// 载体 = 2号位 r13494 落地的 <see cref="SolveTraceNote"/>；本收集器由 Phase 1 建立、贯穿 Phase 2–5。
+    /// 只承载「求解过程决策上下文」，不承载排程硬结果 —— 排程事实走 FinalTasks/ExplanationFacts。
+    /// </summary>
+    public List<SolveTraceNote> TraceNotes { get; set; } = new();
+
+    /// <summary>demand 的有效交期 = Run 级覆盖（ManualTargetDueDate）?? 正式 RequiredAvailableTime（M5 第一批统一换用点）。</summary>
+    public DateTime EffectiveDue(LogicalProductionDemand demand)
+        => DueDateOverrides.TryGetValue(demand.LogicalDemandKey, out var due) ? due : demand.RequiredAvailableTime;
 
     /// <summary>
     /// 资源日历：ResourceId → 可用时间窗列表（已排序）
@@ -737,6 +1044,19 @@ internal class ConstraintContext
     public HashSet<int> MissingDepartmentContextMaterialIds { get; set; } = new();
 
     /// <summary>
+    /// 0号位 2026-09-29 裁决 §5.3 落实（不静默）：同 (StageCode, OperationCode) 的 RoutingOperation 重复行计数。
+    /// 旧实现为静默覆盖（后者覆盖前者 ⇒ 边被错接、一道工序静默丢失）。保留首行 + 计数，供 Phase3 出诊断。
+    /// </summary>
+    public int DuplicateOperationNodeKeyCount { get; set; }
+
+    /// <summary>
+    /// 0号位 2026-09-29 裁决 §5.3 落实（不静默）：<c>RoutingDependency</c> 端点 Stage 归属**无法消解**的边计数。
+    /// 成因：契约 RoutingDependency 无 StageCode 字段，而该工序码在同物料内跨多个 Stage 且部门也无法区分
+    /// （2号位 实测 117 物料同码跨 Stage）。此类边被丢弃并计数，**不猜**（不静默塞给任一 Stage）。
+    /// </summary>
+    public int UnresolvedDependencyEdgeCount { get; set; }
+
+    /// <summary>
     /// 跨物料依赖（任务喂任务，方案A）：子先父后的有序 LogicalDemandKey 列表（已按层拍平）。
     /// 无跨物料 link 时等价于按 DemandSequence 平铺。
     /// </summary>
@@ -763,7 +1083,46 @@ internal class ConstraintContext
     /// 跨物料 BOM 依赖存在环（技术失败标记）。
     /// </summary>
     public bool CrossMaterialHasCycle { get; set; } = false;
+
+    /// <summary>
+    /// B-1（0号位 2026-09-29 裁决 §二）落实：StageSeq 全序链冲突的 MaterialId 集合。
+    ///
+    /// 判定口径（逐字对齐裁决 §2.1/§2.2）：唯一性范围 = **一个已解析好的具体 StageSequenceChain 内**，
+    /// 不是 Material 全局。同 StageCode 取最小 StageSeq 收敛后，**不同 StageCode 不得拥有相同 StageSeq**。
+    /// 出现即登记本集合 ⇒ 该物料的需求**不生成正式计划**（§2.3：不允许静默按数组顺序、不允许静默并行、
+    /// 必须输出明确 Issue）。下游 Reason = <c>STAGE_SEQUENCE_CONFLICT</c>。
+    /// </summary>
+    public HashSet<int> StageSequenceConflictMaterialIds { get; set; } = new();
 }
+
+/// <summary>
+/// 工序节点身份：**(StageCode, OperationCode)**。
+/// 依据：0号位 2026-09-29 裁决《Stage顺序、无Routing Stage、Operation标识与Task/MES粒度》§5.1/§5.2 逐字——
+/// 「OperationCode 不是全局唯一业务身份。同一个物料不同Stage可能出现相同OperationCode」
+/// 「在一个已经限定 Material / ProductionDepartment / Route / Path 的 Routing 图内部，最小节点键采用 (StageCode, OperationCode)」。
+/// 唯一性范围 = 单个已限定上下文的 Routing 图内部（**不是 Material 全局**）。
+/// ⚠ 禁止再退回 OperationCode 单键（裁决 §5.3 明文「不能出现 Phase1 用 (Stage,Operation)、Phase2 又退回 OperationCode 这种半升级」）。
+/// </summary>
+internal readonly record struct OperationNodeKey(string StageCode, string OperationCode)
+{
+    /// <summary>空安全构造：null 归一化为 string.Empty（与既有 2号位 口径「OperationCode 恒非空」一致）。</summary>
+    public static OperationNodeKey Of(string? stageCode, string? operationCode)
+        => new(stageCode ?? string.Empty, operationCode ?? string.Empty);
+
+    public override string ToString() => $"{StageCode}::{OperationCode}";
+}
+
+/// <summary>
+/// 工序资源资格 / 产能系数查找键：MaterialId + ProductionDepartmentId + RouteCode + OperationCode。
+/// ⚠ **结构上限**：契约 <c>OperationResourceEligibility</c>（`LPS.APS.Core/Entities/Aps/OperationResourceEligibility.cs`）
+/// **没有 StageCode 字段** —— 故该查找键**无法**携带 Stage 上下文（裁决 §5.2 的完整复合键在此不可达）。
+/// 本键相对旧实现的唯一可行动改进 = **补上 ProductionDepartmentId**（旧键连部门都没有，会把两个部门
+/// 同名工序的资源资格合并成一份 ⇒ 跨部门串资源）。部门维度是「物料×阶段」的联合属性，可作 Stage 的近似区分。
+/// **残留（数据模型限制，非 1号位 可修）**：同物料 + 同部门下若两个 Stage 出现同一 OperationCode，
+/// 其资格仍合并 —— 该情形由装载层诊断登记，1号位 不猜。
+/// </summary>
+internal readonly record struct EligibilityLookupKey(
+    int MaterialId, int ProductionDepartmentId, string RouteCode, string OperationCode);
 
 /// <summary>
 /// 工序依赖图（单个物料单条路径）
@@ -771,19 +1130,22 @@ internal class ConstraintContext
 internal class RoutingGraph
 {
     /// <summary>
-    /// 工序节点：OperationCode → 工序信息
+    /// 工序节点：(StageCode, OperationCode) → 工序信息。
+    /// 0号位 2026-09-29 裁决 §5.3：本字典为必须升维的三处之一（原为 OperationCode 单键 ⇒ 后者覆盖前者、
+    /// 边被错接、其中一道工序静默丢失；2号位 实测 117 物料受影响）。
     /// </summary>
-    public Dictionary<string, OperationNode> Operations { get; set; } = new();
+    public Dictionary<OperationNodeKey, OperationNode> Operations { get; set; } = new();
 
     /// <summary>
-    /// 依赖边：ToOperationCode → 前驱列表
+    /// 依赖边：To 节点 → 前驱列表。
+    /// 键与边的两端均为 <see cref="OperationNodeKey"/>，不再用 OperationCode 单键。
     /// </summary>
-    public Dictionary<string, List<DependencyEdge>> Dependencies { get; set; } = new();
+    public Dictionary<OperationNodeKey, List<DependencyEdge>> Dependencies { get; set; } = new();
 
     /// <summary>
     /// 根工序（无前驱的工序）
     /// </summary>
-    public List<string> RootOperations { get; set; } = new();
+    public List<OperationNodeKey> RootOperations { get; set; } = new();
 }
 
 /// <summary>
@@ -796,22 +1158,36 @@ internal class OperationNode
     public string ProcessType { get; set; } = string.Empty;
     public string? StageCode { get; set; }
     public decimal StandardDuration { get; set; }
-    public decimal SetupTime { get; set; }
+    // OperationPlanningMode 消费接线（0号位 20260922）：工序规划模式随 RoutingOperation 透传，
+    // Phase2 正排/倒排据此分型——FINITE_RESOURCE 走资源找槽；UNCONSTRAINED/WAIT_ONLY 跳过资源、
+    // 保留工艺时间走链（Task ResourceId=NULL）。DDL v5.1.8.2 定义，默认与 DDL DEFAULT 对齐。
+    public string OperationPlanningMode { get; set; } = "FINITE_RESOURCE";
+    // item1 接线（阶段二）：原 SetupTime 字段已删除——Setup 走 SetupTransitionRule 规则查找（v1.2 §1.2/§20.3），
+    // 工序节点不再携带静态换型值，防止误读。
     public decimal? TransferBatchSize { get; set; }
 
     // P1-08修复：工序节点补齐工艺路径编码与路径序号（源 RoutingOperation.RouteCode/PathId）。
     // 供 Phase2/Phase4 生成 FinalTaskDraft 时回填 RouteCode/PathId，不再留 null。
     public string RouteCode { get; set; } = "DEFAULT";
     public int PathId { get; set; } = 1;
+
+    // 0号位 2026-09-29 裁决 §5.2 落实：节点携带 ProductionDepartmentId，
+    // 供 (a) 资源资格/产能系数查找键 EligibilityLookupKey 补齐部门维度；
+    // (b) RoutingDependency 无 StageCode 字段时，用「工序码 + 部门」消解同名工序的归属歧义。
+    public int ProductionDepartmentId { get; set; }
 }
 
 /// <summary>
-/// 依赖边
+/// 依赖边。两端为 <see cref="OperationNodeKey"/>（含 Stage 上下文）。
+/// ⚠ 契约 <c>RoutingDependency</c>（`LPS.APS.Core/Entities/Aps/RoutingDependency.cs`）**只有
+/// From/To OperationCode 与单值 ProductionDepartmentId，没有 StageCode 字段** ⇒ 边的 Stage 归属
+/// 必须由 1号位 在 <c>BuildRoutingGraphs</c> 里从 RoutingOperation 反查消解；
+/// 消解不唯一时**登记 Issue 并丢弃该边，不猜**（0号位 2026-09-29 §5.3「禁止半升级」+ 不静默原则）。
 /// </summary>
 internal class DependencyEdge
 {
-    public string FromOperationCode { get; set; } = string.Empty;
-    public string ToOperationCode { get; set; } = string.Empty;
+    public OperationNodeKey From { get; set; }
+    public OperationNodeKey To { get; set; }
     public string DependencyType { get; set; } = "ES";
     public decimal LagTime { get; set; }
 }

@@ -36,6 +36,7 @@ public class OrderQueryRepository : IOrderQueryRepository
 SELECT
     o.Id,
     o.PlanVersionId,
+    o.OrderCanonicalId,
     o.OrderNo,
     o.OrderType,
     o.MaterialCode,
@@ -104,6 +105,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 SELECT
     o.Id,
     o.PlanVersionId,
+    o.OrderCanonicalId,
     o.OrderNo,
     o.OrderType,
     o.MaterialCode,

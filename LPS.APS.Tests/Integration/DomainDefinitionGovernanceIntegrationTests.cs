@@ -40,7 +40,7 @@ public class DomainDefinitionGovernanceIntegrationTests : IDisposable
 
     public DomainDefinitionGovernanceIntegrationTests()
     {
-        _uniqueSuffix = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}"[..30];
+        _uniqueSuffix = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}".ToUpperInvariant()[..30];
 
         _cm = TestEnvironment.GetConnectionManager();
         var loggerFactory = LoggerFactory.Create(builder => { });
@@ -198,7 +198,7 @@ public class DomainDefinitionGovernanceIntegrationTests : IDisposable
         (await actFamilyWithFactory.Should().ThrowAsync<InvalidOperationException>()).WithMessage("*不得指定 FactoryId*");
 
         // 产品族不存在 → 拒绝
-        var badFamily = BuildFamilyInput("badfamily");
+        var badFamily = BuildFamilyInput("BADFAMILY");
         badFamily.ProductFamilyId = 999999999;
         Func<Task> actBadFamily = () => _service.CreateAsync(badFamily, 1, _uniqueSuffix);
         (await actBadFamily.Should().ThrowAsync<InvalidOperationException>()).WithMessage("*产品族不存在*");
@@ -227,7 +227,7 @@ public class DomainDefinitionGovernanceIntegrationTests : IDisposable
         _createdDomainIds.Add(created.Id);
 
         // 变更 DomainKey → 拒绝
-        var changedKey = BuildFamilyInput("changed");
+        var changedKey = BuildFamilyInput("CHANGED");
         Func<Task> act = () => _service.UpdateAsync(created.Id, changedKey, 1, _uniqueSuffix);
         (await act.Should().ThrowAsync<InvalidOperationException>()).WithMessage("*不可变更*");
 

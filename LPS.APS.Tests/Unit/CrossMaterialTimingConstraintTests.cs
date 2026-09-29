@@ -208,7 +208,16 @@ public class CrossMaterialTimingConstraintTests
     public async Task Forward_SoftBoundary_SchedulesPastPlanningEnd()
     {
         // 静态到货晚于 PlanningEnd，日历已延长；旧代码会在 PlanningEnd 截断导致 Unscheduled，
-        // 软边界（0号位：无末期限制）后正排应排到 PlanningEnd 之后。
+        // 软边界（0号位 2026-09-12 裁决：无末期限制）后正排应排到 PlanningEnd 之后。
+        //
+        // ⚠ 生产生效前提（2026-09-24 复核，据 2号位 回执 §六）：
+        //   本用例靠 calendarExtension 让日历覆盖到 PlanningEnd 之后。生产侧该覆盖**已不再**由
+        //   「合成 7×24 日历」提供 —— 0号位 2026-09-23 S4 裁决「无日历 = 不可用」后，2号位 合成日历
+        //   路径已下线，改为真实 ResourceCalendarSlot 装载，覆盖能力转 **5号位 真实日历铺天数**
+        //   （需 ≥ PlanHorizonEnd + 180 天）。
+        //   铺天数不足时：本用例语义在生产不可达，正常表现是该需求落 Unscheduled ——
+        //   该「无日历 → 不可用、不产 Task」语义已由
+        //   PhaseTwoOperationPlanningModeTests.人工槽无日历_不可用不产Task 锁定。
         var planningEnd = new DateTime(2026, 9, 10);
         var materialReady = new DateTime(2026, 9, 15); // > planningEnd
         var request = Build(

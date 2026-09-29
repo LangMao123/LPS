@@ -92,7 +92,16 @@ public class P0RegressionTests
         }
 
         var request = Build(demands, ops, deps, els, resources, allowSplit: false,
-            candidate: new CandidateContext { BasePlanVersionId = 1, ChangeSeedKeys = new[] { "D1" } });
+            candidate: new CandidateContext { BasePlanVersionId = 1, ChangeSeedKeys = new[] { "D1" } },
+            // item1 接线后 Setup 走规则：RoutingOperation.SetupTime=30 故意保留——若代码仍读旧字段，
+            // OP10（初始设备状态应为 0）会带 30 分钟 Setup 越出日历起点 8:00，下方不变量断言即抓到。
+            // OP20 前产品=物料1（同产品）→ EXACT A→A 显式规则 30 分钟（v1.2 §六 允许覆盖默认 0）。
+            setupRules: new[]
+            {
+                new SetupTransitionRuleSnapshot { ProductionDepartmentId = 100, StageCode = "STAGE1",
+                    OperationCode = "OP20", ResourceId = 1, FromMaterialId = 1, ToMaterialId = 1,
+                    RuleType = "EXACT", SetupMinutes = 30m }
+            });
 
         var result = await _solver.SolveAsync(request);
 
@@ -354,7 +363,8 @@ public class P0RegressionTests
         IReadOnlyList<ResourceDefinition> resources,
         bool allowSplit,
         bool allowMerge = false,
-        CandidateContext? candidate = null)
+        CandidateContext? candidate = null,
+        IReadOnlyList<SetupTransitionRuleSnapshot>? setupRules = null)
     {
         // 资源日历槽由测试方法内联在 Res(...) 定义 → 这里统一收集
         var calendarSlots = CalendarRegistry.ToList();
@@ -407,7 +417,8 @@ public class P0RegressionTests
                     SchedulingDirection = "FORWARD",
                     AllowMerge = allowMerge,
                     AllowSplit = allowSplit
-                }
+                },
+                SetupTransitionRules = setupRules ?? Array.Empty<SetupTransitionRuleSnapshot>()
             }
         };
     }

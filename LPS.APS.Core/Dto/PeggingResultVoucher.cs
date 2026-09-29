@@ -56,6 +56,25 @@ public class PeggingResult
     public long NextAllocationSequence { get; set; } = 1;
 
     /// <summary>
+    /// **需求物料 → 供给阈值 Stage** 映射（`RequiredStageCode` 的物料级真值）。
+    ///
+    /// 来源 = 本次 BOM 边的 `ChildRequiredStageCode`（主源）→ StagePath `EDGE + IsSupplyThreshold=1`（兜底），
+    /// 由 `PeggingOrchestrator.FillRequiredStageCodesAsync` **一次算好、两个消费者共用**：
+    ///   ① 运行输入 `LogicalProductionDemand.RequiredStageCode`（Solver 消费）；
+    ///   ② 追溯列 `PeggingSupplyAllocation.NextRequiredStageCode`（PM 2026-09-28
+    ///      《Stage、生产部门、Routing、Dependency、StageLeadTimeParam 接口裁决回复》§十一 第二处保留）。
+    ///
+    /// **为何必须按物料直查、而不能走 `LogicalProductionDemand.DemandKey` 中转**：
+    ///   `LogicalProductionDemand` **只为「有生产缺口」的需求生成**，纯供给承接（库存/在途直接接走）的需求
+    ///   根本不在其中 ⇒ 走 DemandKey 关联必然漏掉大部分承接行（实测 PlanVersionId=540：1,205 行只填出 40 行，
+    ///   而 BOM 侧有 30,652 个物料带阈值——缺的是取值路径，不是数据）。
+    ///
+    /// 注：`SupplyAllocationItem` 无需求物料字段，但 `ValidateEligibility` 红线1 保证
+    ///   `supply.MaterialId == demand.MaterialId` ⇒ 本映射可直接用落库行的 `MaterialId` 命中，无需扩 DTO。
+    /// </summary>
+    public Dictionary<int, string> RequiredStageByMaterialId { get; set; } = new();
+
+    /// <summary>
     /// 是否完全满足（true = 供应充足，false = 供应短缺）
     /// </summary>
     public bool IsFullyAllocated { get; set; }

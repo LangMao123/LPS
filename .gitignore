@@ -46,6 +46,10 @@ settings.json.claude
 *.pptx
 *.pdf
 
+# ===== 数据清单文件（CSV/TSV 证据导出，不入版本控制）=====
+*.csv
+*.tsv
+
 # ===== 日志文件 =====
 logs/
 *.log
@@ -72,3 +76,10 @@ Desktop.ini
 
 *.md
 !/README.md
+
+# ===== 前端工程（独立工程，含 dist-pro/stats.html 构建产物，不入本库）=====
+LPS.APS.Front/
+
+# ===== 本地临时草稿（SQL 定义 dump / 临时脚本，不入版本控制）=====
+.tmp_*
+_*.txt

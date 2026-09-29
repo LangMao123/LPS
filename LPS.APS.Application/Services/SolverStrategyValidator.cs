@@ -28,6 +28,7 @@ public sealed class SolverStrategyValidator
         ValidateSplit(block, errors);
         ValidateStageOverlap(block, errors);
         ValidateBottleneckUtilizationThresholds(block, errors);
+        ValidateSetupBudget(block, errors);
 
         return new ValidationResult(errors.Count == 0, errors, warnings);
     }
@@ -94,6 +95,20 @@ public sealed class SolverStrategyValidator
         if (block.CapacityShortageUtilizationThreshold is <= 0 or > 1)
         {
             errors.Add($"CapacityShortageUtilizationThreshold 必须是 (0,1] 比例（当前：{block.CapacityShortageUtilizationThreshold}）");
+        }
+    }
+
+    /// <summary>三预算参数（1号位 2026-09-20 提值）：有界搜索预算 [100,5000]、最大邻域尝试次数 [10,500]，均为正整数（次数量纲）</summary>
+    private static void ValidateSetupBudget(SolverStrategyBlock block, List<string> errors)
+    {
+        if (block.Setup.SetupSearchBudget is < 100 or > 5000)
+        {
+            errors.Add($"Setup.SetupSearchBudget 必须在 [100, 5000] 之间（当前：{block.Setup.SetupSearchBudget}）");
+        }
+
+        if (block.Setup.SetupMaxNeighborhoodTries is < 10 or > 500)
+        {
+            errors.Add($"Setup.SetupMaxNeighborhoodTries 必须在 [10, 500] 之间（当前：{block.Setup.SetupMaxNeighborhoodTries}）");
         }
     }
 }

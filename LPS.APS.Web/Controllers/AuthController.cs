@@ -39,7 +39,11 @@ public class AuthController : ControllerBase
         if (string.IsNullOrWhiteSpace(request.UserCode) || string.IsNullOrWhiteSpace(request.Password))
             return ApiResponse<LoginResponseDto>.Fail(400, "用户名和密码不能为空");
 
-        var result = await _authService.LoginAsync(request.UserCode, request.Password);
+        // 登录审计上下文：IP / UA 由控制器从 HttpContext 读取后传入，AuthService 不直接依赖 HTTP
+        var clientIp = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var userAgent = Request.Headers.UserAgent.ToString();
+
+        var result = await _authService.LoginAsync(request.UserCode, request.Password, clientIp, userAgent);
 
         if (!result.IsSuccess)
             return ApiResponse<LoginResponseDto>.Fail(401, result.ErrorMessage ?? "登录失败");
@@ -91,10 +95,14 @@ public class AuthController : ControllerBase
     public async Task<ApiResponse> Logout()
     {
         var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-        if (int.TryParse(userIdClaim, out var userId))
-        {
-            await _authService.LogoutAsync(userId);
-        }
+        if (!int.TryParse(userIdClaim, out var userId))
+            return ApiResponse.Fail(401, "无法解析当前登录用户身份");
+
+        // 登出审计上下文：userCode 取自 JWT 声明，IP/UA 取自 HttpContext，均转发给 AuthService
+        var userCode = User.FindFirst(ClaimTypes.Name)?.Value;
+        var clientIp = HttpContext.Connection.RemoteIpAddress?.ToString();
+        var userAgent = Request.Headers.UserAgent.ToString();
+        await _authService.LogoutAsync(userId, userCode, clientIp, userAgent);
 
         return ApiResponse.Ok("登出成功");
     }

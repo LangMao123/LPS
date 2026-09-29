@@ -1,4 +1,5 @@
 using FluentAssertions;
+using LPS.APS.Application.Models;
 using LPS.APS.Application.Services;
 using LPS.APS.Core.Entities.APS;
 using Xunit;
@@ -108,6 +109,42 @@ public class SetupTransitionRuleConflictValidatorTests
         };
 
         var result = _validator.Validate(rules);
+
+        result.IsValid.Should().BeTrue(result.GetErrorMessage());
+    }
+
+    [Fact]
+    public void E4_子块承载_EXACT同键重复_经ExtractRules校验拒绝()
+    {
+        // S-9：子块承载 → ExtractRules 反序列化 → 校验器整链（重构 S-1/S-2 承载改道后校验输入源=子块）
+        var rules = new[]
+        {
+            Exact(1, "SMT", "OP10", 100, 1, 2),
+            Exact(1, "SMT", "OP10", 100, 1, 2),
+        };
+        var json = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            [SetupTransitionRuleProjector.SetupTransitionRulesBlockName] = rules
+        });
+
+        var fromBlock = SetupTransitionRuleProjector.ExtractRules(json);
+
+        var result = _validator.Validate(fromBlock);
+
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().Contain(e => e.Contains("EXACT"));
+    }
+
+    [Fact]
+    public void E4_子块承载_空子块_校验通过()
+    {
+        // S-9：子块承载空列表 → 校验通过（无规则 => 运行时 Setup 兜底 0 分钟）
+        var json = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            [SetupTransitionRuleProjector.SetupTransitionRulesBlockName] = new List<SetupTransitionRule>()
+        });
+
+        var result = _validator.Validate(SetupTransitionRuleProjector.ExtractRules(json));
 
         result.IsValid.Should().BeTrue(result.GetErrorMessage());
     }

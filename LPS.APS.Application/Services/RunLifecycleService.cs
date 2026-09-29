@@ -1,5 +1,6 @@
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
+using LPS.APS.Core.DTOs.Scope;
 using LPS.APS.Core.Enum;
 using LPS.APS.Core.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -80,6 +81,7 @@ public class RunLifecycleService : IRunLifecycleService
     private readonly IAuditLogRepository _auditLogRepository;
     private readonly IDataScopeService _dataScopeService;
     private readonly ISchedulingOrchestrator _schedulingOrchestrator;
+    private readonly IScheduleRunService _scheduleRunService;
     private readonly ILogger<RunLifecycleService> _logger;
 
     public RunLifecycleService(
@@ -91,6 +93,7 @@ public class RunLifecycleService : IRunLifecycleService
         IAuditLogRepository auditLogRepository,
         IDataScopeService dataScopeService,
         ISchedulingOrchestrator schedulingOrchestrator,
+        IScheduleRunService scheduleRunService,
         ILogger<RunLifecycleService> logger)
     {
         _scheduleRunRepo = scheduleRunRepo;
@@ -101,6 +104,7 @@ public class RunLifecycleService : IRunLifecycleService
         _auditLogRepository = auditLogRepository;
         _dataScopeService = dataScopeService;
         _schedulingOrchestrator = schedulingOrchestrator;
+        _scheduleRunService = scheduleRunService;
         _logger = logger;
     }
 
@@ -348,7 +352,10 @@ public class RunLifecycleService : IRunLifecycleService
         }
     }
 
-    /// <summary>FAILED 恢复（P0-08）：为 FAILED ScheduleRun 新建一条 RUNNING 重跑，继承策略包版本与 Domain 基线；绝不动旧记录</summary>
+    /// <summary>
+    /// FAILED 恢复（P0-08 + P1-03）：为 FAILED FULL_SCHEDULE Run 新建一条 RUNNING 重跑，同一事务为每个预期 Domain
+    /// 各建一个 RECOVERY 壳（一域一壳），随后内联全量执行并一次性收口；继承策略包版本与 Domain 基线；绝不动旧记录。
+    /// </summary>
     public async Task<int> RecoverFailedRunAsync(int failedScheduleRunId, int actorUserId, CancellationToken ct = default)
     {
         var failed = await _scheduleRunRepo.GetByIdAsync(failedScheduleRunId, ct)
@@ -359,13 +366,37 @@ public class RunLifecycleService : IRunLifecycleService
             throw new InvalidOperationException($"ScheduleRun {failedScheduleRunId} 状态为 {failed.Status}，仅 FAILED 可恢复（旧记录不可回改 RUNNING）");
         }
 
+        // P1-03 §5.1：仅 FULL_SCHEDULE 可恢复。非 FULL（候选/局部重排）恢复会丢 BasePlanVersionId 基线
+        //（恢复 INSERT 不继承该列），需求侧订单不钉基线、退化为按本 PV 装，恢复语义不正确。fail-closed 拒绝。
+        if (failed.RunType != FullScheduleRunType)
+        {
+            throw new InvalidOperationException(
+                $"ScheduleRun {failedScheduleRunId} 的 RunType 为 {failed.RunType}，仅 {FullScheduleRunType} 可恢复（非全量运行无法继承 Base 基线）");
+        }
+
         // 新建前先校验继承基线合法性（避免插入后再因基线不合法产生孤立 RUNNING 记录）
         ValidateDomainKeys(failed.RunType, failed.ExpectedDomainKeysJson, $"ScheduleRun {failedScheduleRunId} 继承基线");
 
         // B3：业务范围硬校验（F-G4 Domain 维度）—— 恢复人仅可操作其授权 Domain 的 Run（fail-closed）
-        await EnsureDomainsInScopeAsync(actorUserId, ParseExpectedDomainKeys(failed.ExpectedDomainKeysJson, failedScheduleRunId), ct);
+        var domainKeys = ParseExpectedDomainKeys(failed.ExpectedDomainKeysJson, failedScheduleRunId);
+        await EnsureDomainsInScopeAsync(actorUserId, domainKeys, ct);
 
-        var newRunId = await _scheduleRunRepo.InsertForRecoveryAsync(failed, "Recover", ct);
+        // P1-03 §3.2/§3.3：一域一壳（N 个），窗口继承失败 Run 既有 PlanVersion，缺失兜底今天 ~ +90 天（不得静默平移）。
+        var failedPlanVersions = await _planVersionRepo.GetByScheduleRunIdAsync(failedScheduleRunId, ct);
+        var shells = new List<RecoveryShellSpec>(domainKeys.Count);
+        foreach (var domainKey in domainKeys)
+        {
+            var pv = failedPlanVersions.FirstOrDefault(p => string.Equals(p.DomainKey, domainKey, StringComparison.Ordinal));
+            shells.Add(new RecoveryShellSpec
+            {
+                DomainKey = domainKey,
+                PlanHorizonStart = pv is not null && pv.PlanHorizonStart != default ? pv.PlanHorizonStart : DateTime.Today,
+                PlanHorizonEnd = pv is not null && pv.PlanHorizonEnd != default ? pv.PlanHorizonEnd : DateTime.Today.AddDays(90),
+            });
+        }
+
+        // 同一事务原子写 Run + N 壳（任一失败整体回滚，不产生孤立 RUNNING）
+        var newRunId = await _scheduleRunRepo.InsertForRecoveryWithShellsAsync(failed, shells, "Recover", ct);
 
         await _auditLogRepository.AddAsync(new AuditLog
         {
@@ -376,8 +407,20 @@ public class RunLifecycleService : IRunLifecycleService
             NewValue = ScheduleRunRunningStatus,
             UserId = actorUserId,
             OccurredAt = DateTime.UtcNow,
-            Remark = $"由 FAILED 运行 {failedScheduleRunId} 恢复，新建 RUNNING 运行 {newRunId}（继承 StrategyProfileVersionId 与 ExpectedDomainKeysJson 基线）",
+            Remark = $"由 FAILED 运行 {failedScheduleRunId} 恢复，新建 RUNNING 运行 {newRunId}（一域一壳 {shells.Count} 个，继承 StrategyProfileVersionId 与 ExpectedDomainKeysJson 基线）",
         }, ct);
+
+        // P1-03 §2：内联全量执行并一次性收口（与候选路径一致，恢复 = 交互式立即重算）。
+        // 注意超时预算：多域耗时 ≈ N × 单域（FULL 单域 ≈ 5.4 分钟），端点须放宽超时；排队/巡检兜底另行立项（发令枪/巡检在 2号位侧）。
+        var runResult = await _schedulingOrchestrator.ExecuteRunAsync(newRunId, ct);
+        if (!runResult.IsSuccess)
+        {
+            // ExecuteRunAsync 不抛业务异常，失败以返回结果表达（Run 已收口 PARTIAL_SUCCESS / FAILED）；
+            // 此处仅记录，供运维/追溯定位，不改变 Run 终态。
+            _logger.LogWarning(
+                "FAILED 恢复执行未全部成功：NewRunId={NewRunId} IsSuccess={IsSuccess} ScheduledCount={ScheduledCount} Error={Error}",
+                newRunId, runResult.IsSuccess, runResult.ScheduledCount, runResult.ErrorMessage);
+        }
 
         return newRunId;
     }
@@ -412,6 +455,18 @@ public class RunLifecycleService : IRunLifecycleService
         {
             throw new InvalidOperationException(
                 $"RunType={spec.RunType} 的用途 {spec.Purpose} 不在冻结合法组合（{string.Join("/", legalPurposes)}），拒绝创建（实施包 §十九）");
+        }
+
+        // 3a. ScopeJsonV2 范围载荷校验（M1：八码映射 + PriorityMode 轴 + 单一真相；GANTT/EQUIPMENT/RESOURCE_CALENDAR + EXPEDITE 拒绝）
+        ScopeJsonV2Validator.Validate(spec.Scope, spec.RunType, spec.Purpose);
+
+        // 3a'. BusinessScope 装配（真空④契约定案 §三/§四：3号位 生成权）。
+        // 服务端权威解析 actor 业务范围（经 IDataScopeService.ResolveScopeAsync），依 Trigger 判定维度装配进 ScopeJsonV2，
+        // **覆盖** 前端/调用方可能自传的 BusinessScope 值（范围=授权边界，不得由调用方自定）。
+        // 中断级（EQUIPMENT_FAILURE / RESOURCE_CALENDAR_CHANGE）= Global；订单类=ProductFamily；Task 局部=ResourceOrgGroup（DataScopeTypes 常量）。
+        if (spec.Scope is not null)
+        {
+            spec.Scope.BusinessScope = await BuildBusinessScopeAsync(actorUserId, spec.Scope.Trigger, ct);
         }
 
         // 4. DomainKey 必填（白天候选严格单 Domain）
@@ -484,6 +539,7 @@ public class RunLifecycleService : IRunLifecycleService
             DomainKey = spec.DomainKey,
             BasePlanVersionId = spec.BasePlanVersionId ?? baseVersion.Id,
             DataCutoffTime = spec.DataCutoffTime,
+            Scope = spec.Scope,
             Actor = spec.Actor,
             PlanHorizonStart = baseVersion.PlanHorizonStart != default ? baseVersion.PlanHorizonStart : DateTime.Today,
             PlanHorizonEnd = baseVersion.PlanHorizonEnd != default ? baseVersion.PlanHorizonEnd : DateTime.Today.AddDays(90),
@@ -510,10 +566,59 @@ public class RunLifecycleService : IRunLifecycleService
 
         // 10. 触发接缝（P1-02）：建 Run + 候选壳后正式接通 3→2 Application Service 契约，
         //     调 2号位 RunSchedulingAndFinalizeAsync 执行并收口 Run（RUNNING → COMPLETED / FAILED）。
-        await _schedulingOrchestrator.RunSchedulingAndFinalizeAsync(
-            result.NewPlanVersionId, result.NewScheduleRunId, strategyProfileVersionId, ct);
+        // P1-03 §5.4 兜底：同步耗时（单域≈5.4min）期间应用池回收/发版/OOM/客户端断连 → 异常直接穿出、
+        //     Run 永久卡 RUNNING（发令枪只领 FULL_SCHEDULE、恢复端点只收 FAILED，两条路都接不着）。
+        //     此处落 FAILED 即被既有恢复通道接住。用无取消令牌绕过已取消的请求 ct（客户端断连也能落库）。
+        try
+        {
+            await _schedulingOrchestrator.RunSchedulingAndFinalizeAsync(
+                result.NewPlanVersionId, result.NewScheduleRunId, strategyProfileVersionId, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "候选运行执行中断，落 FAILED 供恢复：ScheduleRunId={RunId} PlanVersionId={PlanVersionId}",
+                result.NewScheduleRunId, result.NewPlanVersionId);
+            await _scheduleRunService.FailAsync(result.NewScheduleRunId, 0, ex.Message, CancellationToken.None);
+            throw;
+        }
 
         return result;
+    }
+
+    /// <summary>
+    /// 装配 BusinessScopeDto（真空④契约定案 §1.3 维度映射，3号位 生成权）。
+    /// 经 <see cref="IDataScopeService.ResolveScopeAsync"/> 解析 actor 有效业务范围，依 Trigger 判定操作类型维度：
+    /// 订单类（NEW_ORDER_CTP / NEW_ORDER_IMPACT / NEW_ORDER_INSERT / EXISTING_ORDER_ADVANCE）= ProductFamily（产品族 PMC）；
+    /// Task 局部（GANTT_ADJUSTMENT / DOMAIN_MANUAL_RESCHEDULE）= ResourceOrgGroup（一般计划员）；
+    /// 中断级（EQUIPMENT_FAILURE / RESOURCE_CALENDAR_CHANGE）= Global（不涉用户业务范围）。
+    /// Global 放行 → IsGlobal=true；全局范围扩展解析出的维度键集合 → ScopeType/ScopeValues（业务键字符串，与 EnsureInScopeAsync 的 value 同口径）；
+    /// 无任何授权（DataScopeContext.Empty）→ IsGlobal=false + 空集（按无授权 fail-safe，交 1号位 范围不足返回）。
+    /// </summary>
+    private async Task<BusinessScopeDto> BuildBusinessScopeAsync(int actorUserId, BusinessTriggerType trigger, CancellationToken ct)
+    {
+        var scopeType = trigger switch
+        {
+            BusinessTriggerType.NewOrderCtp or BusinessTriggerType.NewOrderImpact
+                or BusinessTriggerType.NewOrderInsert or BusinessTriggerType.ExistingOrderAdvance => DataScopeTypes.ProductFamily,
+            BusinessTriggerType.GanttAdjustment or BusinessTriggerType.DomainManualReschedule => DataScopeTypes.ResourceOrgGroup,
+            _ => DataScopeTypes.Global,
+        };
+
+        var ctx = await _dataScopeService.ResolveScopeAsync(actorUserId, ct);
+
+        if (scopeType == DataScopeTypes.Global || ctx.IsGlobal)
+        {
+            return new BusinessScopeDto { IsGlobal = true, ScopeType = scopeType };
+        }
+
+        var values = ctx.GetValues(scopeType);
+        return new BusinessScopeDto
+        {
+            IsGlobal = false,
+            ScopeType = scopeType,
+            ScopeValues = values is null ? Array.Empty<string>() : values.ToArray(),
+        };
     }
 
     /// <summary>Run 引用追溯（P0-08）：ScheduleRun → 策略包版本 → 规则集/参数集版本 + 关联 PlanVersion 状态与结果</summary>

@@ -106,70 +106,95 @@ public sealed class BomExplosionService : IBomExplosionService
         ArgumentNullException.ThrowIfNull(structure);
         ArgumentNullException.ThrowIfNull(root);
 
-        var codeById = new Dictionary<int, string>();
-        var levelById = new Dictionary<int, int>();
-        var isPurchasedById = new Dictionary<int, bool>();
-        var parentEdgesById = new Dictionary<int, Dictionary<int, BomParentEdge>>();
+        // 两段式（LLC 自底向上记忆化）：把旧「路径级 visited」导致的共享子件整棵子树重走
+        // （12× 重复展开）压成每物料子件只枚举一次，且最深层（LLC）不受展开顺序影响。
+        //
+        // 阶段① 结构发现：expanded 记忆化「该物料子件已完整枚举」，onPath 只拦真实环
+        // back-edge（A→B→A 的 B→A 不记父边、不抬层）；父边按 child 累加全集。
+        // 阶段② 最深层（LLC 语义）：不再随 DFS 路径抬 level，而是对①产出的 DAG 做单源
+        // 最长路径拓扑弛豫——天然排除被截断的环边，且共享子件更深路径自动下推到子件。
+        // 两段均 O(节点 + 边)。
 
-        // 路径级环检测（与 ExplodeOrder 同语义）：A→B→A 时，B 内回到 A 被截断，A 不记环边、不抬 level（仍是 root level 0）。
-        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var idByCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        var isPurchasedByCode = new Dictionary<string, bool>(StringComparer.Ordinal);
+        var parentEdgesByCode = new Dictionary<string, Dictionary<int, BomParentEdge>>(StringComparer.Ordinal);
 
-        Walk(root.RootMaterialId, root.RootMaterialCode, level: 0, parentMaterialId: 0, parentMaterialCode: "", qtyPerUnit: 0m);
+        var expanded = new HashSet<string>(StringComparer.Ordinal); // 子件已完整枚举（记忆化）
+        var onPath = new HashSet<string>(StringComparer.Ordinal);   // 当前 DFS 路径（拦真实环）
 
-        return levelById
+        Discover(root.RootMaterialCode, root.RootMaterialId, parentCode: "", parentId: 0, qtyPerUnit: 0m);
+
+        // 阶段② 最深层（LLC）拓扑弛豫：level[child] = max(level[parent] + 1)。
+        var levelByCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var code in idByCode.Keys) levelByCode[code] = 0;
+
+        // child → 未处理父件数；parent → 子件列表（均只含①已记的边，环边已被①排除）。
+        var remainingParents = new Dictionary<string, int>(StringComparer.Ordinal);
+        var childrenByParent = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var (child, edgeMap) in parentEdgesByCode)
+        {
+            remainingParents[child] = edgeMap.Count;
+            foreach (var edge in edgeMap.Values)
+            {
+                if (!childrenByParent.TryGetValue(edge.ParentMaterialCode, out var list))
+                    childrenByParent[edge.ParentMaterialCode] = list = new List<string>();
+                list.Add(child);
+            }
+        }
+
+        var queue = new Queue<string>(idByCode.Keys.Where(c => !remainingParents.ContainsKey(c)));
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (!childrenByParent.TryGetValue(cur, out var children)) continue;
+
+            foreach (var child in children)
+            {
+                var candidate = levelByCode[cur] + 1;
+                if (candidate > levelByCode[child]) levelByCode[child] = candidate;
+                if (--remainingParents[child] == 0) queue.Enqueue(child);
+            }
+        }
+
+        return levelByCode
             .Select(kv => new BomLevelNode(
-                MaterialId: kv.Key,
-                MaterialCode: codeById[kv.Key],
+                MaterialId: idByCode[kv.Key],
+                MaterialCode: kv.Key,
                 FactoryId: root.FactoryId,
                 Level: kv.Value,
-                IsPurchased: isPurchasedById[kv.Key],
-                ParentEdges: parentEdgesById.TryGetValue(kv.Key, out var edgeMap)
+                IsPurchased: isPurchasedByCode[kv.Key],
+                ParentEdges: parentEdgesByCode.TryGetValue(kv.Key, out var edgeMap)
                     ? (IReadOnlyList<BomParentEdge>)edgeMap.Values.OrderBy(e => e.ParentMaterialId).ToList()
                     : Array.Empty<BomParentEdge>()))
             .OrderBy(n => n.Level)
             .ThenBy(n => n.MaterialCode, StringComparer.Ordinal)
             .ToList();
 
-        void Register(int materialId, string materialCode, int level, int parentMaterialId, string parentMaterialCode, decimal qtyPerUnit)
+        void Discover(string code, int id, string parentCode, int parentId, decimal qtyPerUnit)
         {
-            codeById[materialId] = materialCode;
-            isPurchasedById[materialId] =
-                structure.IsPurchasedByMaterial.TryGetValue(materialCode, out var purchased) && purchased;
+            if (onPath.Contains(code)) return; // 真实环 back-edge：不记父边、不展开、不抬层
 
-            // 最深出现层（LLC 语义）：取 max，保证该物料的所有父件均已在其更浅层先被处理。
-            if (!levelById.TryGetValue(materialId, out var prev) || level > prev)
-                levelById[materialId] = level;
-
-            // 父边去重（同一父件对同一子件只一条 BOM 边）；root（parent=0）不记父边。
-            if (parentMaterialId != 0)
+            // 父边去重（同一父件对同一子件只一条 BOM 边）；root（parentId=0）不记父边。
+            if (parentId != 0)
             {
-                if (!parentEdgesById.TryGetValue(materialId, out var edgeMap))
-                {
-                    edgeMap = new Dictionary<int, BomParentEdge>();
-                    parentEdgesById[materialId] = edgeMap;
-                }
-                if (!edgeMap.ContainsKey(parentMaterialId))
-                    edgeMap[parentMaterialId] = new BomParentEdge(parentMaterialId, parentMaterialCode, qtyPerUnit);
+                if (!parentEdgesByCode.TryGetValue(code, out var edgeMap))
+                    parentEdgesByCode[code] = edgeMap = new Dictionary<int, BomParentEdge>();
+                if (!edgeMap.ContainsKey(parentId))
+                    edgeMap[parentId] = new BomParentEdge(parentId, parentCode, qtyPerUnit);
             }
-        }
 
-        void Walk(int materialId, string materialCode, int level, int parentMaterialId, string parentMaterialCode, decimal qtyPerUnit)
-        {
-            if (!visited.Add(materialCode)) return; // 真实环二次进入：不登记、不抬 level
+            if (expanded.Contains(code)) return; // 子树已完整枚举：只补记上方父边，不再重走子件
 
-            try
-            {
-                Register(materialId, materialCode, level, parentMaterialId, parentMaterialCode, qtyPerUnit);
+            idByCode[code] = id;
+            isPurchasedByCode[code] = structure.IsPurchasedByMaterial.TryGetValue(code, out var purchased) && purchased;
+            expanded.Add(code);
 
-                if (isPurchasedById[materialId]) return; // 采购件即叶，不下钻（对齐旧 TraverseBomNode）
+            if (isPurchasedByCode[code]) return; // 采购件即叶，不下钻（对齐旧 TraverseBomNode）
 
-                foreach (var child in GetUnitVector(structure, materialCode))
-                    Walk(child.ChildMaterialId, child.ChildCode, level + 1, materialId, materialCode, child.QtyPerUnit);
-            }
-            finally
-            {
-                visited.Remove(materialCode);
-            }
+            onPath.Add(code);
+            foreach (var child in GetUnitVector(structure, code))
+                Discover(child.ChildCode, child.ChildMaterialId, code, id, child.QtyPerUnit);
+            onPath.Remove(code);
         }
     }
 }

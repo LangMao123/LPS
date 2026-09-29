@@ -2,7 +2,6 @@ using System.Security.Claims;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Interfaces;
-using LPS.APS.Core.Entities.Auth;
 using LPS.APS.Shared.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -21,22 +20,28 @@ namespace LPS.APS.Web.Controllers;
 public class RbacController : ControllerBase
 {
     private readonly IRbacManagementService _service;
-    private readonly IAuditLogRepository _auditLogRepo;
     private readonly ILogger<RbacController> _logger;
 
-    public RbacController(IRbacManagementService service, IAuditLogRepository auditLogRepo, ILogger<RbacController> logger)
+    public RbacController(IRbacManagementService service, ILogger<RbacController> logger)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
-        _auditLogRepo = auditLogRepo ?? throw new ArgumentNullException(nameof(auditLogRepo));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     // ==================== 用户 ====================
 
-    /// <summary>查询用户列表</summary>
+    /// <summary>查询用户列表（分页）</summary>
+    /// <param name="page">页码，从 1 起，默认 1。</param>
+    /// <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。如业务需更大分页（500/1000），仅调整本常量与前端 page-size 选项两处，不动契约文档。</param>
+    /// <param name="keyword">模糊匹配 UserCode/UserName/Email，空＝不过滤。</param>
+    /// <param name="status">精确匹配状态（Active/Disabled/Deleted），空＝不含已删除。</param>
     [HttpGet("users")]
-    public Task<ApiResponse<IReadOnlyList<UserSummaryDto>>> GetUsers()
-        => RunAsync(() => _service.GetUsersAsync());
+    public Task<ApiResponse<PageResult<UserSummaryDto>>> GetUsers(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? status = null)
+        => RunAsync(() => _service.GetUsersPagedAsync(page, pageSize, keyword, status));
 
     /// <summary>创建用户</summary>
     [HttpPost("users")]
@@ -79,10 +84,18 @@ public class RbacController : ControllerBase
 
     // ==================== 角色 ====================
 
-    /// <summary>查询角色列表</summary>
+    /// <summary>查询角色列表（分页）</summary>
+    /// <param name="page">页码，从 1 起，默认 1。</param>
+    /// <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+    /// <param name="keyword">模糊匹配 RoleCode/RoleName，空＝不过滤。</param>
+    /// <param name="isSystem">精确过滤 IsSystemRole，空＝不过滤。</param>
     [HttpGet("roles")]
-    public Task<ApiResponse<IReadOnlyList<RoleSummaryDto>>> GetRoles()
-        => RunAsync(() => _service.GetRolesAsync());
+    public Task<ApiResponse<PageResult<RoleSummaryDto>>> GetRoles(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? keyword = null,
+        [FromQuery] bool? isSystem = null)
+        => RunAsync(() => _service.GetRolesPagedAsync(page, pageSize, keyword, isSystem));
 
     /// <summary>创建角色</summary>
     [HttpPost("roles")]
@@ -111,10 +124,20 @@ public class RbacController : ControllerBase
 
     // ==================== 权限 ====================
 
-    /// <summary>查询权限列表</summary>
+    /// <summary>查询权限列表（分页）</summary>
+    /// <param name="page">页码，从 1 起，默认 1。</param>
+    /// <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+    /// <param name="module">精确匹配 Module，空＝不过滤。</param>
+    /// <param name="actionType">精确匹配 ActionType，空＝不过滤。</param>
+    /// <param name="keyword">模糊匹配 PermissionCode/PermissionName，空＝不过滤。</param>
     [HttpGet("permissions")]
-    public Task<ApiResponse<IReadOnlyList<PermissionSummaryDto>>> GetPermissions()
-        => RunAsync(() => _service.GetPermissionsAsync());
+    public Task<ApiResponse<PageResult<PermissionSummaryDto>>> GetPermissions(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? module = null,
+        [FromQuery] string? actionType = null,
+        [FromQuery] string? keyword = null)
+        => RunAsync(() => _service.GetPermissionsPagedAsync(page, pageSize, module, actionType, keyword));
 
     /// <summary>创建权限</summary>
     [HttpPost("permissions")]
@@ -123,10 +146,18 @@ public class RbacController : ControllerBase
 
     // ==================== 业务范围策略 ====================
 
-    /// <summary>查询业务范围策略列表</summary>
+    /// <summary>查询业务范围策略列表（分页）</summary>
+    /// <param name="page">页码，从 1 起，默认 1。</param>
+    /// <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+    /// <param name="scopeType">精确匹配 ScopeType，空＝不过滤。</param>
+    /// <param name="keyword">模糊匹配 ScopeValue/Description，空＝不过滤。</param>
     [HttpGet("scopes")]
-    public Task<ApiResponse<IReadOnlyList<DataScopePolicyDto>>> GetScopes()
-        => RunAsync(() => _service.GetDataScopePoliciesAsync());
+    public Task<ApiResponse<PageResult<DataScopePolicyDto>>> GetScopes(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? scopeType = null,
+        [FromQuery] string? keyword = null)
+        => RunAsync(() => _service.GetScopesPagedAsync(page, pageSize, scopeType, keyword));
 
     /// <summary>创建业务范围策略</summary>
     [HttpPost("scopes")]
@@ -165,20 +196,46 @@ public class RbacController : ControllerBase
     public Task<ApiResponse<IReadOnlyList<DataScopePolicyDto>>> GetRoleScopes(int id)
         => RunAsync(() => _service.GetRoleScopesAsync(id));
 
-    // ==================== 审计日志 ====================
+    // ==================== 测试数据清理与批量删除（R1 / R4） ====================
 
-    /// <summary>审计日志分页查询（审计页；audit.view 权限；操作人/动作/时间范围 可空组合，倒序分页）</summary>
-    [Authorize(Policy = PermissionCodes.AuditView)]
-    [HttpGet("audit-logs")]
-    public Task<ApiResponse<IReadOnlyList<AuditLog>>> GetAuditLogs(
-        [FromQuery] int? userId = null,
-        [FromQuery] string? action = null,
-        [FromQuery] DateTime? from = null,
-        [FromQuery] DateTime? to = null,
-        [FromQuery] int page = 1,
-        [FromQuery] int size = 20,
-        CancellationToken ct = default)
-        => RunAsync(() => _auditLogRepo.QueryPagedAsync(userId, action, from, to, page, size, ct));
+    /// <summary>清理测试数据（R1 方案 a：按命名规则软删 verify 残留，admin only，仅软删/停用不物理删）</summary>
+    [HttpPost("test-data/cleanup")]
+    public Task<ApiResponse<TestDataCleanupResult>> CleanupTestData()
+        => RunAsync(() => _service.CleanupTestDataAsync(GetCurrentUserId()), "测试数据清理完成");
+
+    /// <summary>批量删除用户（软删；自删保护 + 最后 auth.manage 保护）</summary>
+    [HttpPost("users/batch-delete")]
+    public async Task<ApiResponse<BatchDeleteResult>> DeleteUsersBatch([FromBody] BatchDeleteRequest request)
+    {
+        int currentUserId;
+        try
+        {
+            currentUserId = GetCurrentUserId();
+        }
+        catch (InvalidOperationException)
+        {
+            return ApiResponse<BatchDeleteResult>.Fail(401, "无法解析当前登录用户身份");
+        }
+
+        // 自删保护：剔除当前登录账号自身，避免误停用自己
+        var ids = request.Ids.Where(id => id != currentUserId).Distinct().ToList();
+        return await RunAsync(() => _service.DeleteUsersBatchAsync(ids, currentUserId), "批量删除用户完成");
+    }
+
+    /// <summary>批量删除角色（软删；系统角色保护）</summary>
+    [HttpPost("roles/batch-delete")]
+    public Task<ApiResponse<BatchDeleteResult>> DeleteRolesBatch([FromBody] BatchDeleteRequest request)
+        => RunAsync(() => _service.DeleteRolesBatchAsync(request.Ids, GetCurrentUserId()), "批量删除角色完成");
+
+    /// <summary>批量删除权限（停用 IsActive=false，保留授权关联，不解绑）</summary>
+    [HttpPost("permissions/batch-delete")]
+    public Task<ApiResponse<BatchDeleteResult>> DeletePermissionsBatch([FromBody] BatchDeleteRequest request)
+        => RunAsync(() => _service.DeletePermissionsBatchAsync(request.Ids, GetCurrentUserId()), "批量停用权限完成");
+
+    /// <summary>批量删除业务范围策略（停用 IsEnabled=0）</summary>
+    [HttpPost("scopes/batch-delete")]
+    public Task<ApiResponse<BatchDeleteResult>> DeleteScopesBatch([FromBody] BatchDeleteRequest request)
+        => RunAsync(() => _service.DeleteScopesBatchAsync(request.Ids, GetCurrentUserId()), "批量停用业务范围策略完成");
 
     // ==================== 私有辅助 ====================
 

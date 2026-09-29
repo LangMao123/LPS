@@ -161,7 +161,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>创建参数集版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖；五主题 JSON 归一化到 ContentSnapshotJson 持久化）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
     [HttpPost("parameter-set/version")]
     public async Task<IActionResult> CreateParameterSetVersion([FromBody] ParameterSetVersion version, CancellationToken ct)
     {
@@ -171,7 +171,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>更新参数集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
     [HttpPut("parameter-set/version/{versionId}")]
     public async Task<IActionResult> UpdateParameterSetVersion(long versionId, [FromBody] ParameterSetVersion version, CancellationToken ct)
     {
@@ -636,6 +636,7 @@ public class GovernanceController : ControllerBase
                 DomainKey = request?.DomainKey ?? string.Empty,
                 BasePlanVersionId = request?.BasePlanVersionId,
                 DataCutoffTime = request?.DataCutoffTime,
+                Scope = request?.Scope,
                 Actor = GetCurrentUserCode(),
             }, GetCurrentUserId(), ct);
             return Ok(ApiResponse<CandidateRunCreatedResult>.Success(result, $"白天候选运行创建成功：RunId={result.NewScheduleRunId}, CandidatePlanVersionId={result.NewPlanVersionId}"));
@@ -668,7 +669,7 @@ public class GovernanceController : ControllerBase
 
     #region 主表列表与运行支撑（G1/G7：3-4联调）
 
-    /// <summary>规则集主表列表（G1/A1：4号位规则集列表页）</summary>
+    /// <summary>规则集主表列表（G1/A1：4号位规则集列表页；R2 起返回含最新版本摘要的列表 DTO）</summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.RuleView)]
     [HttpGet("rule-sets")]
@@ -680,8 +681,8 @@ public class GovernanceController : ControllerBase
         CancellationToken ct = default)
     {
         var (skip, take) = ResolvePaging(page, pageSize);
-        var result = await _ruleSetRepo.GetListAsync(activeOnly, keyword, skip, take, ct);
-        return Ok(ApiResponse<IReadOnlyList<RuleSet>>.Success(result));
+        var result = await _ruleSetRepo.GetListWithVersionAsync(activeOnly, keyword, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<RuleSetListItemDto>>.Success(result));
     }
 
     /// <summary>参数集主表列表（G1/A8：4号位参数集列表页）</summary>
@@ -1040,6 +1041,9 @@ public class CreateCandidateRunRequest
     /// <summary>本次运行统一数据切片边界（可选；缺省 now）</summary>
     public DateTime? DataCutoffTime { get; set; }
 
-    /// <summary>备注（契约位保留，B-1 本轮不参与业务逻辑）</summary>
+    /// <summary>备注（契约位保留，B-1 本轮不参与业务逻辑；R1 P2 结论：前端停传、后端维持丢弃）</summary>
     public string? Remark { get; set; }
+
+    /// <summary>局部重排范围载荷（ScopeJsonV2；承载 ScheduleRun.ScopeJson）。缺省 null = 不承载结构化范围（旧调用兼容）</summary>
+    public ScopeJsonV2? Scope { get; set; }
 }

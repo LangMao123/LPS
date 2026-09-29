@@ -60,7 +60,15 @@ public class Phase5CompactionTests
                 [1] = new[] { (Day.AddHours(8), Day.AddHours(12)), (Day.AddHours(13), Day.AddHours(17)) },
             },
             direction: "FORWARD",
-            candidate: new CandidateContext { BasePlanVersionId = 1, ChangeSeedKeys = new[] { "D1" } });
+            candidate: new CandidateContext { BasePlanVersionId = 1, ChangeSeedKeys = new[] { "D1" } },
+            // item1 接线后 Setup 走规则（RoutingOperation.SetupTime 已废止不再读）：
+            // OP10 首任务=初始设备状态→0；OP20 前产品=物料1（同产品）→ EXACT A→A 显式规则 30 分钟。
+            setupRules: new[]
+            {
+                new SetupTransitionRuleSnapshot { ProductionDepartmentId = 100, StageCode = "STAGE1",
+                    OperationCode = "OP20", ResourceId = 1, FromMaterialId = 1, ToMaterialId = 1,
+                    RuleType = "EXACT", SetupMinutes = 30m }
+            });
 
         var result = await _solver.SolveAsync(request);
 
@@ -68,11 +76,13 @@ public class Phase5CompactionTests
         var op10 = result.FinalTasks.Single(t => t.SourceDraftId == "D1" && t.OperationCode == "OP10");
         var op20 = result.FinalTasks.Single(t => t.SourceDraftId == "D1" && t.OperationCode == "OP20");
 
-        // 压实终态：占用贴日历起点 8:00（Setup 8:00-8:30 + 加工 8:30-9:30），OP20 紧随（9:30-10:00 Setup + 10:00-11:00 加工）
-        Assert.Equal(Day.AddHours(8.5), op10.PlannedStartTime);
-        Assert.Equal(Day.AddHours(9.5), op10.PlannedEndTime);
-        Assert.Equal(Day.AddHours(10), op20.PlannedStartTime);
-        Assert.Equal(Day.AddHours(11), op20.PlannedEndTime);
+        // 压实终态：OP10 初始设备状态 Setup=0 → 加工 [8:00-9:00]；OP20 Setup=30（规则）→ 占用 [9:00-10:30]、加工 [9:30-10:30]
+        Assert.Equal(0m, op10.SetupTime);
+        Assert.Equal(Day.AddHours(8), op10.PlannedStartTime);
+        Assert.Equal(Day.AddHours(9), op10.PlannedEndTime);
+        Assert.Equal(30m, op20.SetupTime);
+        Assert.Equal(Day.AddHours(9.5), op20.PlannedStartTime);
+        Assert.Equal(Day.AddHours(10.5), op20.PlannedEndTime);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -207,7 +217,8 @@ public class Phase5CompactionTests
         Dictionary<int, (DateTime Start, DateTime End)[]> calendarOverrides,
         string direction,
         CandidateContext? candidate = null,
-        IReadOnlyList<MaterialAvailabilitySlice>? materialSlices = null)
+        IReadOnlyList<MaterialAvailabilitySlice>? materialSlices = null,
+        IReadOnlyList<SetupTransitionRuleSnapshot>? setupRules = null)
     {
         var calendarSlots = new List<ResourceCalendarSlot>();
         foreach (var kvp in calendarOverrides)
@@ -249,7 +260,8 @@ public class Phase5CompactionTests
                     SchedulingDirection = direction,
                     AllowMerge = false,
                     AllowSplit = false
-                }
+                },
+                SetupTransitionRules = setupRules ?? Array.Empty<SetupTransitionRuleSnapshot>()
             }
         };
     }

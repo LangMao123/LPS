@@ -79,6 +79,26 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         return results.ToList();
     }
 
+    public async Task<List<ProcurementManualEtaOverride>> GetActiveOverridesAsync(CancellationToken ct = default)
+    {
+        var sql = @"
+SELECT
+    PONo, [LineNo], MaterialId, MaterialCode, ReceivingWarehouse,
+    ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark
+FROM ProcurementManualEtaOverride
+WHERE IsActive = 1
+ORDER BY UpdatedAt DESC";
+
+        var results = await _connectionManager.QueryAsync<ProcurementManualEtaOverride>(
+            sql,
+            null,
+            CommandType.Text,
+            DatabaseId.APS,
+            commandTimeout: 30);
+
+        return results.ToList();
+    }
+
     public async Task<ProcurementManualEtaOverride?> GetByBusinessKeyAsync(
         string poNo,
         int lineNo,

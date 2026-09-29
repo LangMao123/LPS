@@ -8,14 +8,14 @@ namespace LPS.APS.Engine.Services.Auth;
 /// <summary>
 /// 权限码种子服务实现（F-G5 收尾，3号位）
 /// 启动时确保 Permission 表包含代码侧 V1 功能权限码（与 <see cref="LPS.APS.Core.Authorization.PermissionCodes.All"/> 一一对应）。
-/// 注意：P0-01 裁决后统一 `aps.` 前缀；0号位裁决 V1 权限码采用 DDL v1.3 细粒度 34 码。
+/// 注意：P0-01 裁决后统一 `aps.` 前缀；0号位裁决 V1 权限码采用 DDL v1.3 细粒度 34 码 + Setup 换型 3 码（4号位 Setup 契约 §11.1）+ ResourceCalendar/ManualCapacity 各 3 码（5号位 权限码申请 2026-09-24）。
 /// </summary>
 public class PermissionSeedService : IPermissionSeedService
 {
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<PermissionSeedService> _logger;
 
-    /// <summary>V1 功能权限码种子（Code / Name / Module / ActionType / Description），对齐 DDL v1.3 的 34 码。</summary>
+    /// <summary>V1 功能权限码种子（Code / Name / Module / ActionType / Description），对齐 DDL v1.3 的 34 码 + Setup 换型 3 码 + ResourceCalendar/ManualCapacity 各 3 码（43 码）。</summary>
     private static readonly (string Code, string Name, string Module, string ActionType, string Description)[] Seeds =
     {
         // Plan
@@ -45,6 +45,21 @@ public class PermissionSeedService : IPermissionSeedService
         ("aps.strategy.view", "查看策略", "Strategy", "View", "查看策略包/版本"),
         ("aps.strategy.edit", "编辑策略", "Strategy", "Edit", "编辑策略草稿"),
         ("aps.strategy.publish", "发布策略", "Strategy", "Execute", "发布策略版本"),
+
+        // Setup 换型（4号位 Setup 契约 §11.1 新增 3 码）
+        ("aps.setup.view", "查看Setup换型规则", "Setup", "View", "查看Setup换型规则/版本"),
+        ("aps.setup.edit", "维护Setup换型规则", "Setup", "Edit", "维护Setup换型规则草稿"),
+        ("aps.setup.publish", "发布Setup换型规则", "Setup", "Execute", "发布Setup换型规则版本"),
+
+        // ResourceCalendar 设备资源日历（5号位 权限码申请 2026-09-24 新增 3 码）
+        ("aps.resource_calendar.view", "查看设备资源日历", "ResourceCalendar", "View", "查询设备日历窗口"),
+        ("aps.resource_calendar.edit", "维护设备资源日历", "ResourceCalendar", "Edit", "批量铺窗/修改设备日历"),
+        ("aps.resource_calendar.delete", "删除设备资源日历", "ResourceCalendar", "Execute", "物理删除设备日历窗口"),
+
+        // ManualCapacity 人工能力槽（5号位 权限码申请 2026-09-24 新增 3 码）
+        ("aps.manual_capacity.view", "查看人工能力槽", "ManualCapacity", "View", "查询人工槽主档/日历"),
+        ("aps.manual_capacity.edit", "维护人工能力槽", "ManualCapacity", "Edit", "新增主档/批量铺窗"),
+        ("aps.manual_capacity.delete", "删除人工能力槽", "ManualCapacity", "Execute", "软删主档/物理删窗口"),
 
         // Manual ETA
         ("aps.manual_eta.view", "查看人工到货时间", "ManualEta", "View", "查看Manual ETA"),
@@ -104,7 +119,7 @@ public class PermissionSeedService : IPermissionSeedService
     /// <inheritdoc />
     public async Task<IReadOnlyCollection<string>> FindMissingPermissionCodesAsync(CancellationToken cancellationToken = default)
     {
-        // P1-06：以代码侧权威清单 PermissionCodes.All（34 码）为基线校验落库情况，
+        // P1-06：以代码侧权威清单 PermissionCodes.All（43 码）为基线校验落库情况，
         // 未落库即视为「权限基线未对齐」。
         var missing = new List<string>();
         foreach (var code in PermissionCodes.All)

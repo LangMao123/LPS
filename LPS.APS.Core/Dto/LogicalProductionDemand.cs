@@ -54,10 +54,24 @@ public sealed class LogicalProductionDemand
     public string StartStageCode { get; set; } = string.Empty;
 
     /// <summary>
+    /// 要做到哪个大工艺阶段即算可供给父件（供给阈值 Stage）——对应 BOM 边的 `ChildRequiredStageCode`
+    /// / `APS_BOM_STAGE_PATH_RAW.IsSupplyThreshold = 1` 的那一段。
+    ///
+    /// 【语义（PM《BOM取用_Pegging_Stage_Routing完整链路说明》§八，2026-09-28）】
+    ///   「子件做到这个 Stage 以后，才成为当前父件可使用的 Supply。」
+    ///   例：B 的 Stage 链为 CN_MACH → CN_SURF(IsSupplyThreshold=1)，则 B 完成 CN_MACH 尚不可供给 A，
+    ///   须完成 CN_SURF。⇒ 本需求**不必走完该物料全部 Stage，做到本阶段即为终点**。
+    ///
+    /// null / 空 = 无阈值信息（源数据缺 `ChildRequiredStageCode`）⇒ 按既有保守口径「全工艺完成才可供给」
+    /// （与冻结 DDL 的设计决策一致：`ChildRequiredStageCode=NULL 时按保守策略：子件必须全工艺完成后才可供给父件`）。
+    /// </summary>
+    public string? RequiredStageCode { get; set; }
+
+    /// <summary>
     /// 续排起点工序码（工序级，比 StartStageCode 更细，对应 5号位 的 NextOperation/StartOperation）
     /// 2号位 Pegging 不扩展 Operation，此字段由 5号位 按执行进度交付；null = 尚无工序级起点（新单从第一道工序起 / 未接 5号位交付）。
     /// </summary>
-    public string? StartOperationCode { get; init; }
+    public string? StartOperationCode { get; set; }
 
     /// <summary>
     /// 净产出数量

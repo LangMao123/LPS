@@ -102,3 +102,28 @@ public sealed record AssignIdsRequest(IReadOnlyList<int> Ids);
 
 /// <summary>更新业务范围策略请求（仅说明可改）</summary>
 public sealed record UpdateDataScopePolicyRequest(string? Description = null);
+
+/// <summary>测试数据清理结果（R1 方案 a 响应）</summary>
+public class TestDataCleanupResult
+{
+    public int Users { get; set; }
+    public int Roles { get; set; }
+    public int Permissions { get; set; }
+    public IReadOnlyList<TestDataCleanupFailure> Failed { get; set; } = Array.Empty<TestDataCleanupFailure>();
+}
+
+/// <summary>测试数据清理失败项（kind=user/role/permission）</summary>
+public sealed record TestDataCleanupFailure(string Kind, int Id, string Reason);
+
+/// <summary>批量删除请求</summary>
+public sealed record BatchDeleteRequest(IReadOnlyList<int> Ids);
+
+/// <summary>批量删除结果（succeeded=成功 Id，failed=逐条失败原因）</summary>
+public class BatchDeleteResult
+{
+    public IReadOnlyList<int> Succeeded { get; set; } = Array.Empty<int>();
+    public IReadOnlyList<BatchDeleteFailure> Failed { get; set; } = Array.Empty<BatchDeleteFailure>();
+}
+
+/// <summary>批量删除失败项（kind=user/role/permission/scope，对齐 cleanup 的 {kind,id,reason} 结构）</summary>
+public sealed record BatchDeleteFailure(string Kind, int Id, string Reason);

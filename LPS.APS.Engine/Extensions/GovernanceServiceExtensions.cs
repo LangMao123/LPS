@@ -34,8 +34,11 @@ public static class GovernanceServiceExtensions
         services.AddScoped<IDomainDependencyRepository, DomainDependencyRepository>();
         // E-1：域定义治理写侧（3号位 CRUD + 启用/停用 + 审计）
         services.AddScoped<IDomainDefinitionRepository, DomainDefinitionRepository>();
-        // 产品转换换型规则仓储（2号位 Dapper 实现，接口/控制器注释指派 2号位数据引擎落地）
-        services.AddScoped<ISetupTransitionRuleRepository, SetupTransitionRuleRepository>();
+        // Setup换型：产品转换换型规则（SetupTransitionRule）不再走独立物理表仓储——S-3 撤销（承载 = RuleSetVersion.ContentSnapshotJson 子块）
+        // Setup换型：主数据只读查询仓储（Setup 契约 §11.1 Code 回带用；3号位 依用户授权例外自写，Engine 层此前无独立主数据读仓储）
+        services.AddScoped<IMasterDataLookupRepository, MasterDataLookupRepository>();
+        // Setup换型：规则缺失（uncovered-stats）只读聚合查询仓储（#10 端点；3号位 依 G4 只读查询归属自写，Setup 治理域只读事实）
+        services.AddScoped<ISetupUncoveredStatRepository, SetupUncoveredStatRepository>();
 
         return services;
     }
