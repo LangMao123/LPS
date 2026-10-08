@@ -160,6 +160,74 @@ public class RealDomainFullRunTest
     }
 
     /// <summary>
+    /// 【2号位 · 既有 PlanVersion 单域重跑（诊断入口）】对**已存在**的 PlanVersion 走手动入口
+    /// <see cref="SchedulingOrchestrator.RunSchedulingAsync(int, long, CancellationToken)"/> 重跑。
+    ///
+    /// **为什么需要它**：2026-10-08 真实域跑批出现「22,135 条需求进求解器 → 722s → FinalTask=0」，
+    ///   而 <see cref="RunRealDomainAsync"/> 走的是 <c>MANUAL_*</c> 新壳 —— 该壳**没有**
+    ///   <c>OrderBomRequestLink</c>（OBRL 由 bom-request-push 按 PV 生成，新壳拿不到），
+    ///   于是 Pegging 回退「按 MaterialId 全量装载」、BOM 快照为空。
+    ///   夜间壳（<c>NIGHTLY_20261008_FAMILY_X</c>）才带 OBRL 与已落库的 <c>APS_BOM_RAW</c>。
+    ///   要复现**带 BOM 的真实口径**，必须能点名既有 PV 重跑，而不是每次新建壳。
+    ///
+    /// 与 <see cref="RunRealDomainAsync"/> 的差别：本入口 <c>scheduleRunId=0</c> ⇒
+    ///   <c>LoadSchedulingContextAsync</c> 的 <c>if (scheduleRunId &gt; 0)</c> 守卫使 **MES 进度快照不装载**。
+    ///   诊断「求解器为什么丢弃需求」不受影响；但**连续性切片**依赖 MES 进度，
+    ///   在本入口下恒为空 —— **不要用本入口验连续性**。
+    ///
+    /// 开门：<code>APS_REAL_DOMAIN_RUN=1 APS_REAL_DOMAIN_PV_ID=2 dotnet test --filter FullyQualifiedName~RunExistingPlanVersionAsync</code>
+    /// </summary>
+    [SkippableFact(DisplayName = "2号位: 既有 PlanVersion 单域重跑（诊断入口，生产口径）")]
+    public async Task RunExistingPlanVersionAsync()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable(GateEnvVar) == "1",
+            $"真实域跑批默认关闭（会写 APS_Production 并跑满主链）。设 {GateEnvVar}=1 显式开启。");
+
+        var pvIdRaw = Environment.GetEnvironmentVariable("APS_REAL_DOMAIN_PV_ID");
+        Skip.IfNot(int.TryParse(pvIdRaw, out var planVersionId) && planVersionId > 0,
+            $"未指定 APS_REAL_DOMAIN_PV_ID（当前值 '{pvIdRaw ?? "(null)"}'）—— 本入口必须显式点名既有 PlanVersionId。");
+
+        var ct = CancellationToken.None;
+
+        using var provider = BuildProductionProvider();
+        _connectionManager = provider.GetRequiredService<DatabaseConnectionManager>();
+        var schedulingOrchestrator = provider.GetRequiredService<SchedulingOrchestrator>();
+
+        var strategyVersionId = await ResolveDefaultStrategyVersionIdAsync(ct);
+
+        // 反查既有 PV 的归属 Run（只为 DumpEvidence 打印终态，不参与执行）
+        var sourceRunId = await _connectionManager.QueryFirstOrDefaultAsync<int?>(
+            "SELECT SourceScheduleRunId FROM PlanVersion WHERE Id = @Id",
+            new { Id = planVersionId }, db: DatabaseId.APS) ?? 0;
+
+        _output.WriteLine($"[0] PlanVersionId={planVersionId}, SourceScheduleRunId={sourceRunId}, 策略包版本={strategyVersionId}");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await schedulingOrchestrator.RunSchedulingAsync(planVersionId, strategyVersionId, ct);
+        sw.Stop();
+
+        _output.WriteLine($"[1] RunSchedulingAsync: IsSuccess={result.IsSuccess}, Error={result.ErrorMessage ?? "(null)"}, "
+            + $"Scheduled={result.ScheduledCount}, Unscheduled={result.UnscheduledCount}, 耗时={sw.ElapsedMilliseconds}ms");
+
+        if (result.Metrics is { } m)
+        {
+            _output.WriteLine($"     Metrics: Demand={m.DemandCount}, LPD={m.LogicalProductionDemandCount}, "
+                + $"FinalTask={m.FinalTaskCount} | ContextBuild={m.ContextBuildMs}ms, Pegging={m.PeggingMs}ms, "
+                + $"Solver={m.SolverMs}ms, Persist={m.PersistMs}ms, Total={m.TotalMs}ms");
+        }
+        else
+        {
+            _output.WriteLine("     Metrics=(null)");
+        }
+
+        // 落库证据：无论成败都摊开（0 任务时正是要看现场）
+        await DumpEvidenceAsync(sourceRunId, planVersionId, ct);
+
+        // 本入口是**诊断**入口，不把「0 任务」判成测试失败 —— 求解器的丢弃原因在日志里，
+        // 断言在此只会把「拿到了证据」误报成红。
+    }
+
+    /// <summary>
     /// 【2号位 · 夜间发令枪 seam 真跑】验 P1-03 抽出的 <c>ExecuteRunAsync</c> 在真实库上的行为：
     ///   ① 首次调用**真的跑完**整个域 —— 即重入守卫**不得误伤首跑**（本次改动最需证伪的风险点）；
     ///   ② 第二次调用**命中重入守卫、不重跑**。

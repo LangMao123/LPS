@@ -199,6 +199,12 @@ public sealed class DepartmentLookupItem
 
     /// <summary>单值归属大工艺阶段码（1:1）</summary>
     public string StageCode { get; set; } = string.Empty;
+
+    /// <summary>源系统部门码（= ProductionDepartment.SourceDeptCode；2026-10-08 应 4号位 前端需求补返回）</summary>
+    public string? SourceDeptCode { get; set; }
+
+    /// <summary>生产单元 holon 码（= ProductionDepartment.Holon；与 DeptCode 内嵌 HL 码同源）</summary>
+    public string? Holon { get; set; }
 }
 
 /// <summary>主数据 Code→Id 读端点响应：设备下拉项（masterId=表主键 Id，code=ResourceCode）</summary>

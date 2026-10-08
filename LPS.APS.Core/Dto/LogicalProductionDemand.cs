@@ -123,10 +123,70 @@ public sealed class LogicalProductionDemand
 
     /// <summary>
     /// 是否连续份额（跨版本连续性的输入标记）。
-    /// true        = 逐工单连续份额（B类 已有APS Task连续 / C类 无TaskNo外部MES连续），
-    ///               1号位 Solver 走「不拆合(P0-07) + 连续先行/单活跃资源(P0-08)」语义；
-    /// false/缺省  = 普通自由需求（A类硬约束 / D类自由），行为不变。
-    /// 连续份额的身份（旧TaskNo / 旧MES工单）复用 LogicalDemandKey 承载，不另设 ContinuationKey 字段。
+    ///
+    /// 【A/B/C 模型（《APS_V1_1号位有限产能排程开发实施包 v1.6》§本轮统一执行红线 Q2/Q3，0号位 2026-10-07 裁决 §四）】
+    ///   · **Continuation Slice（A桶 / B桶）** = true —— 已有执行连续份额：带 ContinuationKey、
+    ///     固定真实 RouteCode/PathId、StartOperation，按 NoSplitMerge 处理，**不得切换 Routing**。
+    ///     A 与 B 对 Solver 语义**完全一致**（差别仅在 FinalTask 后 TaskNo 归属，属 2号位 身份处理，
+    ///     1号位 不需要区分）。
+    ///   · **Free Slice（C桶）** = false/缺省 —— 自由需求：Routing 由 1号位 在候选内联合择优选择。
+    ///
+    /// 1号位 消费语义：
+    ///   · true  → 走「不拆合(P0-07) + 连续先行/单活跃资源(P0-08)」语义，且**固定路径**（不选路）；
+    ///   · false → 若物料有 &gt;1 条候选 Path，走 C桶候选内择优（见 Phase2 需求级选路）。
+    ///
+    /// ⚠ **禁止用「候选 Path 条数」反推 A/B/C 身份**（0号位 2026-10-07 裁决 §四）：
+    ///   A/B 所在物料本来就可能有多条合法 Routing，C 也可能当前只有 1 条合法 Path。
+    ///   Path 数量 ≠ 桶身份，桶身份只能由本字段承载。
     /// </summary>
     public bool IsContinuation { get; init; }
+
+    /// <summary>
+    /// 连续份额身份键（《APS_V1_1号位有限产能排程开发实施包 v1.6》Q3，0号位 2026-10-07 裁决 §六 授权补载体）。
+    ///
+    /// 【口径（Q3 逐字）】一个 ScheduleRun 内，一个 MESWorkOrderNo 一个且仅一个 ContinuationKey；
+    ///   同一 MES 工单多个 Slice 共享同一 Key；**不得把 LogicalDemandKey 拼入 Key**（否则同一 MES 工单裂分）。
+    ///   由 2号位 按 ScheduleRun + MESWorkOrderNo 生成真实值；1号位 只做**透明消费 + FinalTask 原样回传**，
+    ///   **不生成、不解析、不拼接**（生成权属 2号位）。
+    ///   null = 非连续份额（Free Slice）或无 MES 工单身份。
+    /// </summary>
+    public string? ContinuationKey { get; init; }
+
+    /// <summary>
+    /// 固定工艺路径编码（《APS_V1_1号位有限产能排程开发实施包 v1.6》§1号位新增/替换实施要求）：
+    /// 「A/B输入必须带真实固定 `RouteCode / PathId / StartOperation` 与完整指定 Path DAG」。
+    /// 非空 ⇒ 该需求走**固定路径**，1号位 不选路（Continuation Slice）。
+    /// null ⇒ 无固定路径，由 1号位 在候选内择优（Free Slice / C桶）。
+    /// 与 <see cref="PathId"/> 成对使用；**A/B 缺值应 Fail Closed，不得回退猜唯一 Path**（0号位 2026-10-07 裁决 §三）。
+    /// </summary>
+    public string? RouteCode { get; init; }
+
+    /// <summary>
+    /// 固定路径序号（与 <see cref="RouteCode"/> 成对，语义见该字段）。
+    /// 类型与 <c>RoutingOperation.PathId</c> 一致（int），可直接用于 <c>RoutePathKey</c> 图查找。
+    /// </summary>
+    public int? PathId { get; init; }
+
+    /// <summary>
+    /// 不拆不合硬标记（《APS_V1_1号位有限产能排程开发实施包 v1.6》：「A/B输入…并按 `NoSplitMerge` 处理」）。
+    /// true ⇒ 本份额不得拆分、不得与他份额合批（A/B Continuation Slice 恒为 true，由 2号位 按桶置位）。
+    /// false/缺省 ⇒ 按既有 AllowSplit/AllowMerge 策略处理。
+    /// 与 <see cref="IsContinuation"/> 的 P0-07 语义同向，本字段是**显式载体**（0号位 2026-10-07 裁决 §四：
+    /// 「`NoSplitMerge` 及固定 Route/Path 应显式落实」）。
+    /// </summary>
+    public bool NoSplitMerge { get; init; }
+
+    /// <summary>
+    /// 首选资源编码（软偏好，《APS_V1_1号位有限产能排程开发实施包 v1.6》§1号位新增/替换实施要求 + 红线 Q4）。
+    ///
+    /// 【口径】5号位 保留 Operation 级 `LastReportResourceCode` 真实事实；2号位 关联当前 Continuation Slice
+    ///   并校验当前 Operation Eligibility，**合法可靠时**形成本值，否则为 NULL。
+    ///   1号位 对非空值必须作为**资源连续性软偏好**进入目标函数/排序，
+    ///   **不得升级为 Hard Lock**，不得突破 Eligibility / Calendar / Firm·Frozen / Material / Routing 等硬约束。
+    ///
+    /// 与旧字段 <see cref="PreferredResourceId"/> 的关系：旧字段是「上一 ACTIVE Task 的 ResourceId」的 ID 形态；
+    ///   本字段是 v1.6 冻结的 **Code 形态正式输入**。两者并存，1号位 优先消费本字段（Code→Resource 适配），
+    ///   本字段为空时回落旧字段（行为不变）。
+    /// </summary>
+    public string? PreferredResourceCode { get; init; }
 }

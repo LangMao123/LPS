@@ -30,6 +30,8 @@ public class GovernanceVersionService : IGovernanceVersionService
     private readonly IAuditLogRepository _auditLogRepository;
     /// <summary>权威仓库事实源只读访问（0号位 裁决5：INVALID_WAREHOUSE_REF 校验；可空——未接入事实源时跳过校验，见清单三 2号位/5号位 确认项）</summary>
     private readonly DatabaseConnectionManager? _connectionManager;
+    /// <summary>执行批拆分规则治理服务（可空——未接入时发布跳过 BatchPolicy 注入；0号位 2026-10-07 裁决本轮落码）</summary>
+    private readonly ITaskSplitRuleConfigGovernanceService? _taskSplitRuleConfigGovernanceService;
     /// <summary>Demand Priority 业务校验器（无状态纯校验，P0-05 强制接入发布前校验）</summary>
     private readonly DemandPriorityValidator _demandPriorityValidator = new();
 
@@ -45,7 +47,8 @@ public class GovernanceVersionService : IGovernanceVersionService
         IStrategyProfileRepository strategyProfileRepository,
         IStrategyProfileVersionRepository strategyProfileVersionRepository,
         IAuditLogRepository auditLogRepository,
-        DatabaseConnectionManager? connectionManager = null)
+        DatabaseConnectionManager? connectionManager = null,
+        ITaskSplitRuleConfigGovernanceService? taskSplitRuleConfigGovernanceService = null)
     {
         _ruleSetVersionRepository = ruleSetVersionRepository;
         _parameterSetVersionRepository = parameterSetVersionRepository;
@@ -53,6 +56,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         _strategyProfileVersionRepository = strategyProfileVersionRepository;
         _auditLogRepository = auditLogRepository;
         _connectionManager = connectionManager;
+        _taskSplitRuleConfigGovernanceService = taskSplitRuleConfigGovernanceService;
     }
 
     /// <summary>合法发布前驱状态（其余状态发布一律拒绝）</summary>
@@ -117,6 +121,9 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         // P0-02b：发布时聚合五子块（Lock/Supply/Procurement/SolverStrategy/CandidateGuardrail）→ ContentSnapshotJson（契约 §6.10.5）
         version.ContentSnapshotJson = BuildParameterSetContentSnapshot(version);
+
+        // P0-09（0号位 2026-10-07 裁决本轮落码）：发布时聚合第⑧块 BatchPolicy 子块（读 active 规则 → Project → 注入 ContentSnapshotJson.BatchPolicy）
+        version.ContentSnapshotJson = await InjectBatchPolicyAsync(version.ContentSnapshotJson, ct);
 
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.UtcNow;
@@ -1001,6 +1008,22 @@ public class GovernanceVersionService : IGovernanceVersionService
             ?? throw new InvalidOperationException($"参数集版本 {version.Id} 无内容快照，无法聚合发布");
     }
 
+    /// <summary>
+    /// 发布时注入第⑧块 BatchPolicy 子块（0号位 2026-10-07 裁决本轮落码）。
+    /// 读 TaskSplitRuleConfig active + 生效区间内规则 → 投影 BatchPolicyRuleSnapshot → 原子写入 ContentSnapshotJson.BatchPolicy。
+    /// 未接入规则治理服务（单测/未接线场景）→ 保持原快照不变（发布侧 fail-open；缺策略 fail-closed 属 1号位 消费侧）。
+    /// </summary>
+    private async Task<string> InjectBatchPolicyAsync(string contentSnapshotJson, CancellationToken ct)
+    {
+        if (_taskSplitRuleConfigGovernanceService is null)
+        {
+            return contentSnapshotJson;
+        }
+
+        var rules = await _taskSplitRuleConfigGovernanceService.GetActiveRulesForSnapshotAsync(ct);
+        return TaskSplitRuleConfigProjector.SetRules(contentSnapshotJson, rules);
+    }
+
     // ==================== P0-01：内容持久化链辅助（ContentSnapshotJson 唯一真相，方案 A2） ====================
 
     /// <summary>
@@ -1050,6 +1073,15 @@ public class GovernanceVersionService : IGovernanceVersionService
         TryAddBlock(blocks, "Procurement", version.ProcurementJson, version.Id);
         TryAddBlock(blocks, "SolverStrategy", version.SolverStrategyJson, version.Id);
         TryAddBlock(blocks, "CandidateGuardrail", version.CandidateGuardrailJson, version.Id);
+
+        // 第⑧块 Batch Policy：由发布投影/治理写路径直写 ContentSnapshotJson（独立写路径，不走主题 JSON），
+        // 全量重建快照时须保留既有 BatchPolicy 子块，避免被五主题归一化覆盖（数据丢失，与 RuleSet 保留 SetupTransitionRules 同轨）。
+        var batchPolicyJson = ExtractBlockJson(version.ContentSnapshotJson, TaskSplitRuleConfigProjector.BatchPolicyBlockName);
+        if (!string.IsNullOrWhiteSpace(batchPolicyJson))
+        {
+            blocks[TaskSplitRuleConfigProjector.BatchPolicyBlockName] =
+                System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(batchPolicyJson, JsonOptions);
+        }
 
         version.ContentSnapshotJson = System.Text.Json.JsonSerializer.Serialize(blocks);
     }

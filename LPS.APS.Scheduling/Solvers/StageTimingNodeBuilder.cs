@@ -239,9 +239,10 @@ public static class StageTimingNodeBuilder
         }
 
         // 标记所有有 downstream 的 Task（非末端）。节点身份 = (StageCode, OperationCode)（0号位 §5.3）。
+        // Path-aware（0号位 2026-10-07 裁决 Q-3）：本列表全属同一需求 ⇒ 路径身份取自首个 Task，不按物料猜。
         var downstream = new HashSet<string>(StringComparer.Ordinal);
-        if (constraints.RoutingGraphs.TryGetValue(materialId, out var graphs) &&
-            graphs.TryGetValue("DEFAULT", out var graph))
+        var sample = tasks[0];
+        if (constraints.TryGetRoutingGraph(sample.MaterialId, sample.RouteCode, sample.PathId, out var graph))
         {
             foreach (var depList in graph.Dependencies.Values)
             {

@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Data;
 using Dapper;
@@ -41,14 +42,20 @@ public class DatabaseConnectionManager : IDisposable
     private readonly SemaphoreSlim _apsSemaphore;
     private readonly SemaphoreSlim _odsSemaphore;
     private readonly SemaphoreSlim _authSemaphore;
+    private readonly ILogger<DatabaseConnectionManager>? _logger;
     private SqlConnection? _apsConnection;
     private SqlConnection? _odsConnection;
     private SqlConnection? _authConnection;
     private bool _disposed = false;
 
-    public DatabaseConnectionManager(IOptions<DatabaseOptions> options)
+    /// <param name="options">三库连接配置</param>
+    /// <param name="logger">日志（DI 注入）；直接 <c>new</c> 的调用点走下面的单参重载。</param>
+    public DatabaseConnectionManager(
+        IOptions<DatabaseOptions> options,
+        ILogger<DatabaseConnectionManager>? logger)
     {
         _options = options.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger;
 
         if (!_options.IsValid())
         {
@@ -58,6 +65,25 @@ public class DatabaseConnectionManager : IDisposable
         _apsSemaphore = new SemaphoreSlim(1, 1);
         _odsSemaphore = new SemaphoreSlim(1, 1);
         _authSemaphore = new SemaphoreSlim(1, 1);
+    }
+
+    /// <summary>
+    /// 单参构造重载（无日志）。
+    ///
+    /// ⚠️ 本重载存在**不是**为了「写起来方便」，而是 **Moq / Castle DynamicProxy 的硬约束**：
+    /// <c>new Mock&lt;DatabaseConnectionManager&gt;(args)</c> 走 <c>CreateClassProxy(..., constructorArguments)</c>，
+    /// 按**实参个数与类型精确匹配**构造函数，**不会**替调用方补 C# 可选参数的默认值。
+    /// 故只留 `(IOptions, ILogger? = null)` 一个签名时，测试里 `Mock&lt;T&gt;(Options.Create(...))`（**1 个实参**）
+    /// 匹配失败 ⇒ 代理类型造不出来 ⇒ <c>Mock.Object</c> 取值即抛 ArgumentException
+    /// （2026-10-08 r13561 曾因此致 24 个用例由绿转红，见台账 §T-1008q）。
+    /// 保留本重载 ⇒ 1 参 mock 与直接 <c>new</c> 都能绑定，**无需改任何测试**。
+    ///
+    /// ⇒ 通用结论（1号位 2026-10-08 提出、本号位复核采纳）：**「可选参数不影响 Moq」不成立**；
+    ///    凡以 <c>Mock&lt;T&gt;(args)</c> 构造的类，若要兼容可选参数，就必须同时保留等价的**定参重载**。
+    /// </summary>
+    public DatabaseConnectionManager(IOptions<DatabaseOptions> options)
+        : this(options, null)
+    {
     }
 
     /// <summary>
@@ -136,6 +162,30 @@ public class DatabaseConnectionManager : IDisposable
     {
         var (semaphore, _) = GetDbResources(db);
         semaphore.Release();
+    }
+
+    /// <summary>
+    /// 丢弃指定库的缓存连接（连接状态已不可信时调用，例如回滚失败留下未结束的事务）。
+    /// 只处置并置空引用，下次 <see cref="GetConnectionAsync"/> 会重建；**不影响信号量** ——
+    /// 调用方仍须按配对调用 <see cref="ReleaseConnection(DatabaseId)"/>。
+    /// </summary>
+    private void DiscardConnection(DatabaseId db)
+    {
+        switch (db)
+        {
+            case DatabaseId.APS:
+                _apsConnection?.Dispose();
+                _apsConnection = null;
+                break;
+            case DatabaseId.ODS:
+                _odsConnection?.Dispose();
+                _odsConnection = null;
+                break;
+            case DatabaseId.Auth:
+                _authConnection?.Dispose();
+                _authConnection = null;
+                break;
+        }
     }
 
     /// <summary>
@@ -281,9 +331,30 @@ public class DatabaseConnectionManager : IDisposable
                     await transaction.CommitAsync();
                     return result;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    await transaction.RollbackAsync();
+                    // 【2026-10-08 修复】原实现直接 `await transaction.RollbackAsync()`：一旦**回滚自己**抛异常
+                    // （本事务可能已插入百万级行——BOM 接货一批 680 万行——回滚要逐行 undo，本身就可能
+                    // 跑很久乃至超时），该异常会**顶替原始异常**向外传播。
+                    // ⚠️ 与恢复模式无关：2026-10-08 当时 APS_Production 是 FULL（日志近满 ⇒ 回滚代价更大），
+                    //    但即便改成 SIMPLE，只要回滚自身抛错，顶替效应就照样发生 ⇒ 此修法必须保留。
+                    // 后果：调用方只看到「执行超时」而看不到真正的原因（业务逻辑异常）。
+                    // 2026-10-08 BOM 接货连续两次「超时」即此：真因是 ToDictionary 重复键（毫秒即抛），
+                    // 却被约 9 分钟的巨额回滚超时盖住，根因因此被排查了两轮。
+                    // ⇒ 现在：先留痕原始异常 → 尽力回滚 → **始终重抛原始异常**；回滚失败则丢弃该连接
+                    //   （带着未结束的事务复用同一 SqlConnection 会毒化后续所有调用，且可能持锁阻塞全库读）。
+                    _logger?.LogError(ex, "事务内操作失败 (db={Db})，开始回滚；本事务已插入的数据将全部撤销", db);
+                    try
+                    {
+                        await transaction.RollbackAsync();
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        _logger?.LogError(rollbackEx,
+                            "事务回滚失败 (db={Db})：原始异常见上一条（本条的 message 不含真因）。" +
+                            "已丢弃该连接、下次调用重建；若服务端仍残留活动事务需人工确认，否则会阻塞全库读取。", db);
+                        DiscardConnection(db);
+                    }
                     throw;
                 }
             }
@@ -296,9 +367,20 @@ public class DatabaseConnectionManager : IDisposable
                     transaction.Commit();
                     return result;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    transaction.Rollback();
+                    // 同上（SqlConnection 分支）：回滚失败不得顶替原始异常。
+                    _logger?.LogError(ex, "事务内操作失败 (db={Db})，开始回滚；本事务已插入的数据将全部撤销", db);
+                    try
+                    {
+                        transaction.Rollback();
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        _logger?.LogError(rollbackEx,
+                            "事务回滚失败 (db={Db})：原始异常见上一条（本条的 message 不含真因）。已丢弃该连接。", db);
+                        DiscardConnection(db);
+                    }
                     throw;
                 }
             }

@@ -22,7 +22,7 @@ public interface IProcurementManualEtaRepository
     /// <param name="activeOnly">是否只查询有效记录（IsActive=1）</param>
     /// <param name="ct">取消令牌</param>
     /// <returns>Manual ETA覆盖列表</returns>
-    Task<List<ProcurementManualEtaOverride>> QueryAsync(
+    Task<PageResult<ProcurementManualEtaOverride>> QueryAsync(
         List<int>? materialIds = null,
         List<string>? materialCodes = null,
         List<string>? poNos = null,
@@ -31,8 +31,8 @@ public interface IProcurementManualEtaRepository
         DateTime? etaAfter = null,
         DateTime? updatedAfter = null,
         bool activeOnly = true,
-        int skip = 0,
-        int take = 100,
+        int pageIndex = 1,
+        int pageSize = 20,
         CancellationToken ct = default);
 
     /// <summary>

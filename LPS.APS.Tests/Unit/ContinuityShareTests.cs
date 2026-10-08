@@ -152,6 +152,16 @@ public class ContinuityShareTests
         public int DemandSequence;
         public bool IsContinuation;
         public string? PI;
+
+        // ── v1.6 A/B（Continuation Slice）输入契约必备项 ──
+        //   规则清单 v1.5 / 实施包 v1.6：`IsContinuation=true` 必须带
+        //   ContinuationKey + 真实固定 RouteCode/PathId + StartOperation，并按 NoSplitMerge 处理。
+        //   0号位 2026-10-07 (5).md **P0-05** 进一步要求：任一缺失 ⇒ Fail Closed（禁止进入自由候选选路）。
+        public string? ContinuationKey;
+        public string? RouteCode;
+        public int? PathId;
+        public string? StartOperationCode;
+        public bool NoSplitMerge;
     }
 
     private static DemandSpec D(
@@ -166,7 +176,14 @@ public class ContinuityShareTests
             RequiredAvailableTime = PlanningStart.AddDays(20),
             DemandSequence = seq,
             IsContinuation = isContinuation,
-            PI = pi
+            PI = pi,
+            // 连续份额按 v1.6 契约补齐固定路径身份（RouteCode/PathId 与下方 Build() 的 "DEFAULT"/0 一致）。
+            // ContinuationKey：契约口径「一个 MESWorkOrderNo 一个且仅一个」⇒ 有 PI 用 PI，否则回落 Key。
+            ContinuationKey = isContinuation ? (pi ?? key) : null,
+            RouteCode = isContinuation ? "DEFAULT" : null,
+            PathId = isContinuation ? 1 : null,
+            StartOperationCode = isContinuation ? "OP10" : null,
+            NoSplitMerge = isContinuation
         };
 
     /// <summary>
@@ -197,7 +214,13 @@ public class ContinuityShareTests
             RequiredAvailableTime = d.RequiredAvailableTime,
             DemandSequence = d.DemandSequence,
             ProductionInstructionNo = d.PI,
-            IsContinuation = d.IsContinuation
+            IsContinuation = d.IsContinuation,
+            // v1.6 A/B 输入契约：连续份额必须带固定路径身份 + ContinuationKey + StartOperation + NoSplitMerge。
+            ContinuationKey = d.ContinuationKey,
+            RouteCode = d.RouteCode,
+            PathId = d.PathId,
+            StartOperationCode = d.StartOperationCode,
+            NoSplitMerge = d.NoSplitMerge
         }).ToList();
 
         // 结构实体（路由/资格/部门/资源/日历）按「去重后的物料」各生成一份，
@@ -209,6 +232,7 @@ public class ContinuityShareTests
             MaterialId = mid,
             ProductionDepartmentId = deptId,
             RouteCode = "DEFAULT",
+            PathId = 1,   // 与 D() 中连续份额声明的 PathId 一致（固定路径图键 = ("DEFAULT", 1)）
             OperationCode = opCode,
             StageCode = stage,
             StandardDuration = 60m,
@@ -269,7 +293,10 @@ public class ContinuityShareTests
                     SchedulingDirection = "FORWARD",
                     AllowMerge = allowMerge,
                     AllowSplit = allowSplit
-                }
+                },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                //   本夹具验证的是连续份额（A/B 恒 1 批）与自由需求共存 ⇒ Material 级宽松策略。
+                BatchPolicies = TestBatchPolicy.Permissive(logicalDemands.Select(d => d.MaterialId))
             }
         };
     }

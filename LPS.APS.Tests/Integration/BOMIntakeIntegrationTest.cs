@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -32,8 +34,15 @@ namespace LPS.APS.Tests.Integration;
 /// </remarks>
 public class BOMIntakeIntegrationTest
 {
-    // 328 = CNT_FAMILYX（CONTINUITY，长驻真实版本，OrderBomRequestLink 映射用、单 Domain 唯一命中）
-    private const int PlanVersionId = 328;
+    // 【2026-10-08 修复】原为写死的 `PlanVersionId = 328`（CNT_FAMILYX）。该版本在 09-29 清理后
+    // 已不存在（现为 1~4），写死即过期。改为按「当次 ScheduleRun 的 DAILY_BASELINE 版本」动态解析，
+    // 与 NightlyBatchOrchestrator Step 5 取 planVersionIds 的口径一致，避免再次腐化。
+    private static async Task<List<int>> ResolvePlanVersionIdsAsync(DatabaseConnectionManager conn)
+        => (await conn.QueryAsync<int>(
+            @"SELECT Id FROM PlanVersion
+              WHERE VersionCategory = 'DAILY_BASELINE'
+                AND SourceScheduleRunId = (SELECT MAX(Id) FROM ScheduleRun)",
+            db: DatabaseId.APS)).ToList();
 
     [SkippableFact(DisplayName = "独立接货：拉取最近 READY BOM 批次并落库（APS_BOM_RAW + APS_BOM_STAGE_PATH_RAW）")]
     public async Task IntakeLatestReadyBatchAsync()
@@ -54,8 +63,12 @@ public class BOMIntakeIntegrationTest
         var puller = sp.GetRequiredService<IBOMResultPullService>();
         var conn = sp.GetRequiredService<DatabaseConnectionManager>();
 
-        Console.WriteLine($"触发独立接货 IntakeLatestReadyBatchAsync([{PlanVersionId}]) ...");
-        var result = await puller.IntakeLatestReadyBatchAsync(new[] { PlanVersionId }, CancellationToken.None);
+        var planVersionIds = await ResolvePlanVersionIdsAsync(conn);
+        Console.WriteLine($"[PlanVersion] 动态解析到 {planVersionIds.Count} 个: {string.Join(", ", planVersionIds)}");
+        Skip.If(planVersionIds.Count == 0, "PlanVersion 表无当次 DAILY_BASELINE 版本，无法生成 OrderBomRequestLink —— 环境态。");
+
+        Console.WriteLine($"触发独立接货 IntakeLatestReadyBatchAsync([{string.Join(",", planVersionIds)}]) ...");
+        var result = await puller.IntakeLatestReadyBatchAsync(planVersionIds, CancellationToken.None);
         Console.WriteLine(
             $"[接货] IntakePerformed={result.IntakePerformed}, BatchNo={result.BatchNo ?? "<无READY批次>"}, PulledCount={result.PulledCount}");
 

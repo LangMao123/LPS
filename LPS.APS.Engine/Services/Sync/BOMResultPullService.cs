@@ -20,7 +20,7 @@ namespace LPS.APS.Engine.Services.Sync;
 /// 
 /// 数据路径：
 ///   ODS: MES_APS_BOM_Workset → 流式 DbDataReader
-///   → SqlBulkCopy（BatchSize=10000, Timeout=600s）
+///   → SqlBulkCopy（BatchSize=10000, Timeout=<see cref="BulkCopyTimeoutSeconds"/>s）
 ///   → APS: APS_BOM_RAW
 ///   → APS: sp_CalculateLLC 计算低阶码（§2.4.1）
 ///   → ODS: MES_APS_BOM_Workset_StageDetail → APS: APS_BOM_STAGE_PATH_RAW（v5.0.7同批次拉取）
@@ -31,6 +31,33 @@ public class BOMResultPullService : IBOMResultPullService
 {
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<BOMResultPullService> _logger;
+
+    /// <summary>
+    /// 跨机流式 BulkCopy 超时（秒）。
+    /// 【2026-10-08 修复】原为两处写死的 <c>600</c>，而接货是**跨三机**搬运：
+    /// ODS(10.116.2.73) 流式读 → 本机中转 → APS(10.116.2.75) 写。
+    /// <b>2026-10-08 用户已将 APS_Production 改为 SIMPLE 恢复模式</b>（原 FULL）——
+    /// 下文「回滚跑几分钟」的描述针对的是当时 FULL 的实况，现已缓解，但**回滚顶替异常的代码缺陷
+    /// 与恢复模式无关，仍然必须修**（见 <c>DatabaseConnectionManager.ExecuteInTransactionAsync</c>）。
+    /// <para>
+    /// <b>⚠️ 2026-10-08 更正</b>：本常量原先由 600 抬到 1800，依据是「实测 7.4k 行/秒、600s 被撞满」——
+    /// **该依据已被实测证伪**。加桩重测（见 <c>LogBulkCopyThroughput</c> 输出）真实吞吐为：
+    /// <list type="bullet">
+    /// <item>APS_BOM_RAW：4,425,669 行 / 124.9s = <b>35,435 行/秒</b>；</item>
+    /// <item>APS_BOM_STAGE_PATH_RAW：2,384,758 行 / 38.1s = <b>62,623 行/秒</b>。</item>
+    /// </list>
+    /// 按此速率 600s 可覆盖约 2,100 万行，**当时根本没有触及 BulkCopy 上限**。那次失败的真实原因
+    /// 是 <c>GenerateOrderBomRequestLinkAsync</c> 的 <c>ToDictionary</c> 重复键（业务异常，毫秒即抛），
+    /// 被随后的巨额回滚超时顶替，才伪装成「接货超时」（详见该方法内注释）。
+    /// </para>
+    /// <para>
+    /// 因此 <b>1800s 不再作为「修复」保留，而仅作为安全余量</b>：批次规模随手订单量增长，
+    /// 留 4~5 倍当前批量（约 6,400 万行）的余量，避免将来真撞限时又是「整批回滚」的代价。
+    /// ⚠️ 若后续批量继续放大到逼近 1800s，正解是改走**服务端到服务端**搬运
+    /// （APS 经 <c>[mes]</c> 链接服务器直插，省掉本机中转），而非继续抬上限。
+    /// </para>
+    /// </summary>
+    private const int BulkCopyTimeoutSeconds = 1800;
 
     public BOMResultPullService(
         DatabaseConnectionManager connectionManager,
@@ -125,6 +152,7 @@ public class BOMResultPullService : IBOMResultPullService
                 await sqlConn.ExecuteAsync("TRUNCATE TABLE APS_BOM_RAW", transaction: sqlTx);
 
                 // Step 3: 流式拉取 ODS → APS（DbDataReader → SqlBulkCopy，参与事务）
+                var bulkSw = System.Diagnostics.Stopwatch.StartNew();
                 await _connectionManager.BulkCopyFromReaderToTransactionAsync(
                     sourceSql: sourceSql,
                     sourceParameters: new { BatchNo = batchNo },
@@ -134,7 +162,8 @@ public class BOMResultPullService : IBOMResultPullService
                     destinationTransaction: sqlTx,
                     columnMappings: columnMappings,
                     batchSize: 10000,
-                    timeoutSeconds: 600);
+                    timeoutSeconds: BulkCopyTimeoutSeconds);
+                bulkSw.Stop();
 
                 // Step 4: 验证拉取行数
                 var pulled = await sqlConn.ExecuteScalarAsync<int>(
@@ -148,6 +177,8 @@ public class BOMResultPullService : IBOMResultPullService
                         "拉取行数与预期不完全匹配: 实际={PulledCount}, 预期={ExpectedCount} (BatchNo={BatchNo})",
                         pulled, request.ExpandedRowCount, batchNo);
                 }
+
+                LogBulkCopyThroughput("APS_BOM_RAW", pulled, bulkSw.Elapsed, batchNo);
 
                 // Step 5: 计算低阶码（§2.4.1 sp_CalculateLLC）
                 _logger.LogInformation("LLC计算开始: BatchNo={BatchNo}", batchNo);
@@ -242,6 +273,7 @@ public class BOMResultPullService : IBOMResultPullService
             ["IsSupplyThreshold"] = "IsSupplyThreshold"
         };
 
+        var bulkSw = System.Diagnostics.Stopwatch.StartNew();
         await _connectionManager.BulkCopyFromReaderToTransactionAsync(
             sourceSql: sourceSql,
             sourceParameters: new { BatchNo = batchNo },
@@ -251,14 +283,33 @@ public class BOMResultPullService : IBOMResultPullService
             destinationTransaction: transaction,
             columnMappings: columnMappings,
             batchSize: 10000,
-            timeoutSeconds: 600);
+            timeoutSeconds: BulkCopyTimeoutSeconds);
+        bulkSw.Stop();
 
         var pulledCount = await connection.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM APS_BOM_STAGE_PATH_RAW WHERE BatchNo = @BatchNo",
             new { BatchNo = batchNo },
             transaction: transaction);
 
+        LogBulkCopyThroughput("APS_BOM_STAGE_PATH_RAW", pulledCount, bulkSw.Elapsed, batchNo);
         _logger.LogInformation("StageDetail拉取完成: BatchNo={BatchNo}, 行数={PulledCount}", batchNo, pulledCount);
+    }
+
+    /// <summary>
+    /// 输出跨机 BulkCopy 的吞吐（行/秒）与预估「多少行会撞 <see cref="BulkCopyTimeoutSeconds"/>」。
+    /// 【2026-10-08 新增】起因：写死 600s 时，4,425,669 行的批次恰好撞线整批回滚，而事后无任何
+    /// 吞吐数字可复盘。此日志让「批次长到多大就会超时」变成可测的，而不是下次再撞。
+    /// </summary>
+    private void LogBulkCopyThroughput(string table, long rows, TimeSpan elapsed, string batchNo)
+    {
+        var seconds = Math.Max(elapsed.TotalSeconds, 0.001);
+        var rowsPerSec = rows / seconds;
+        var rowsAtTimeout = rowsPerSec * BulkCopyTimeoutSeconds;
+
+        _logger.LogInformation(
+            "BulkCopy 吞吐: 表={Table}, 行数={Rows}, 耗时={Elapsed:F1}s, {RowsPerSec:F0}行/秒, " +
+            "按此速率 {Timeout}s 上限对应约 {RowsAtTimeout:F0} 行 (BatchNo={BatchNo})",
+            table, rows, seconds, rowsPerSec, BulkCopyTimeoutSeconds, rowsAtTimeout, batchNo);
     }
 
     /// <summary>
@@ -356,9 +407,27 @@ public class BOMResultPullService : IBOMResultPullService
             WHERE PlanVersionId IN @PlanVersionIds
               AND OrderCanonicalId IS NOT NULL";
 
-        var orderMap = (await connection.QueryAsync<BomLinkOrderDto>(
+        // ⚠️ 必须用 ToLookup 而**不能**用 ToDictionary：同一 OrderCanonicalId 会**跨 PlanVersion 重复出现**。
+        //    2026-10-08 实测（本批 DAILY_BASELINE = PV1~PV4）：PV1/PV2 各 22,144 行、去重后正好
+        //    22,144 个 OC —— 每个 OC 恰好 ×2；同一 (OC, PV) 内部重复 = 0。
+        //    ★ 用 ToDictionary 会在建字典这一步**立刻抛 ArgumentException（重复键）**。
+        //      这正是 2026-10-08 接货两次「接货超时」的真实根因：异常发生在一瞬间，但随后的
+        //      catch 要回滚 680 万行插入（当时目标库还是 FULL 恢复、日志近满），回滚自身超时并**顶替**了原始异常，
+        //      对外只剩一条只有 Rollback 栈的 SqlException —— 伪装的「超时」（该 catch 已一并修复）。
+        //    OrderBomRequestLink 的冻结唯一键正是 (PlanVersionId, OrderCanonicalId)（DDL v5.0.34）,
+        //    ⇒「每个命中分区各落一行」既满足唯一约束，又不丢任何分区信息（1 明细 → 2 行）。
+        //
+        //    ❓ 待定（非本类可自决，已另行提报）：同一订单为何会跨两个分区，**成因尚未定盘**。
+        //       实测 DomainDefinition 中同时存在两个 **同 scope、同 ProductFamilyId** 的启用域：
+        //         FAMILY2  (Id=373, CreatedBy='admin',       2026-09-29 03:10, scope=FAMILY, PF=1, Fty=NULL, SortOrder=3)
+        //         FAMILY_X (Id=1,   CreatedBy='3号位-seed', 2026-09-02 11:58, scope=FAMILY, PF=1, Fty=NULL, SortOrder=99)
+        //       订单按 ProductFamilyId(=1) 归域 ⇒ 两个域都会命中，遂各出一份分区。
+        //       冻结基线 v1.8 未给域清单，仅规定「根据当前有效 DomainDefinition 确定真实 DomainKey」⇒
+        //       **表即权威**，此处只保证代码不崩、且落库满足唯一键；域去重由 3号位/PM 定夺。
+        //       ⚠️ 在成因定盘前，本方法按 [Order] 的实际行数**如实镜像**（有几个分区就落几行），不做去重。
+        var orderLookup = (await connection.QueryAsync<BomLinkOrderDto>(
             orderSql, new { PlanVersionIds = planVersionIds }, transaction: transaction))
-            .ToDictionary(o => o.OrderCanonicalId);
+            .ToLookup(o => o.OrderCanonicalId);
 
         // 4. 幂等保护：清理该批次旧 Link 数据
         var deletedCount = await connection.ExecuteAsync(
@@ -388,7 +457,13 @@ public class BOMResultPullService : IBOMResultPullService
         dataTable.Columns.Add("ErrorMessage", typeof(string));
         dataTable.Columns.Add("SyncedAt", typeof(DateTime));
 
-        var now = DateTime.UtcNow;
+        // 【2026-10-08 修复】原为 `DateTime.UtcNow` —— 本文件、乃至 `Services/Sync` 全目录**唯一**一处 UTC。
+        //   同一次接货事务里：`APS_BOM_RAW.SyncedAt` 是 BulkCopy **直接从 ODS 源带过来的**（源系统本地时间，
+        //   实测 13:46:47~13:48:49），而本表的 SyncedAt 却是 UTC（实测 05:56:08）⇒ **同事务两表差 8 小时**，
+        //   按时间对账/排时序会直接看错（本日排查即被此绊住：OBRL 的时间戳看起来比 PlanVersion 建行还早 5 小时）。
+        //   APS 侧其余生成时间戳统一用本地时间（如 `PeggingOrchestrator.PersistDomainAndPeggingInTransactionAsync`
+        //   的 `var now = DateTime.Now;`）⇒ 此处对齐为本地时间。
+        var now = DateTime.Now;
         var resolvedCount = 0;
         var skippedCount = 0;
         var noBomCount = 0;
@@ -396,44 +471,48 @@ public class BOMResultPullService : IBOMResultPullService
         foreach (var detail in details)
         {
             worksetMap.TryGetValue(detail.RequestDetailId, out var workset);
-            orderMap.TryGetValue(detail.OrderCanonicalId, out var order);
+            var matchedOrders = orderLookup[detail.OrderCanonicalId];
 
-            // SKIPPED = 该 Order 未装入本批任一 PlanVersion 的 [Order] 表。
-            // OrderBomRequestLink.PlanVersionId / OrderId 列均 NOT NULL，无法落库；仅计数记日志，不写行。
-            if (order == null)
+            // SKIPPED = 该 Order 未装入本批任一 PlanVersion 的 [Order] 快照。
+            // OrderBomRequestLink.PlanVersionId 既是 NOT NULL 又是唯一键的一半 ⇒ 无法落库；仅计数，不写行。
+            if (!matchedOrders.Any())
             {
                 skippedCount++;
                 continue;
             }
 
-            string linkStatus;
+            var linkStatus = workset?.ResolvedBOMNO != null ? "RESOLVED" : "NO_BOM";
 
-            if (workset?.ResolvedBOMNO != null)
+            if (linkStatus == "RESOLVED")
             {
-                linkStatus = "RESOLVED";
                 resolvedCount++;
             }
             else
             {
-                linkStatus = "NO_BOM";
                 noBomCount++;
             }
 
-            dataTable.Rows.Add(
-                (long)order.PlanVersionId,
-                batchNo,
-                order.OrderId,
-                detail.OrderCanonicalId,
-                (object?)detail.OrderNo ?? DBNull.Value,
-                (object?)detail.SourceSystem ?? DBNull.Value,
-                (object?)detail.SourceOrderId ?? DBNull.Value,
-                detail.RequestDetailId,
-                (object?)detail.RequestedBOMNO ?? DBNull.Value,
-                (object?)workset?.ResolvedBOMNO ?? DBNull.Value,
-                workset?.RepWorksetId != null ? (object)workset.RepWorksetId : DBNull.Value,
-                linkStatus,
-                DBNull.Value,   // ErrorMessage：SKIPPED 已不落库，其余行无错误
-                now);
+            // 本批**每个命中分区各落一行**（本批实测命中 2 个分区 ⇒ 1 明细 → 2 行）。
+            // 唯一键 (PlanVersionId, OrderCanonicalId) 保证分区之间不冲突；同分区内 OC 唯一
+            // （实测 ODS 明细与 OrderCanonicalId 为 1:1，OCsWithMultiDetail=0）⇒ 不会撞键。
+            foreach (var order in matchedOrders)
+            {
+                dataTable.Rows.Add(
+                    (long)order.PlanVersionId,
+                    batchNo,
+                    order.OrderId,
+                    detail.OrderCanonicalId,
+                    (object?)detail.OrderNo ?? DBNull.Value,
+                    (object?)detail.SourceSystem ?? DBNull.Value,
+                    (object?)detail.SourceOrderId ?? DBNull.Value,
+                    detail.RequestDetailId,
+                    (object?)detail.RequestedBOMNO ?? DBNull.Value,
+                    (object?)workset?.ResolvedBOMNO ?? DBNull.Value,
+                    workset?.RepWorksetId != null ? (object)workset.RepWorksetId : DBNull.Value,
+                    linkStatus,
+                    DBNull.Value,   // ErrorMessage：SKIPPED 已不落库，其余行无错误
+                    now);
+            }
         }
 
         // 全部 SKIPPED（无任何 Order 命中本批 PlanVersion）时表为空，跳过写入以避免空 DataTable 的 BulkCopy 边界。
@@ -442,9 +521,11 @@ public class BOMResultPullService : IBOMResultPullService
             await _connectionManager.BulkInsertToTransactionAsync(dataTable, "OrderBomRequestLink", connection, transaction);
         }
 
+        // 计数口径：Total/Skipped/Resolved/NoBom 都按 **RequestDetail 条数**；Rows 是**实际落库行数**
+        // （同一明细在每个命中分区各一行 ⇒ 通常 Rows ≈ (Resolved+NoBom) × 分区数）。两者不可混用。
         _logger.LogInformation(
-            "OrderBomRequestLink生成完成: BatchNo={BatchNo}, 总数={Total}, RESOLVED={Resolved}, NO_BOM={NoBom}, SKIPPED={Skipped}",
-            batchNo, details.Count, resolvedCount, noBomCount, skippedCount);
+            "OrderBomRequestLink生成完成: BatchNo={BatchNo}, 明细={Total}, 落库={Rows}行, RESOLVED={Resolved}, NO_BOM={NoBom}, SKIPPED={Skipped}",
+            batchNo, details.Count, dataTable.Rows.Count, resolvedCount, noBomCount, skippedCount);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

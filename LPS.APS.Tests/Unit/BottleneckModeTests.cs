@@ -66,9 +66,13 @@ public class BottleneckModeTests
         Assert.DoesNotContain(1, ids);    // R1 低利用率本就不判
     }
 
+    // ⚠ 2026-10-07：断言值随 PhaseThreeDiagnostics 的 ReasonCode 对齐最新冻结文档（15 码权威枚举，
+    //   《APS数据库字段说明文档 v5.1.9》§八.1 :4833）同步 —— 瓶颈事实的 ReasonCode 由
+    //   RESOURCE_CAPACITY_SHORTAGE（非 15 码，已退役）改为 RESOURCE_CAPACITY_WAIT。
+    //   本 helper 断言的是 1号位 自己的产出（FiniteCapacitySolver.ExplanationFacts），故随之更新。
     private static List<int> BottleneckIds(DomainSolveResult result)
         => result.ExplanationFacts
-            .Where(f => f.ObjectType == "RESOURCE" && f.ReasonCode == "RESOURCE_CAPACITY_SHORTAGE")
+            .Where(f => f.ObjectType == "RESOURCE" && f.ReasonCode == "RESOURCE_CAPACITY_WAIT")
             .Select(f => f.ResourceId!.Value)
             .ToList();
 
@@ -148,6 +152,9 @@ public class BottleneckModeTests
                     AllowMerge = false,
                     AllowSplit = false
                 },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                //   本夹具验证的是瓶颈识别，非批决策 ⇒ Material 级宽松策略（恒 1 批）。
+                BatchPolicies = TestBatchPolicy.Permissive(logicalDemands.Select(d => d.MaterialId)),
                 SolverStrategy = new SolverStrategyBlock
                 {
                     BottleneckMode = mode,

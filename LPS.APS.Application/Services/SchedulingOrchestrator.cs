@@ -40,6 +40,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     private readonly IPeggingOrchestrator _peggingOrchestrator;
     private readonly IScheduleRunService _scheduleRunService;
     private readonly LPS.APS.Engine.Services.Sync.IOrderLoadingService _orderLoadingService;
+    private readonly LPS.APS.Engine.Services.Sync.IBomRealtimeExpandService _bomRealtimeExpandService;
     private readonly ILogger<SchedulingOrchestrator> _logger;
 
     public SchedulingOrchestrator(
@@ -48,6 +49,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         IPeggingOrchestrator peggingOrchestrator,
         IScheduleRunService scheduleRunService,
         LPS.APS.Engine.Services.Sync.IOrderLoadingService orderLoadingService,
+        LPS.APS.Engine.Services.Sync.IBomRealtimeExpandService bomRealtimeExpandService,
         ILogger<SchedulingOrchestrator> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
@@ -55,6 +57,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         _peggingOrchestrator = peggingOrchestrator ?? throw new ArgumentNullException(nameof(peggingOrchestrator));
         _scheduleRunService = scheduleRunService ?? throw new ArgumentNullException(nameof(scheduleRunService));
         _orderLoadingService = orderLoadingService ?? throw new ArgumentNullException(nameof(orderLoadingService));
+        _bomRealtimeExpandService = bomRealtimeExpandService ?? throw new ArgumentNullException(nameof(bomRealtimeExpandService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -398,6 +401,44 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             _logger.LogError(ex,
                 "白天候选订单池准备失败：PlanVersionId={PlanVersionId}（候选将因无订单而产出空结果，请检查该 PV 的 DomainKey/DomainDefinition）",
                 planVersionId);
+        }
+
+        // 【白天候选】BOM 实时展开接线（2026-10-08，2号位）。
+        //   口径 = 5号位 回执 v1.0（2026-09-24）+ 本号位《白天BOM实时展开方案致5号位》§一：
+        //     ① 范围 = ScopeJson.OrderTargets[].OrderCanonicalId（本次局部重排的对象集），**只补缺口**
+        //        （服务内部先按白天天次查 MES_API_BOM_Request_Detail、已存在的跳过 ⇒ 幂等）；
+        //     ② 5号位 加护1：`sp_ExpandBOMRealtime_vNext` 前置校验 `MES_BOM_Edge_RefreshLog` 非 COMPLETED 会 RAISERROR ——
+        //        **必须捕获转可解释结果、不得硬失败** ⇒ 此处 try/catch 记日志后继续（Pegging 仍可用夜间存量 BOM）。
+        //   ⚠️ 边界：本方法仅为「白天候选」入口；夜间正式排程的 BOM 由 NightlyBatchOrchestrator 走接货链，不经此处。
+        try
+        {
+            var targetOrderCanonicalIds = scope?.OrderTargets
+                .Select(t => t.OrderCanonicalId)
+                .Where(id => id > 0)
+                .Distinct()
+                .ToList() ?? new List<long>();
+
+            if (targetOrderCanonicalIds.Count > 0)
+            {
+                var expandResult = await _bomRealtimeExpandService.EnsureExpandedAsync(targetOrderCanonicalIds, cancellationToken);
+                _logger.LogInformation(
+                    "白天候选 BOM 实时展开：目标订单={Requested}，补写 Detail={Inserted}，展开={Expanded}，结果行={Rows}，Issue={Issues}",
+                    expandResult.RequestedOrders, expandResult.DetailInserted,
+                    expandResult.ExpandedOrders, expandResult.ExpandedRowCount, expandResult.Issues.Count);
+                if (expandResult.Issues.Count > 0)
+                    _logger.LogWarning("白天候选 BOM 实时展开 Issue（不阻断）：{Issues}", string.Join(" | ", expandResult.Issues));
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "白天候选 BOM 实时展开：ScopeJson.OrderTargets 为空（非局部重排场景），跳过实时展开、沿用夜间已展开 BOM。PlanVersionId={PlanVersionId}",
+                    planVersionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            // 加护1：不得硬失败 —— 实时展开失败不阻断候选（沿用夜间存量 BOM），记错便于定位。
+            _logger.LogError(ex, "白天候选 BOM 实时展开失败（不阻断候选，沿用夜间已展开 BOM）。PlanVersionId={PlanVersionId}", planVersionId);
         }
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();

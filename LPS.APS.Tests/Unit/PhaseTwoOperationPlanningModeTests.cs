@@ -63,7 +63,9 @@ public class PhaseTwoOperationPlanningModeTests
             },
             StrategySnapshot = new SolverStrategySnapshot
             {
-                Parameters = new FiniteCapacityParameters { SchedulingDirection = "FORWARD" }
+                Parameters = new FiniteCapacityParameters { SchedulingDirection = "FORWARD" },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                BatchPolicies = TestBatchPolicy.Permissive(1)
             }
         };
     }
@@ -159,7 +161,9 @@ public class PhaseTwoOperationPlanningModeTests
             },
             StrategySnapshot = new SolverStrategySnapshot
             {
-                Parameters = new FiniteCapacityParameters { SchedulingDirection = "FORWARD" }
+                Parameters = new FiniteCapacityParameters { SchedulingDirection = "FORWARD" },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                BatchPolicies = TestBatchPolicy.Permissive(1)
             }
         };
     }

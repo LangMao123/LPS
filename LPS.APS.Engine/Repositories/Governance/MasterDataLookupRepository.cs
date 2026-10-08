@@ -86,7 +86,7 @@ public sealed class MasterDataLookupRepository : IMasterDataLookupRepository
     /// <inheritdoc />
     public async Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, int limit = 200, CancellationToken ct = default)
         => (await _connectionManager.QueryAsync<DepartmentLookupItem>(
-            @"SELECT TOP (@Limit) [Id] AS [MasterId], [DeptCode] AS [Code], [StageCode] AS [StageCode]
+            @"SELECT TOP (@Limit) [Id] AS [MasterId], [DeptCode] AS [Code], [StageCode] AS [StageCode], [SourceDeptCode] AS [SourceDeptCode], [Holon] AS [Holon]
               FROM [dbo].[ProductionDepartment]
               WHERE (@Search IS NULL OR [DeptCode] LIKE '%' + @Search + '%')
               ORDER BY [DeptCode]",

@@ -185,6 +185,14 @@ public sealed class SolverStrategySnapshot
     /// （EXACT/DEFAULT 命中，无规则 0 分钟，禁止 RoutingOperation.SetupTime 兜底）。</summary>
     public IReadOnlyList<SetupTransitionRuleSnapshot> SetupTransitionRules { get; init; }
         = Array.Empty<SetupTransitionRuleSnapshot>();
+
+    /// <summary>⑧ 批量策略（Batch Policy）规则（0号位 2026-10-07《未命名的Markdown文件 (7).md》§四/§十/§十一）。
+    /// 粒度 = <c>Material + ProductionDepartment</c>（冻结 B-001；<c>ProductionDepartmentId</c> 可空 = Material 级默认）。
+    /// 2号位 按本 Run 从 `TaskSplitRuleConfig` 装载并投影；1号位 `PhaseOneConstraintBuilder` 收进
+    /// <c>ConstraintContext.ExecutionBatchPolicies</c>，由 <c>PhaseTwoInitialScheduler</c> 做 C 桶 Batch Decision。
+    /// 空 ⇒ 每需求恒 1 批（不拆）；**1号位 不得自造全局默认策略**（§十一 第 3 条）。</summary>
+    public IReadOnlyList<BatchPolicyRuleSnapshot> BatchPolicies { get; init; }
+        = Array.Empty<BatchPolicyRuleSnapshot>();
 }
 
 /// <summary>
@@ -302,6 +310,7 @@ public sealed class FiniteCapacityParameters
 /// <summary>
 /// SolverStrategyMode ↔ SchedulingDirection 字符串固定映射（P1-02 §五-3：1↔2 契约正式化）。
 /// 由 2号位 在投影处唯一使用；1号位 消费 SchedulingDirection 字符串（PhaseTwoInitialScheduler）。
+/// 2026-10-07（0号位 裁决）：Mode += Auto，透传 "AUTO"——由 1号位 按当前求解上下文决定最终方向（不按 OrderType 硬编码）。
 /// </summary>
 public static class SolverStrategyModeMap
 {
@@ -310,6 +319,7 @@ public static class SolverStrategyModeMap
         SolverStrategyMode.Forward  => "FORWARD",
         SolverStrategyMode.Backward => "BACKWARD",
         SolverStrategyMode.Mixed    => "MIXED",
+        SolverStrategyMode.Auto     => "AUTO",         // 1号位 按求解上下文决定最终方向（0号位 2026-10-07 裁决）
         _                            => "BACKWARD"    // 防御未知枚举，等效 Backward（与历史行为一致）
     };
 }

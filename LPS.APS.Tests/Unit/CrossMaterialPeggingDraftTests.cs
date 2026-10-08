@@ -341,7 +341,9 @@ public class CrossMaterialPeggingDraftTests
             CalendarSlots = calendarSlots,
             StrategySnapshot = new SolverStrategySnapshot
             {
-                Parameters = new FiniteCapacityParameters { SchedulingDirection = direction }
+                Parameters = new FiniteCapacityParameters { SchedulingDirection = direction },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                BatchPolicies = TestBatchPolicy.Permissive(logicalDemands.Select(d => d.MaterialId))
             }
         };
     }

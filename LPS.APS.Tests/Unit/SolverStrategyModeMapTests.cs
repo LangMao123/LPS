@@ -29,6 +29,12 @@ public class SolverStrategyModeMapTests
     }
 
     [Fact]
+    public void Auto_映射_AUTO()
+    {
+        SolverStrategyModeMap.ToDirection(SolverStrategyMode.Auto).Should().Be("AUTO");
+    }
+
+    [Fact]
     public void 未知枚举_防御回退_BACKWARD()
     {
         SolverStrategyModeMap.ToDirection((SolverStrategyMode)99).Should().Be("BACKWARD");

@@ -1,8 +1,8 @@
-using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.DTOs.Ctp;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Shared.Models;
 
@@ -10,19 +10,22 @@ namespace LPS.APS.Web.Controllers;
 
 /// <summary>
 /// CTP（承诺交期）评估接口（骨架）。
-/// 3号位 职责：挂权限码 + F-G4 业务范围（Domains）二次校验；核心试算能力归 1号位/2号位，接入前返回 501。
+/// 3号位 职责：挂权限码 + domainKey resolve（缺省自动）+ F-G4 业务范围（Domains）二次校验；
+/// 核心试算能力归 1号位/2号位，接入前返回 501。
+/// 契约：APS V1 CTP 评估接口契约登记 v1.0（2026-09-30）。
+/// 错误映射：resolve 失败 400 / scope 越界 403 / 核心未接入 501。
 /// </summary>
 /// <remarks>开发者：3号位</remarks>
 [ApiController]
 [Route("api/ctp")]
 public class CtpController : ControllerBase
 {
-    private readonly IDataScopeService _dataScopeService;
+    private readonly ICtpService _ctpService;
     private readonly ILogger<CtpController> _logger;
 
-    public CtpController(IDataScopeService dataScopeService, ILogger<CtpController> logger)
+    public CtpController(ICtpService ctpService, ILogger<CtpController> logger)
     {
-        _dataScopeService = dataScopeService;
+        _ctpService = ctpService ?? throw new ArgumentNullException(nameof(ctpService));
         _logger = logger;
     }
 
@@ -30,7 +33,7 @@ public class CtpController : ControllerBase
     private int GetCurrentUserId()
         => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
-    /// <summary>发起承诺交期评估（CTP 试算）——骨架：仅 scope 二次校验，核心计算待 1号位/2号位 接入</summary>
+    /// <summary>发起承诺交期评估（CTP 试算）——骨架：resolve + scope 二次校验，核心计算待 1号位/2号位 接入</summary>
     /// <remarks>开发者：3号位（编排骨架）；核心试算能力归 1号位/2号位</remarks>
     [Authorize(Policy = PermissionCodes.PlanCtp)]
     [HttpPost("evaluate")]
@@ -38,25 +41,23 @@ public class CtpController : ControllerBase
     {
         try
         {
-            // F-G4 fail-closed：Domains ∋ request.DomainKey（Global 放行）
-            await _dataScopeService.EnsureInScopeAsync(GetCurrentUserId(), DataScopeTypes.Domain, request.DomainKey, ct);
+            // resolve（显式/自动）+ F-G4 fail-closed 业务范围校验（Global 放行）
+            var domainKey = await _ctpService.EvaluateAsync(request, GetCurrentUserId(), ct);
+
+            // 核心承诺交期评估计算归 1号位/2号位，接入前返回 501
+            _logger.LogInformation("CTP 评估端点（骨架）被调用：{DomainKey}，核心能力待接入", domainKey);
+            return StatusCode(501, ApiResponse.Fail(501, "承诺交期评估（CTP 试算）核心能力由 1号位/2号位 接入，暂未开放"));
         }
         catch (ScopeViolationException ex)
         {
             _logger.LogWarning(ex, "CTP 评估业务范围越界：{DomainKey}", request.DomainKey);
             return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
-
-        // 核心承诺交期评估计算归 1号位/2号位，接入前返回 501
-        _logger.LogInformation("CTP 评估端点（骨架）被调用：{DomainKey}，核心能力待接入", request.DomainKey);
-        return StatusCode(501, ApiResponse.Fail(501, "承诺交期评估（CTP 试算）核心能力由 1号位/2号位 接入，暂未开放"));
+        catch (InvalidOperationException ex)
+        {
+            // resolve 无唯一匹配（缺 domainKey 且自动解析失败/多域歧义）→ 业务错 400（契约 §4；不 422）
+            _logger.LogWarning(ex, "CTP 评估 domainKey 解析失败：{MaterialCode}/{FactoryCode}", request.MaterialCode, request.FactoryCode);
+            return StatusCode(400, ApiResponse.Fail(400, ex.Message));
+        }
     }
-}
-
-/// <summary>CTP 评估请求体</summary>
-public sealed record CtpEvaluateRequest
-{
-    /// <summary>目标域 Key（FAMILY_INJECTION / BJ_FAMILY_INJECTION 等）</summary>
-    [Required(ErrorMessage = "DomainKey 必填")]
-    public required string DomainKey { get; init; }
 }

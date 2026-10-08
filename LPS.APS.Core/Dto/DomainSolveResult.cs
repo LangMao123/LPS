@@ -103,6 +103,31 @@ public sealed class FinalTaskDraft
 
     public int Priority { get; init; }
     public bool IsVirtual { get; init; }
+
+    /// <summary>
+    /// 执行批键（《APS_V1_1号位有限产能排程开发实施包 v1.6》§1号位新增/替换实施要求，0号位 2026-10-07 裁决 §六 授权补载体）：
+    /// 「`ExecutionBatchDraftKey` 用于把多 Operation FinalTask 归为同一执行批；FinalTask 必须回传真实 RouteCode/PathId
+    ///   并原样回传 ContinuationKey」。
+    ///
+    /// 【口径】同一执行批（同一 Routing 选择结果）下的多个 Operation FinalTask 共享同一 Key。
+    ///   **生成权属 1号位**（0号位 2026-10-07 裁决 §七：本项「无前置生产职责」，1号位 今天即可完成）。
+    ///   冻结要求「每个 Execution Batch 只允许一条完整 Path」⇒ 同一 Key 下所有 FinalTask 的
+    ///   (RouteCode, PathId) 必须一致。
+    ///
+    /// ⚠ 与既有 <see cref="StageExecutionBatchDraftKey"/> **不是同一字段**（后者是 Stage 级、按 Stage 归并，
+    ///   0号位 已明确二者不可互相顶替）。
+    /// </summary>
+    public string? ExecutionBatchDraftKey { get; init; }
+
+    /// <summary>
+    /// 连续份额身份键（原样回传，《APS_V1_1号位有限产能排程开发实施包 v1.6》Q3 + §1号位新增/替换实施要求：
+    /// 「FinalTask 必须…原样回传 ContinuationKey」）。
+    ///
+    /// 【口径】1号位 **不生成、不解析**，从源 <c>LogicalProductionDemand.ContinuationKey</c> **逐字拷贝**。
+    ///   null = 源需求无该身份。
+    /// </summary>
+    public string? ContinuationKey { get; init; }
+
     public string? StageExecutionBatchDraftKey { get; init; }
     public decimal? StageExecutionBatchQty { get; init; }
     public long? ExistingMESPlanReleaseId { get; init; }

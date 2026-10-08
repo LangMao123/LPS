@@ -315,6 +315,22 @@ internal sealed class ResourceProductTimeline
         return timeline;
     }
 
+    /// <summary>
+    /// 深拷贝（C桶候选内择优用）：每个候选 Path 必须在**同一初始上下文**上试排，互不污染；
+    /// 试排结果择优后再在真实上下文上重跑选中候选落定（0号位 2026-10-07 裁决 Q-2：
+    /// 「候选评价必须看到当前 Domain 真实的资源占用、Calendar、已排 Task…」，故不能只跑孤立试算）。
+    /// </summary>
+    public ResourceProductTimeline Clone()
+    {
+        var clone = new ResourceProductTimeline();
+        foreach (var (resourceId, list) in _byResource)
+        {
+            clone._byResource[resourceId] = new List<(DateTime End, int MaterialId)>(list);
+        }
+
+        return clone;
+    }
+
     /// <summary>上一相邻 Task 产品：最晚占用结束时间 ≤ occStart 者；null = 无可追溯上一产品（初始设备状态，Setup=0）。</summary>
     public int? GetPrevMaterial(int resourceId, DateTime occStart)
     {

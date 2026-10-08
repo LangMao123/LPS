@@ -239,6 +239,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     CandidateGuardrail = frozenSnapshot.CandidateGuardrail,
                     // ⑦ 换型规则：2号位装载投影后按 Domain（Dept+Stage）裁剪，只传本域涉及规则（§19.3「只加载本 Domain」）。
                     SetupTransitionRules = SetupTransitionRuleProjector.CropToDomain(frozenSnapshot.SetupTransitionRules, materialStageDeptContexts),
+                    // ⑧ 批量策略（05 契约 §2.3 第 7 类）：**整块全量透传，不裁剪**。
+                    //   粒度 = Material + ProductionDepartmentId（可空 = Material 级默认）。
+                    //   与 ①②③④ 同向（装载不裁剪、匹配期决定）——裁剪会把「Material 级默认行」(Dept=NULL)
+                    //   一并丢掉，1号位 收到空策略即按「每需求恒 1 批」处理，而 §十一 禁止 1号位 自造默认。
+                    //   交由 1号位 PhaseOneConstraintBuilder 按本域 Material/Dept 自行匹配。
+                    BatchPolicies = frozenSnapshot.BatchPolicy,
                     Parameters = new FiniteCapacityParameters
                     {
                         AllowSplit = solverStrategy.Split.MaxOptimizationSplitCount > 1,
@@ -268,6 +274,49 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             solverSw.Stop();
             Console.WriteLine($"[PeggingOrchestrator] IFiniteCapacityScheduler.SolveAsync完成: FinalTasks={solveResult.FinalTasks?.Count ?? 0}, Success={solveResult.Success}");
 
+            // ── 求解结果可观测性（2026-10-08 新增，纯读、不改行为）────────────────────────
+            // 背景：2026-10-08 真实域跑批出现「22,135 条需求进求解器 → 722s → FinalTask=0 → Success=true」的
+            //   **静默空跑**。原实现只打 `FinalTasks.Count` + `Success` ⇒ 求解器**为什么**一条不产
+            //   （`UnscheduledTasks.Reason` / `ExplanationFacts.ReasonCode` / `Summary.UnscheduledCount`）
+            //   全部不可见，只能回 1号位 源码里猜丢弃点。
+            //   与 2026-09-29「优雅失败 ErrorMessage 恒 null」同族：**失败现场必须能从日志自证**。
+            //   `DomainSolveResult` 的这三个集合是 1号位 已出口的字段，2号位 只是原样打印，不解释、不推断。
+            var unscheduledByReason = solveResult.UnscheduledTasks
+                .GroupBy(t => string.IsNullOrEmpty(t.Reason) ? "(空原因)" : t.Reason, StringComparer.Ordinal)
+                .OrderByDescending(g => g.Count())
+                .Take(5)
+                .Select(g => $"{g.Count()}×{g.Key}");
+            var explanationByReason = solveResult.ExplanationFacts
+                .Where(f => !string.IsNullOrEmpty(f.ReasonCode))
+                .GroupBy(f => f.ReasonCode, StringComparer.Ordinal)
+                .OrderByDescending(g => g.Count())
+                .Take(5)
+                .Select(g => $"{g.Count()}×{g.Key}");
+
+            // 求解过程追溯（B.2）：`DomainSolveResult.SolveTraceNotes` 是 1号位 已出口的字段，
+            //   此前 2号位 全仓零消费（`LPS.APS.Application`/`LPS.APS.Engine` grep 无引用）⇒ **静默丢弃**。
+            //   该集合是「非排程结果」的求解过程上下文（如 SCOPE_REFERENCE_MISSING / TARGET_MISSED /
+            //   SETUP_RESOLUTION），正是排不下时最需要的证据。此处按 Level+ReasonCode 聚合打印，不落库。
+            var traceByCode = solveResult.SolveTraceNotes
+                .GroupBy(n => $"{n.Level}:{n.ReasonCode}", StringComparer.Ordinal)
+                .OrderByDescending(g => g.Count())
+                .Take(5)
+                .Select(g => $"{g.Count()}×{g.Key}");
+
+            _logger.LogInformation(
+                "[Pegging] 求解结果明细: Success={Success}, IsRoughCut={Rough}, Error={Error}, "
+                + "Summary(Total={Total}, Scheduled={Scheduled}, Unscheduled={Unscheduled}, Issues={Issues}, ElapsedMs={Elapsed}) "
+                + "| UnscheduledTasks 原因 Top5: {UnschedReasons} "
+                + "| ExplanationFacts ReasonCode Top5: {ExplReasons} "
+                + "| SolveTraceNotes 共 {TraceCount} 条，Level:ReasonCode Top5: {TraceReasons}",
+                solveResult.Success, solveResult.IsRoughCut, solveResult.ErrorMessage ?? "(null)",
+                solveResult.Summary.TotalDrafts, solveResult.Summary.ScheduledCount,
+                solveResult.Summary.UnscheduledCount, solveResult.Summary.IssueCount, solveResult.Summary.ElapsedMs,
+                unscheduledByReason.Any() ? string.Join(" | ", unscheduledByReason) : "(空)",
+                explanationByReason.Any() ? string.Join(" | ", explanationByReason) : "(空)",
+                solveResult.SolveTraceNotes.Count,
+                traceByCode.Any() ? string.Join(" | ", traceByCode) : "(空)");
+
             var persistSw = System.Diagnostics.Stopwatch.StartNew();
             (result.GeneratedTasks, result.PhysicalPeggingCount, result.SupplyAllocationCount) =
                 await PersistDomainAndPeggingInTransactionAsync(
@@ -278,7 +327,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 result.GeneratedTasks.Count, result.PhysicalPeggingCount, result.SupplyAllocationCount);
 
             sw.Stop();
-            result.IsSuccess      = true;
+            // 【2026-10-08 修复】原为 `result.IsSuccess = true;` **无条件置真** ⇒ 求解器返回
+            //   `Success=false`（1号位 语义 = **技术失败**：Routing 非法 / 数量闭合错误 / 硬资源约束破坏）
+            //   时，本编排仍报成功；上层 `ExecuteDomainAsync` 的 `isSuccess = peggingFailed.Count == 0`
+            //   因此恒真 ⇒ **PV 被标 `Computed`、ETL 记「失败:0」、库里查不到任何失败痕迹**。
+            //   2026-10-08 实测即栽在此：PV2 22,135 条需求、求解 722s、FinalTask=0，而 ETL 写的是「失败:0」，
+            //   只能回 1号位 源码里猜丢弃点（`ErrorMessage` 也一并被丢）。
+            //   现口径：**Pegging 编排成功 且 求解器未报技术失败** ⇒ IsSuccess=true。
+            //   ⚠️ 不改变业务语义：1号位 明示「产能不足 / 排不下」属**业务结果**，走 `Success=true`
+            //      + `UnscheduledTasks` 出口，**不会**在此被判失败；此处只兜技术失败。
+            result.IsSuccess = solveResult.Success;
+            result.ErrorMessage = solveResult.Success
+                ? null
+                : string.IsNullOrWhiteSpace(solveResult.ErrorMessage)
+                    ? "求解器返回 Success=false（技术失败）但未提供 ErrorMessage"
+                    : $"求解器技术失败：{solveResult.ErrorMessage}";
             result.ExecutionTimeMs = sw.ElapsedMilliseconds;
             result.PeggingMs      = peggingMs;
             result.SolverMs       = solverSw.ElapsedMilliseconds;
@@ -385,15 +448,19 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         oldTaskNoByWorkOrder[r.MESWorkOrderNo] = r.TaskNo;
                 }
 
+                // B/C 桶「同批共号」登记表（T-002）：批身份 → 本 Run 内已分配的新 TaskNo。
+                // 作用域 = 本 PlanVersion 落库事务（跨域循环不共享，故声明在此 foreach 之前）。
+                var taskNoByBatch = new Dictionary<string, string>(StringComparer.Ordinal);
+
                 foreach (var final in solveResult.FinalTasks)
                 {
                     ct.ThrowIfCancellationRequested();
 
                     piByDemandKey.TryGetValue(final.SourceDraftId, out var mtsInstructionNo);
 
-                    // G4：连续份额从 ContinuationKey 反解 MES 工单号；TaskNo 三分支（继承旧号 / 新号）
+                    // G4：连续份额从 ContinuationKey 反解 MES 工单号；TaskNo 三分支（T-002/T-003/T-004）
                     var mesWorkOrderNo = ExtractMesWorkOrderNo(final.SourceDraftId);
-                    var taskNo = ResolveTaskNo(planVersionId, final.FinalDraftId, mesWorkOrderNo, oldTaskNoByWorkOrder);
+                    var taskNo = ResolveTaskNo(planVersionId, final, mesWorkOrderNo, oldTaskNoByWorkOrder, taskNoByBatch);
 
                     // S3c：人工槽合成 ResourceId 拆回——合成键（≥ ManualSlotResourceOffset）→ Task.ResourceId=NULL + Task.ManualSlotId=原槽号；
                     // 设备真实 ResourceId 原样落 ResourceId（P0-06 不丢 1号位 时间资源真相）。
@@ -410,6 +477,18 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         persistManualSlotId = null;
                     }
 
+                    // 真实路径身份落库（红线 Q1 / RT-001 / DB-002）：1号位 FinalTaskDraft 原样透传，**不回填 DEFAULT/1**。
+                    //   ⚠ `FinalTaskDraft.PathId` 是 `long?`，而 Task.PathId 是 `INT`（DDL v5.1.8.3）⇒ 越界即置 NULL，不静默截断。
+                    //   ⚠ 当前值仍会是 DEFAULT/1 —— 因为 1号位 侧 `StageTimingNodeBuilder.cs:295` 尚硬编码
+                    //     RouteCode=="DEFAULT"，2号位 不敢先停归一化（见台账 §T-1008l）。待 1号位 整改后本列自动变真值。
+                    int? persistPathId =
+                        final.PathId is { } pid && pid >= int.MinValue && pid <= int.MaxValue ? (int)pid : null;
+
+                    // ProductionDepartmentId：DB-002 要求落真实部门，但 1↔2 契约 `FinalTaskDraft` 尚无此字段
+                    //   （1号位 `OperationNode.ProductionDepartmentId` 有真值，未随 FinalTask 带出）。
+                    //   按 CLAUDE.md「1↔2 契约字段只按 1号位 点名扩」⇒ 此处先落 NULL 并挂账，不自行反推。
+                    int? persistDepartmentId = null;
+
                     var ids = await conn.QueryAsync<long>(
                         @"INSERT INTO [Task] (
                               PlanVersionId, TaskNo, OrderId, MaterialId,
@@ -418,6 +497,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                               ResourceId, ManualSlotId,
                               Status, IsLocked, IsCriticalPath, TaskType,
                               MTS_InstructionNo, SetupSource, StageCode,
+                              MESWorkOrderNo, ProductionDepartmentId, RouteCode, PathId,
+                              StageExecutionBatchDraftKey, StageExecutionBatchQty,
                               CreatedAt, UpdatedAt
                           )
                           OUTPUT INSERTED.Id
@@ -428,6 +509,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                               @ResourceId, @ManualSlotId,
                               @Status, @IsLocked, @IsCriticalPath, @TaskType,
                               @MTS_InstructionNo, @SetupSource, @StageCode,
+                              @MESWorkOrderNo, @ProductionDepartmentId, @RouteCode, @PathId,
+                              @StageExecutionBatchDraftKey, @StageExecutionBatchQty,
                               @CreatedAt, @UpdatedAt
                           )",
                         new
@@ -460,6 +543,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             // StageCode 增列（2026-09-21）：FinalTaskDraft.StageCode（=RoutingOperation.StageCode 大工艺）原样落库，
                             // 供 TaskDispatch 下发时区分「哪个 Stage 的指示」；空串落 NULL（与 MTS_InstructionNo 同口径）。
                             StageCode        = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
+                            // ── v5.1.8.3 新增列：真实身份 + MES 执行批（T-002/T-003 / DB-002 / 红线 Q1）──
+                            MESWorkOrderNo   = mesWorkOrderNo,
+                            ProductionDepartmentId = persistDepartmentId,
+                            // 空串落 NULL（与 StageCode 同口径）；**不得**把 DEFAULT 当占位真值写进去
+                            RouteCode        = string.IsNullOrWhiteSpace(final.RouteCode) ? null : final.RouteCode,
+                            PathId           = persistPathId,
+                            // C 桶由 1号位 给 Stage 执行批键（A/B 桶留空，见 09-29 加列脚本口径）；当前 1号位 尚未产出 ⇒ 恒 NULL
+                            StageExecutionBatchDraftKey = string.IsNullOrWhiteSpace(final.StageExecutionBatchDraftKey) ? null : final.StageExecutionBatchDraftKey,
+                            StageExecutionBatchQty      = final.StageExecutionBatchQty,
                             CreatedAt        = now,
                             UpdatedAt        = now
                         },
@@ -480,8 +572,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         OperationCode    = final.OperationCode,
                         ResourceId       = persistResourceId,   // S3c：拆键后（人工槽→NULL）；设备保留 1号位 实际 Resource（供跨域占用块提取）
                         ManualSlotId     = persistManualSlotId,
-                        RouteCode        = "DEFAULT",
-                        PathId           = 1,
+                        // 真实路径身份（红线 Q1）：与上方 INSERT 同源逐字一致，**不再硬编码 DEFAULT/1**
+                        RouteCode        = string.IsNullOrWhiteSpace(final.RouteCode) ? null : final.RouteCode,
+                        PathId           = persistPathId,
+                        MESWorkOrderNo   = mesWorkOrderNo,
+                        ProductionDepartmentId = persistDepartmentId,
+                        StageExecutionBatchDraftKey = string.IsNullOrWhiteSpace(final.StageExecutionBatchDraftKey) ? null : final.StageExecutionBatchDraftKey,
+                        StageExecutionBatchQty      = final.StageExecutionBatchQty,
                         Quantity         = final.Quantity,
                         UOM              = final.UOM,
                         PlannedStartTime = final.PlannedStartTime,
@@ -1557,6 +1654,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public DateTime? LastReportTime { get; set; }
         public DateTime? SourceUpdatedAt { get; set; }
         public string? LastReportResourceCode { get; set; }
+
+        // 2026-09-30 新增：工单级路线/部门（同一工单所有行同值）
+        public string? RouteCode { get; set; }
+        public int? ProductionDepartmentId { get; set; }
     }
 
     /// <summary>Stage 顺序行（APS_BOM_STAGE_PATH_RAW，ChildMaterialCode+StageCode → StageSeq）</summary>
@@ -1882,11 +1983,28 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var contSlices = result.Where(d => d.IsContinuation).ToList();
         var freeSlices = result.Where(d => !d.IsContinuation && d.LogicalDemandKey.EndsWith("/FREE", StringComparison.Ordinal)).ToList();
         if (contSlices.Count > 0)
+        {
             _logger.LogInformation(
                 "[Pegging][Continuity] 分桶完成: Continuation={ContCount}片 ΣE={E}, Free={FreeCount}片 ΣQ={FreeQty}, 涉及PI={PiCount}个",
                 contSlices.Count, contSlices.Sum(d => d.NetOutputQty),
                 freeSlices.Count, freeSlices.Sum(d => d.NetOutputQty),
                 contSlices.Select(d => d.ProductionInstructionNo).Distinct().Count());
+
+            // ── A/B 输入完整性显式告警（不静默）──
+            // 1号位 `PhaseTwoInitialScheduler.cs:285-301` 对 `IsContinuation` 需求硬 Fail Closed：
+            //   ContinuationKey / RouteCode / PathId / StartOperationCode / NoSplitMerge 缺任一
+            //   ⇒ 记 `UnscheduledDemandKeys` 且**不产任何 Task** —— 从 2号位 视角表现为「A/B 数量凭空消失」。
+            //   ContinuationKey / NoSplitMerge 已由 `CloneDemandSlice` 补齐；**RouteCode/PathId 补不了**：
+            //   一个 demand 按 MES 工单切成多片，各片可能走不同 Path，真实值只能由 5号位 按 slice 交付
+            //   （猜唯一 Path 正是 Q-3 明令禁止）。故此处把缺口**显式打到日志**，便于对账而非静默丢单。
+            var noPath = contSlices.Count(d => string.IsNullOrEmpty(d.RouteCode) || d.PathId is null);
+            if (noPath > 0)
+                _logger.LogWarning(
+                    "[Pegging][Continuity] A/B 输入不完整：{NoPath}/{Total} 片缺真实 RouteCode/PathId ⇒ " +
+                    "1号位 将按 Fail Closed 记 Unscheduled 且不产 Task（待 5号位 按 slice 交付路径身份）。涉及PI={PiCount}个",
+                    noPath, contSlices.Count,
+                    contSlices.Select(d => d.ProductionInstructionNo).Distinct().Count());
+        }
 
         return (result, overCommits);
     }
@@ -1898,7 +2016,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///   Q≤0 且仍有开工中剩余 → 不产 Demand/Task + 登记 Demand Mismatch（§9.2）；
     ///   每工单 → Continuation = DerivedRemainingQty（Ci；不受 Q 上限裁剪）；
     ///   Free = max(Q − ΣCi, 0)；E&gt;Q → 不砍单、不产自由 Task，登记 Execution Over-Commit（§9.1）。
-    /// ContinuationKey = 源 LogicalDemandKey + "/WO:" + MESWorkOrderNo；Free = 源 key + "/FREE"；
+    /// Slice 键（LogicalDemandKey）= 源 LogicalDemandKey + "/WO:" + MESWorkOrderNo；Free = 源 key + "/FREE"；
+    /// **ContinuationKey 与 Slice 键是两回事**（红线 Q3）：ContinuationKey = f(ScheduleRun, MESWorkOrderNo)，
+    ///   同一 MES 工单的全部 Slice **共享同一个** ContinuationKey，**不得把 LogicalDemandKey 拼进去**（否则同一工单裂分）。
     /// 共用源 AllocationSequence/DemandKey（P3.2 不新建 Allocation）。
     /// PlannedProcessQty 逐片按材料级良率单位投入比（源 PlannedProcessQty/NetOutputQty）反算（§16）。
     /// </summary>
@@ -1961,7 +2081,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 var startStage = !string.IsNullOrEmpty(ctx.StartStageCode) ? ctx.StartStageCode : demand.StartStageCode;
 
                 result.Add(CloneDemandSlice(demand, key, ci, Math.Round(ci * processRatio, 4),
-                    isContinuation: true, startStage, startOp));
+                    isContinuation: true, startStage, startOp,
+                    continuationKey: ContinuationKeyOf(demand.PlanVersionId, ctx.MESWorkOrderNo)));
             }
 
             var freeQty = q - sumE;
@@ -1991,7 +2112,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         decimal processQty,
         bool isContinuation,
         string? startStageCode,
-        string? startOperationCode) => new()
+        string? startOperationCode,
+        string? continuationKey = null) => new()
     {
         LogicalDemandKey       = logicalDemandKey,
         PlanVersionId          = s.PlanVersionId,
@@ -2013,7 +2135,30 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         PreferredResourceId    = s.PreferredResourceId,
         FallbackResourceId     = s.FallbackResourceId,
         IsContinuation         = isContinuation,
+        // ── v1.6 §1 + 0号位 2026-10-07 裁决：A/B 切片必须**显式**带齐身份字段，不靠默认值 ──
+        // 1号位 `PhaseTwoInitialScheduler.cs:285-301` 对 `IsContinuation` 需求做**硬 Fail Closed**：
+        //   ContinuationKey / RouteCode / PathId / StartOperationCode / NoSplitMerge 缺任一 ⇒
+        //   进 `UnscheduledDemandKeys`、**不产任何 Task**（静默丢单）。
+        //   ⇒ 本方法逐项显式赋值；缺项必须在此处可见，不得依赖「反正有默认值」。
+        ContinuationKey        = continuationKey,
+        RouteCode              = s.RouteCode,
+        PathId                 = s.PathId,
+        NoSplitMerge           = isContinuation,
+        PreferredResourceCode  = s.PreferredResourceCode,
     };
+
+    /// <summary>
+    /// 连续份额身份键（红线 Q3：一个 ScheduleRun 内，一个 MESWorkOrderNo 有且仅有一个 ContinuationKey）。
+    ///
+    /// 【口径】`CK-{PlanVersionId}-{MESWorkOrderNo}`
+    ///   · 生成权属 **2号位**（1号位 只透明消费 + FinalTask 原样回传，不生成/不解析/不拼接）；
+    ///   · 作用域 = 本 ScheduleRun（以 `PlanVersionId` 为运行身份）⇒ **同一工单跨 Run 的 Key 不同**，符合红线「Run 内唯一」；
+    ///   · **刻意不含 `LogicalDemandKey`** —— 拼进去会让同一 MES 工单的多个 Slice 各自得到不同的 Key，
+    ///     即红线明令禁止的「同一 MES 工单裂分」。
+    ///   · 确定性纯函数：同输入必得同值，可复算、可单测。
+    /// </summary>
+    internal static string ContinuationKeyOf(long planVersionId, string mesWorkOrderNo)
+        => $"CK-{planVersionId}-{mesWorkOrderNo}";
 
     /// <summary>
     /// 连续性分桶异常事件（G6）：E&gt;Q 执行超量 / Q=0 仍开工 两类，登记到 ScheduleExplanationFact（复用不加表）。
@@ -2060,17 +2205,68 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     }
 
     /// <summary>
-    /// TaskNo 三分支（冻结 §12.10，T09/T10/T22）：连续份额（mesWorkOrderNo 非空）且反查到旧 TaskNo → 继承（分支1，不新建）；
-    /// 连续份额但无旧 TaskNo（首次上线/无绑定）→ 新号（分支2）；自由份额（mesWorkOrderNo=null）→ 新号（分支3）。
+    /// TaskNo 三分支（冻结规则清单 v1.5 **T-002 / T-003 / T-004**，红线 Q2）：
+    ///
+    ///   · **T-002** TaskNo 是「**Stage 内 MES 执行批**」的 APS 跨版本业务身份，**一个 TaskNo 可对应 N 条 Operation Task**；
+    ///   · **T-003** 一个 TaskNo 绑定一个 MESWorkOrderNo；**MES 工单不跨 Stage**；
+    ///   · **T-004** A 继续旧 TaskNo/原 WO；B Solver 前 TaskNo=NULL、FinalTask 后由 2号位 生成新 TaskNo 绑定原 WO；
+    ///              只有 C 新建 MES 工单；
+    ///   · **T-005** `ExecutionBatchDraftKey` 是 **Solver 归组键，不是 TaskNo** ⇒ 本方法只拿它当**归组判据**，号另行生成。
+    ///
+    /// 分支：
+    ///   ① **A 桶**（有 MES 工单，且 `TaskDispatch` 反查到旧号）⇒ **继承旧号**（跨版本连续性，不新建）；
+    ///   ② **B 桶**（有 MES 工单但无旧号）⇒ 本 Run 内按 **(MESWorkOrderNo, StageCode)** 归组，同批共用一个新号；
+    ///   ③ **C 桶**（无 MES 工单）⇒ 本 Run 内按 **(ExecutionBatchDraftKey, StageCode)** 归组，同批共用一个新号。
+    ///
+    /// 为何 ②③ 都要再叠 `StageCode`：`ExecutionBatchDraftKey` 的键域是 `(需求键, 批序号)`
+    /// （`PhaseTwoInitialScheduler.ExecutionBatchKey`）**不含 Stage**，单用它会让一个 TaskNo 跨 Stage ⇒ 违反 T-003。
+    ///
+    /// ⚠ 旧实现（2026-10-08 前）：非继承分支一律 `PEGG-{pv}-{finalDraftId[..8]}` —— **按 Operation 一条一个号**，
+    ///   同一执行批的 N 条工序各拿一个号，直接违反 T-002「一个 TaskNo 可对应 N 条 Operation Task」。
     /// </summary>
     internal static string ResolveTaskNo(
         long planVersionId,
-        string finalDraftId,
+        FinalTaskDraft final,
         string? mesWorkOrderNo,
-        IReadOnlyDictionary<string, string> oldTaskNoByWorkOrder)
-        => mesWorkOrderNo != null && oldTaskNoByWorkOrder.TryGetValue(mesWorkOrderNo, out var oldTaskNo)
-            ? oldTaskNo
-            : $"PEGG-{planVersionId}-{finalDraftId[..8]}";
+        IReadOnlyDictionary<string, string> oldTaskNoByWorkOrder,
+        IDictionary<string, string> taskNoByBatch)
+    {
+        // ① A 桶：跨版本继承（T-004「A 继续旧 TaskNo/原 WO」）
+        if (mesWorkOrderNo != null && oldTaskNoByWorkOrder.TryGetValue(mesWorkOrderNo, out var oldTaskNo))
+            return oldTaskNo;
+
+        // ② / ③ B、C 桶：本 Run 内按「Stage 内 MES 执行批」归组，同批共号（T-002）
+        var batchKey = TaskNoBatchKey(mesWorkOrderNo, final.ExecutionBatchDraftKey, final.StageCode);
+        if (taskNoByBatch.TryGetValue(batchKey, out var existing))
+            return existing;
+
+        var newTaskNo = $"PEGG-{planVersionId}-{ShortHash16(batchKey)}";
+        taskNoByBatch[batchKey] = newTaskNo;
+        return newTaskNo;
+    }
+
+    /// <summary>
+    /// TaskNo 归组键 = 「Stage 内 MES 执行批」（T-002 + T-003「MES 工单不跨 Stage」）。
+    ///   · B 桶（<paramref name="mesWorkOrderNo"/> 非空）⇒ 以 **MES 工单 + Stage** 为批身份（一个 WO 一个号）；
+    ///   · C 桶（为空）⇒ 以 **Solver 归组键 + Stage** 为批身份（此时 MES 工单尚未创建，T-004）。
+    /// 两级键都带前缀（`WO|` / `EB|`）以免「工单号恰好等于某批键」时两类撞键。
+    /// </summary>
+    internal static string TaskNoBatchKey(string? mesWorkOrderNo, string? executionBatchDraftKey, string? stageCode)
+        => mesWorkOrderNo is not null
+            ? $"WO|{mesWorkOrderNo}|{stageCode}"
+            : $"EB|{executionBatchDraftKey}|{stageCode}";
+
+    /// <summary>
+    /// 批身份 → TaskNo 后缀的**确定性**短哈希（SHA-256 前 16 个十六进制字符 = 64 bit）。
+    ///
+    /// 为什么不能用 <c>string.GetHashCode()</c>：.NET Core 起它对 string 每进程随机加盐，
+    ///   **同一批键跨运行会得到不同值** ⇒ TaskNo 不可复算，破坏 T-002「跨版本业务身份」。
+    /// 为什么取 16 位：10 万批规模下生日碰撞概率 ≈ 3×10⁻¹¹，可忽略；且 `PEGG-{pv}-{16hex}` 远短于列宽 NVARCHAR(50)。
+    /// </summary>
+    internal static string ShortHash16(string s)
+        => Convert.ToHexString(
+               System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s)),
+               0, 8);
 
     /// <summary>
     /// 跨 Domain Quantity-Time（§8/D12）：下游域启动前，从上游域已落盘 Task 读取 ChildMaterialCode
@@ -2659,7 +2855,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var rows = await QueryChunkedInAsync(piNos, chunk =>
             _connectionManager.QueryAsync<OperationProgressRow>(
                 @"SELECT ProductionInstructionNo, MESWorkOrderNo, OperationName, StageCode,
-                         PlannedQty, GoodQty, LastReportTime, SourceUpdatedAt, LastReportResourceCode
+                         PlannedQty, GoodQty, LastReportTime, SourceUpdatedAt, LastReportResourceCode,
+                         RouteCode, ProductionDepartmentId
                   FROM OperationProgressSnapshot
                   WHERE ScheduleRunId = @ScheduleRunId
                     AND ProductionInstructionNo IN @PiNos",
@@ -2675,6 +2872,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     OperationCode = r.OperationName,   // V1：工序身份 = OperationName，无独立工序码列
                     OperationName = r.OperationName,
                     StageCode = r.StageCode,
+                    // 2026-09-30：MES 工单完整计划工序清单 + 工单创建部门，供 5号位 做路线定位
+                    RouteCode = r.RouteCode ?? string.Empty,
+                    ProductionDepartmentId = r.ProductionDepartmentId,
                     MESWorkOrderNo = r.MESWorkOrderNo,
                     PlannedQty = r.PlannedQty,
                     GoodQty = r.GoodQty,

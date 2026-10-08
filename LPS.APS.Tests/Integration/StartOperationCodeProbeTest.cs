@@ -51,7 +51,16 @@ public class StartOperationCodeProbeTest
         services.AddApplicationServices();
         services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         services.AddScoped<IFrozenStrategySnapshotProvider, FrozenStrategySnapshotFixtureProvider>();
-        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug).AddProvider(new MarkerLoggerProvider(new[] { "[Pegging][红线]", "[EECTX" })));
+        // 过滤口径（2026-09-30 修）：原 `[EECTX` 前缀会把逐工单的 [EECTX]/[EECTX-STARTSTAGE] Debug 行
+        // 全放进来（真实批次数百条），先吃满 MaxPrint 上限 ⇒ 末尾的 `[Pegging][红线]` 汇总行被挤掉、
+        // 探针等于没输出。现只放两类：
+        //   `[Pegging][红线]` —— 汇总 2~3 行，探针的主结论；
+        //   `[EECTX]`        —— 逐工单明细（含 startStage / opsCnt / remainingCnt / inputOpsTotal），
+        //                       用于判「E>0 是走上序前沿还是走 AllocateStageRemaining 比例分摊」。
+        // ⚠️ `[EECTX]` 是字面匹配，**不会**命中 `[EECTX-STARTSTAGE]` 行（中间隔着 `-`）；若要核
+        //    5号位 DetermineEffectiveStartStage 是否把 startStage 错推，需把 `[EECTX-STARTSTAGE]`
+        //    一并加进数组（本次未加）。
+        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug).AddProvider(new MarkerLoggerProvider(new[] { "[Pegging][红线]", "[EECTX]" })));
         services.AddScoped<DatabaseConnectionManager>();
 
         var sp = services.BuildServiceProvider();
@@ -114,7 +123,7 @@ public class StartOperationCodeProbeTest
     {
         private readonly string[] _markers;
         private static int _printed;
-        private const int MaxPrint = 60;
+        private const int MaxPrint = 400;
 
         /// <summary>是否打出过 [Pegging][红线] 定位行（= PI Position 装载真的跑到了）。</summary>
         internal static volatile bool SawRedline;

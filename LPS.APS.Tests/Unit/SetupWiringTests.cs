@@ -262,6 +262,9 @@ public class SetupWiringTests
                     AllowMerge = false,
                     AllowSplit = false
                 },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                //   本夹具验证的是 Setup 接线，非批决策 ⇒ 给一条 Material 级宽松策略（恒 1 批，不改变既有行为）。
+                BatchPolicies = TestBatchPolicy.Permissive(demands.Select(d => d.MaterialId)),
                 SetupTransitionRules = rules
             }
         };

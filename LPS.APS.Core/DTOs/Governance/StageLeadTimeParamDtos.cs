@@ -27,7 +27,7 @@ public sealed class StageLeadTimeParamDto
 
 /// <summary>
 /// 新增/编辑阶段提前期参数请求（治理侧直维护；PUT 整对象替换，不改 IsActive）。
-/// 粒度主键 = 工厂 + StageCode + 生产部门；物料/产品族为可选的更细降级匹配层。
+/// 粒度主键 = 工厂 + StageCode + 生产部门；物料/产品族为旧层，仅历史兼容（不参与 V1 正常匹配）。
 /// </summary>
 public sealed class SaveStageLeadTimeParamRequest
 {

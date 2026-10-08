@@ -28,6 +28,11 @@ public class PiPositionQueryRepository : IPiPositionQueryRepository
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 标量判空会随列表一起扩成 (…) 导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<PiPositionDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
     p.Id,
@@ -55,7 +60,7 @@ WHERE p.PlanVersionId = @PlanVersionId
     AND (@MaterialCode IS NULL OR p.MaterialCode LIKE '%' + @MaterialCode + '%')
     AND (@PositionType IS NULL OR p.PositionType = @PositionType)
     AND (@StageCode IS NULL OR p.CurrentStageCode = @StageCode OR p.NextStageCode = @StageCode)
-    AND (@AllowedFactories IS NULL OR o.SourceFactoryId IN @AllowedFactories)
+    AND (@HasFactories = 0 OR o.SourceFactoryId IN @AllowedFactories)
 ORDER BY p.ProductionInstructionNo, p.PositionType
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -66,6 +71,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             PositionType = positionType,
             StageCode = stageCode,
+            HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take

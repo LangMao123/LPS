@@ -22,6 +22,7 @@ public sealed class FrozenStrategySnapshot
     public SolverStrategyBlock SolverStrategy { get; set; } = new();    // ⑤ Solver 策略
     public CandidateGuardrailBlock CandidateGuardrail { get; set; } = new(); // ⑥ Candidate 技术 Guardrail
     public List<SetupTransitionRuleSnapshot> SetupTransitionRules { get; set; } = []; // ⑦ 产品转换换型规则本 Run 冻结内容（v1.2 §九/§十；0号位 裁决项2）
+    public List<BatchPolicyRuleSnapshot> BatchPolicy { get; set; } = []; // ⑧ 批量策略（Batch Policy）本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码；Material+ProductionDepartment 粒度）
 }
 
 /// <summary>
@@ -191,7 +192,7 @@ public sealed class PlanningYieldRule
 /// </summary>
 public sealed class SolverStrategyBlock
 {
-    public SolverStrategyMode Mode { get; set; }          // FORWARD / BACKWARD / MIXED（冻结 E1）
+    public SolverStrategyMode Mode { get; set; }          // AUTO / FORWARD / BACKWARD / MIXED（冻结 E1；AUTO=1号位按求解上下文决定最终方向，0号位 2026-10-07 裁决）
     public bool AllowMerge { get; set; } = false;         // 是否允许合批（1号位 PhaseTwoInitialScheduler.cs:158 消费；3号位 2026-09-04 补源）
     public DynamicBottleneckMode BottleneckMode { get; set; }   // 选「哪个资源当瓶颈锚点」的枚举（Auto/PreferAnchor/ForceAnchor/NotAnchor）
     public string? AnchorResourceCode { get; set; }        // 锚点资源编码（业务编码，非 int ResourceId）；BottleneckMode=PreferAnchor/ForceAnchor/NotAnchor 时生效，Auto 忽略；空=未指定→等价 Auto。P1-02 归 3号位 冻结、2号位 传入、1号位 消费
@@ -209,7 +210,7 @@ public sealed class SolverStrategyBlock
     public decimal CapacityShortageUtilizationThreshold { get; set; } = 0.90m;     // 利用率 > 此值 → 判延期根因产能短缺
 }
 
-public enum SolverStrategyMode { Forward, Backward, Mixed }
+public enum SolverStrategyMode { Forward, Backward, Mixed, Auto }
 public enum DynamicBottleneckMode { Auto, PreferAnchor, ForceAnchor, NotAnchor }
 
 public sealed class OnTimeTargetParams
@@ -278,4 +279,27 @@ public sealed class SetupTransitionRuleSnapshot
     public int? ToMaterialId { get; set; }                   // 后产品（EXACT 明确；DEFAULT 为 null）
     public string RuleType { get; set; } = "DEFAULT";       // "EXACT" / "DEFAULT"（v1.2 §九）
     public decimal SetupMinutes { get; set; }                // 换型分钟（真实资源占用，非负）
+}
+
+/// <summary>
+/// ⑧ 批量策略（Batch Policy）规则快照——本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码）。
+/// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 可空=Material 级默认）。
+/// 来源：TaskSplitRuleConfig 物理表 active + 生效区间内规则，由 FrozenStrategySnapshotProvider 装配时投影。
+/// 缺策略（某 Material+Dept 无命中规则）由消费侧 fail-closed（BATCH_POLICY_MISSING），本块不承载信号位。
+/// 仅业务键 + 参数，不含审计字段（Id/Created/Updated/IsActive——投影时只取有效规则）。
+/// </summary>
+public sealed class BatchPolicyRuleSnapshot
+{
+    public int MaterialId { get; set; }                         // 物料（正式业务键）
+    public int? ProductionDepartmentId { get; set; }            // 生产部门（可空=Material 级默认）
+
+    public decimal? MinExecutionBatchQty { get; set; }          // 硬最小批量
+    public decimal? MaxExecutionBatchQty { get; set; }          // 硬最大批量（NULL=无硬上限）
+    public decimal? PreferredBatchQty { get; set; }             // 软偏好切点
+    public bool AllowSplit { get; set; }                        // 是否允许拆分
+    public bool AllowMerge { get; set; }                        // 是否允许合并
+    public int? MaxOptimizationSplitCount { get; set; }         // 仅限制优化性拆分搜索（不限制硬 Max 强制拆分）
+    public int? MaxBatchCandidates { get; set; }                // 单问题最多评估候选数
+    public string? BottleneckSplitStrategy { get; set; }        // PREFER_SPLIT / PREFER_MERGE（瓶颈资源拆分/合并策略）
+    public string? NonBottleneckStrategy { get; set; }          // PREFER_LARGE_BATCH / PREFER_SMALL_BATCH（非瓶颈批量策略）
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Shared.Models;
@@ -91,6 +92,11 @@ internal class PhaseOneConstraintBuilder
         // 8. 装载 RunScope（M5 第一批：Run 级交期覆盖 + Task 软目标）
         // ═══════════════════════════════════════════════
         BuildRunScope(request, context);
+
+        // ═══════════════════════════════════════════════
+        // 9. 装载 ⑧块 Batch Policy（P0-01：Material + ProductionDepartment 键控）
+        // ═══════════════════════════════════════════════
+        BuildExecutionBatchPolicies(request, context);
 
         return context;
     }
@@ -281,12 +287,39 @@ internal class PhaseOneConstraintBuilder
                 result[demand.MaterialId] = stageSet;
             }
 
-            // 工序节点集合（仅 DEFAULT 路径，V1 单路径）：键 = (StageCode, OperationCode)。
+            var depsForMaterial = depsByMaterial.TryGetValue(demand.MaterialId, out var dl)
+                ? dl
+                : new List<RoutingDependency>();
+
+            // 按 (RouteCode, PathId) **逐路径**计算可达 Stage 后取**并集**（v1.6 + Q1：PathId 进图键、禁止跨 Path 连边）。
+            // V1 装载层归一化为单路径（'DEFAULT'/1）⇒ 恰好一组，与旧实现（只取 'DEFAULT'）**行为等价**；
+            // V2 多路径 ⇒ 逐路径各算再并集：只并**集合**、不跨路径连边（并集是保守口径，
+            // 宁可判「该 Stage 在范围内」也不误报缺失，延续 P1-06 初衷）。
+            foreach (var pathGroup in ops.GroupBy(op => RoutePathKey.Of(op.RouteCode, op.PathId)))
+            {
+                CollectReachableStagesForPath(
+                    pathGroup,
+                    depsForMaterial.Where(d => d.RouteCode == pathGroup.Key.RouteCode
+                                            && d.PathId == pathGroup.Key.PathId),
+                    demand,
+                    stageSet);
+            }
+        }
+
+        return result;
+
+        // 单条 (RouteCode, PathId) 路径内的可达 Stage 收集（局部函数：复用外层实例方法 ResolveNodeKey）
+        void CollectReachableStagesForPath(
+            IEnumerable<RoutingOperation> pathOps,
+            IEnumerable<RoutingDependency> pathDeps,
+            LogicalProductionDemand demand,
+            HashSet<string> stageSet)
+        {
+            // 工序节点集合（单条路径内）：键 = (StageCode, OperationCode)。
             // ⚠ 0号位 2026-09-29 裁决 §5.3：原实现是「工序码 → StageCode」单键 + First() 任取，
             //   同码跨 Stage 时会**判错整个可达 Stage 集合**（连带影响 P1-06 缺失判定与部门锁定范围），
             //   比单点覆盖更严重。此处升维。
-            var nodes = ops
-                .Where(op => op.RouteCode == "DEFAULT")
+            var nodes = pathOps
                 .GroupBy(op => OperationNodeKey.Of(op.StageCode, op.OperationCode))
                 .ToDictionary(g => g.Key, g => g.First());
 
@@ -311,34 +344,31 @@ internal class PhaseOneConstraintBuilder
                 inDegree[nodeKey] = 0;
             }
 
-            if (depsByMaterial.TryGetValue(demand.MaterialId, out var deps))
+            foreach (var dep in pathDeps)
             {
-                foreach (var dep in deps.Where(d => d.RouteCode == "DEFAULT"))
+                var fromKey = nodesByOperationCode.TryGetValue(dep.FromOperationCode, out var fromCandidates)
+                    ? ResolveNodeKey(fromCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                    : null;
+
+                var toKey = nodesByOperationCode.TryGetValue(dep.ToOperationCode, out var toCandidates)
+                    ? ResolveNodeKey(toCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
+                    : null;
+
+                if (fromKey == null || toKey == null)
                 {
-                    var fromKey = nodesByOperationCode.TryGetValue(dep.FromOperationCode, out var fromCandidates)
-                        ? ResolveNodeKey(fromCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
-                        : null;
+                    continue; // 无法消解 ⇒ 不猜（丢边由 BuildRoutingGraphs 统一计数）
+                }
 
-                    var toKey = nodesByOperationCode.TryGetValue(dep.ToOperationCode, out var toCandidates)
-                        ? ResolveNodeKey(toCandidates, k => nodes[k].ProductionDepartmentId, dep.ProductionDepartmentId)
-                        : null;
+                if (!adjacency.TryGetValue(fromKey.Value, out var tos))
+                {
+                    tos = new List<OperationNodeKey>();
+                    adjacency[fromKey.Value] = tos;
+                }
+                tos.Add(toKey.Value);
 
-                    if (fromKey == null || toKey == null)
-                    {
-                        continue; // 无法消解 ⇒ 不猜（丢边由 BuildRoutingGraphs 统一计数）
-                    }
-
-                    if (!adjacency.TryGetValue(fromKey.Value, out var tos))
-                    {
-                        tos = new List<OperationNodeKey>();
-                        adjacency[fromKey.Value] = tos;
-                    }
-                    tos.Add(toKey.Value);
-
-                    if (inDegree.ContainsKey(toKey.Value))
-                    {
-                        inDegree[toKey.Value]++;
-                    }
+                if (inDegree.ContainsKey(toKey.Value))
+                {
+                    inDegree[toKey.Value]++;
                 }
             }
 
@@ -409,8 +439,6 @@ internal class PhaseOneConstraintBuilder
                 }
             }
         }
-
-        return result;
     }
 
     /// <summary>
@@ -428,14 +456,14 @@ internal class PhaseOneConstraintBuilder
 
         foreach (var (materialId, operations) in operationsByMaterial)
         {
-            // 按 RouteCode 再分组
-            var operationsByRoute = operations
-                .GroupBy(op => op.RouteCode)
+            // 按 (RouteCode, PathId) 再分组（v1.6 + Q1：PathId 必须进图键，禁止跨 Path 连边）
+            var operationsByPath = operations
+                .GroupBy(op => RoutePathKey.Of(op.RouteCode, op.PathId))
                 .ToDictionary(g => g.Key, g => g.ToList());
 
-            var routeGraphs = new Dictionary<string, RoutingGraph>();
+            var routeGraphs = new Dictionary<RoutePathKey, RoutingGraph>();
 
-            foreach (var (routeCode, routeOps) in operationsByRoute)
+            foreach (var (pathKey, routeOps) in operationsByPath)
             {
                 var graph = new RoutingGraph();
 
@@ -474,7 +502,9 @@ internal class PhaseOneConstraintBuilder
                 //   ProductionDepartmentId）⇒ 边的 Stage 归属必须从本图节点反查消解。消解不唯一时
                 //   计数并丢弃该边，**不猜**（0号位 §5.3「禁止半升级」+ 不静默原则）。
                 var dependencies = routingDependencies
-                    .Where(dep => dep.MaterialId == materialId && dep.RouteCode == routeCode)
+                    .Where(dep => dep.MaterialId == materialId
+                                  && dep.RouteCode == pathKey.RouteCode
+                                  && dep.PathId == pathKey.PathId)
                     .ToList();
 
                 // 工序码 → 候选节点键索引（消解依赖端点用；同码跨 Stage 时 >1 个候选）
@@ -527,7 +557,7 @@ internal class PhaseOneConstraintBuilder
                     .Where(nodeKey => !allToOps.Contains(nodeKey))
                     .ToList();
 
-                routeGraphs[routeCode] = graph;
+                routeGraphs[pathKey] = graph;
             }
 
             context.RoutingGraphs[materialId] = routeGraphs;
@@ -731,14 +761,14 @@ internal class PhaseOneConstraintBuilder
         List<OperationResourceEligibility> eligibilities,
         ConstraintContext context)
     {
-        // 按 EligibilityLookupKey(MaterialId, ProductionDepartmentId, RouteCode, OperationCode) → ResourceId 列表（按 Priority 排序）
+        // 按 EligibilityLookupKey(MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode) → ResourceId 列表（按 Priority 排序）
         // P0-01修复：使用冻结接口 OperationResourceEligibility，不再使用旧的 ResourceEligibility
         // 第4轮C1修复：索引加入MaterialId，避免不同物料共享资源资格
         // 0号位 2026-09-29 §5.3 落实：**补上 ProductionDepartmentId** —— 上游 lockedEligibilities 已按
         //   四元组（含部门）过滤，故此处以同一四元组分组才是自洽口径；旧三元键会把两个部门的同名工序
         //   资格合并成一份（跨部门串资源）。契约无 StageCode 字段，无法再细到 Stage（残留已在键类型上注明）。
         var eligibilityGroups = eligibilities
-            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.OperationCode))
+            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.PathId, e.OperationCode))
             .ToDictionary(
                 g => g.Key,
                 g => g.OrderBy(e => e.Priority)
@@ -752,7 +782,7 @@ internal class PhaseOneConstraintBuilder
         // 第4轮C1修复：索引加入MaterialId；本次再补部门（同上）
         // (EligibilityLookupKey, ResourceId) → CapacityFactor
         var capacityFactors = eligibilities
-            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.OperationCode))
+            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.PathId, e.OperationCode))
             .ToDictionary(
                 g => g.Key,
                 g => g.ToDictionary(
@@ -904,6 +934,30 @@ internal class PhaseOneConstraintBuilder
     }
 
     /// <summary>
+    /// P0-01 接线：装载第⑧块冻结 Batch Policy 规则 → <see cref="ConstraintContext.ExecutionBatchPolicies"/>。
+    ///
+    /// 数据链路：`TaskSplitRuleConfig`（3号位 治理）→ 本 Run 一次性 `FrozenStrategySnapshot.BatchPolicies`
+    ///   → 2号位 投影进 `SolverStrategySnapshot.BatchPolicies`（1↔2 契约，0号位 (7).md §十）
+    ///   → 此处**整块逐字收进** `ConstraintContext`（**不在装载层裁剪、不按 Domain 塌成单值**）
+    ///   → `PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy` 按 `(MaterialId, Dept)` **逐需求**解析。
+    ///
+    /// **不得**在装载层做「同键合并 / 取第一条」等裁剪：键域语义（精确命中 + Material 级默认回落）
+    ///   由解析侧 `ResolveExecutionBatchPolicy` 统一负责，装载层只做**保真搬运**。
+    /// 空（`StrategySnapshot` 为 null 或 ⑧块为空）⇒ 策略集为空 ⇒ 每需求恒 1 批，行为与旧版**逐字一致**。
+    /// </summary>
+    private static void BuildExecutionBatchPolicies(DomainSolveRequest request, ConstraintContext context)
+    {
+        var policies = request.StrategySnapshot?.BatchPolicies;
+        if (policies is null || policies.Count == 0)
+        {
+            context.ExecutionBatchPolicies = new List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot>();
+            return;
+        }
+
+        context.ExecutionBatchPolicies = new List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot>(policies);
+    }
+
+    /// <summary>
     /// M5 第一批：装载 RunScope 投影（Run 级交期覆盖 + Task 软目标）成内存词典。
     /// 键体系已由 2号位 转为内存键（DueDateOverrides=LogicalDemandKey；TaskTargetOverrides=(DraftId, OperationCode)）。
     /// null/空 RunScope = FULL 语义 → 两词典均空，现有行为零改变（向后兼容）。
@@ -933,9 +987,266 @@ internal class PhaseOneConstraintBuilder
 internal class ConstraintContext
 {
     /// <summary>
-    /// 工序依赖图：MaterialId → RouteCode → 工序依赖关系
+    /// 工序依赖图：MaterialId → <see cref="RoutePathKey"/>(RouteCode, PathId) → 工序依赖关系。
+    /// 键升维依据见 <see cref="RoutePathKey"/>（v1.6 新增要求 + Q1「禁止跨 Path 连边」）。
+    /// 旧键为 RouteCode 单键 ⇒ V2 多路径时把互斥备选路径并成一张图（跨 Path 连边）。
     /// </summary>
-    public Dictionary<int, Dictionary<string, RoutingGraph>> RoutingGraphs { get; set; } = new();
+    public Dictionary<int, Dictionary<RoutePathKey, RoutingGraph>> RoutingGraphs { get; set; } = new();
+
+    /// <summary>
+    /// V1 单路径解析：取该物料**唯一**一条 (RouteCode, PathId) 的 Routing 图。
+    /// ⚠ **2026-10-07 起口径收窄**：`LogicalProductionDemand` 已补 `RouteCode`/`PathId` 契约字段
+    ///   （v1.6 §新增/替换实施要求 + 0号位 裁决 §六 授权落 Core），需求**已能自述走哪条路径**
+    ///   ⇒ 常规调用应改用 <see cref="TryGetRoutingGraph"/> / <see cref="TryGetDemandRoutingGraph"/>。
+    ///   本方法**仅保留两处兜底**（均要求「唯一」才命中，**任何情况下都不猜**，与 Q-3 红线不冲突）：
+    ///     · 需求**未**声明固定路径、且该物料在本请求内**只有一条**路径时直接取用；
+    ///     · 锁定任务继承时的路径身份反查（需求无固定路径时）。
+    ///   · 0 条 → false（无 Routing，调用方按既有语义处理）；
+    ///   · 1 条 → 命中（与升维前 <c>TryGetValue("DEFAULT")</c> 行为等价）；
+    ///   · &gt;1 条 → **false 且登记**（多路径必须由需求固定路径或 C 桶候选择优定夺，
+    ///     此处**不猜**、不取 First()，与全仓「不静默」原则一致）。
+    /// </summary>
+    public bool TryGetSingleRoutingGraph(int materialId, [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        if (byPath.Count == 1)
+        {
+            graph = byPath.Values.First();
+            return true;
+        }
+
+        AmbiguousRoutingPathMaterialIds.Add(materialId);
+        return false;
+    }
+
+    /// <summary>
+    /// 【Path-aware 解析（0号位 2026-10-07 裁决 Q-3，**必须整改**）】按**给定的** (RouteCode, PathId)
+    /// 精确取图，不再假设「一物料一图」。
+    ///
+    /// 任务级调用点一律用**任务自身**的 (RouteCode, PathId) 调用本方法：已有 FinalTask 却按 MaterialId
+    /// 取「物料唯一图」是旧的单路径假设，多 Path 下会**串 Path**（拿另一条备选路径的前驱/后继边接本任务工序）。
+    ///
+    /// **Fail Closed（0号位 2026-10-07 裁决 §三 新增红线）**：routeCode / pathId 任一缺失 ⇒ 返回 false，
+    ///   **不得**退回 <see cref="TryGetSingleRoutingGraph"/> 按物料猜唯一 Path，也不得跨 Path 找替代节点。
+    ///   调用方按既有语义处理（跳过该项判定 / 该需求 Unscheduled）。
+    /// </summary>
+    public bool TryGetRoutingGraph(
+        int materialId,
+        string? routeCode,
+        long? pathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        // Fail Closed：缺路径身份不猜（空串不是合法 RouteCode）。
+        // pathId 用 long? 承载（FinalTaskDraft.PathId 为 long?），越 int 域视为非法身份 ⇒ 同样不猜。
+        if (string.IsNullOrEmpty(routeCode) || pathId is null
+            || pathId.Value < int.MinValue || pathId.Value > int.MaxValue)
+        {
+            return false;
+        }
+
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        return byPath.TryGetValue(RoutePathKey.Of(routeCode, (int)pathId.Value), out graph);
+    }
+
+    /// <summary>
+    /// 取该物料在本次请求内的**全部**候选路径（(RouteCode, PathId) → 图），按 (RouteCode, PathId) 升序 ——
+    /// 顺序确定、可重放（C桶候选内择优要求确定性）。无路径 ⇒ false。
+    /// </summary>
+    public bool TryGetRoutingGraphs(
+        int materialId,
+        [NotNullWhen(true)] out List<KeyValuePair<RoutePathKey, RoutingGraph>>? candidates)
+    {
+        candidates = null;
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        candidates = byPath
+            .OrderBy(kv => kv.Key.RouteCode, StringComparer.Ordinal)
+            .ThenBy(kv => kv.Key.PathId)
+            .ToList();
+        return true;
+    }
+
+    /// <summary>
+    /// 需求 → **已选中路径** 登记表（Scheduling 内部，不动 Core）。
+    ///
+    /// Phase2 需求级选路后登记；Phase4 局部修复 / Phase5 各需求级消费点复用。
+    /// 依据 RT-002「A/B 固定真实 RouteCode + PathId，**局部修复不得换路径**」——
+    /// 局部修复**不得重选路径**，只能复用 Phase2 的选中结果。
+    /// 未登记（单 Path 退化 / 需求自带固定路径）⇒ 调用方回落需求自身 RouteCode/PathId 或唯一那条。
+    /// </summary>
+    public Dictionary<string, RoutePathKey> ChosenRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// **批键 → 本批选中路径键**（P0-03 升维，0号位 (7).md §六/§七）。
+    ///
+    /// 为什么必须升维：`ChosenRoutePaths` 是「**需求** → 单一路径键」的单值表，**无法承载**多批各自选路
+    ///   （`D1 → Batch-001 走 RouteA`、`Batch-002 走 RouteB` 完全合法，RT-003/RT-004）。
+    ///   本表按**执行批**登记，Phase4 局部修复据此**逐批**取图 —— 不串批、不重选路径（RT-002）。
+    ///
+    /// 登记时机：Phase2 步骤 4 落定后**每批**登记（单批亦登记，与 `ChosenRoutePaths` 同值 ⇒ 行为零回归）。
+    /// 未登记（该批未及落定）⇒ 调用方回落需求固定路径 → 唯一那条（同 <see cref="TryGetDemandRoutingGraph"/>）。
+    /// </summary>
+    public Dictionary<string, RoutePathKey> ChosenBatchRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// **需求 → 本 Run 该需求的执行批清单（批键 + 本批数量）**（P0-03）。
+    ///
+    /// Phase4 局部修复的基本单位 = **执行批**（不是 `LogicalProductionDemand`）：据此**逐批**重建，
+    ///   **不得**用整份需求数量重建，**不得**把 Batch-002 的修复结果写回 Batch-001 的键。
+    /// Phase2 `FormExecutionBatches` 产出后**在需求循环开头即登记**（先于试排/择优/落定）。
+    /// 空（未登记）⇒ 该需求按**单批**回落（键 = `EB|{需求键}|001`，数量 = 需求数量）—— 与升维前逐字一致。
+    /// </summary>
+    public Dictionary<string, List<ExecutionBatchPlanEntry>> ExecutionBatchPlans { get; set; }
+        = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 需求 → **本 Run 该需求的全部执行批归批键**（Scheduling 内部，不动 Core）。
+    ///
+    /// Phase2 `FormExecutionBatches` 产出后**在需求循环开头即登记**（先于试排/择优/落定），
+    /// Phase4 **逐批**修复（`PhaseFourLocalRepair.ExpandRepairUnits` 读本表 + <see cref="ExecutionBatchPlans"/>）
+    /// 按**本批键**重建 —— 保证「局部修复不得把同一执行批劈成两个键」，
+    /// 且不得把 Batch-002 写回 Batch-001 的键（P0-03；原 `ResolveExecutionBatchKeyForRebuild` 已删除）。
+    /// </summary>
+    public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// ⑧块 Batch Policy —— **按 `(MaterialId, ProductionDepartmentId?)` 键控的策略集**
+    /// （P0-01 整改，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
+    ///
+    /// **为什么必须是集合而不是单值**：正式业务粒度 = **Material + ProductionDepartment**（B-001；
+    ///   `TaskSplitRuleConfig` / `BatchPolicyRuleSnapshot` 同口径）。一个 Domain 内
+    ///   `Material A + Dept X`、`Material A + Dept Y`、`Material B + Dept X` 各有不同策略是**正常的**；
+    ///   用单值代表整个 Domain 会让不同物料/部门**错误共用批量硬约束**，直接改变排程业务结果。
+    ///
+    /// **解析**：<see cref="PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy"/> 按需求
+    ///   `(MaterialId, StartStageCode → ProductionDepartmentId)` 精确命中；未命中回落
+    ///   `(MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（该默认语义由 ⑧块 DTO 自身承载）；
+    ///   仍无命中 ⇒ **缺策略**。⚠ P0-01（0号位 2026-10-08 §四）后缺策略**不再**等于「不拆、恒 1 批」：
+    ///   C 桶需求一律判 `BATCH_POLICY_MISSING` 并 **Fail Closed**（不产 FinalTask、不进 Phase4）。
+    ///   正式兜底链第③级「Global Batch Default」由 2/3号位 在上游**投影成有效 Policy** 后再交 1号位，
+    ///   1号位 不得自行展开该级、更不得把末级 `null` 解释成「单批合法」。
+    ///
+    /// **载体**：`SolverStrategySnapshot.BatchPolicies`（⑧块，1↔2 契约，0号位 (7).md §十/§十一）⇒
+    ///   `PhaseOneConstraintBuilder.BuildExecutionBatchPolicies` **整块逐字**收进本集合（**不在装载层裁剪**，
+    ///   键域解析统一由 `ResolveExecutionBatchPolicy` 负责）。
+    ///   空集合 ⇒ 每个 C 桶需求均判 `BATCH_POLICY_MISSING`（Fail Closed）。
+    /// </summary>
+    public List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot> ExecutionBatchPolicies { get; set; } = new();
+
+    /// <summary>
+    /// 需求级取图（Phase4 / Phase5 消费点用），解析顺序：
+    ///   ① **Phase2 已登记选中路径**（<see cref="ChosenRoutePaths"/>）—— RT-002「局部修复不得换路径」，**优先且不重选**；
+    ///   ② 需求自带固定路径（A/B，<c>LogicalProductionDemand.RouteCode/PathId</c>）；
+    ///   ③ 唯一那条（单路径退化，行为与升维前等价）；多路径且未登记 ⇒ **false，不猜**。
+    /// </summary>
+    public bool TryGetDemandRoutingGraph(
+        string logicalDemandKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        if (ChosenRoutePaths.TryGetValue(logicalDemandKey, out var chosen))
+        {
+            return RoutingGraphs.TryGetValue(materialId, out var byPath)
+                   && byPath.TryGetValue(chosen, out graph);
+        }
+
+        if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
+        {
+            return true;
+        }
+
+        return TryGetSingleRoutingGraph(materialId, out graph);
+    }
+
+    /// <summary>
+    /// **批级取图**（P0-03，Phase4 局部修复用）。解析顺序：
+    ///   ① **本批已登记选中路径**（<see cref="ChosenBatchRoutePaths"/>）—— RT-002「局部修复不得换路径」，优先且不重选；
+    ///   ② 需求自带固定路径（A/B，`RouteCode/PathId`）；
+    ///   ③ 唯一那条；多路径且未登记 ⇒ **false，不猜**（Fail Closed）。
+    ///
+    /// 与 <see cref="TryGetDemandRoutingGraph"/> 的唯一差别是①的键：本方法按**批键**，后者按**需求键**。
+    /// </summary>
+    public bool TryGetBatchRoutingGraph(
+        string batchKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        if (ChosenBatchRoutePaths.TryGetValue(batchKey, out var chosen))
+        {
+            return RoutingGraphs.TryGetValue(materialId, out var byPath)
+                   && byPath.TryGetValue(chosen, out graph);
+        }
+
+        if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
+        {
+            return true;
+        }
+
+        return TryGetSingleRoutingGraph(materialId, out graph);
+    }
+
+    /// <summary>
+    /// 需求级取**路径键**（Calendar 判据 Path 隔离用，P1-04）。解析顺序与
+    /// <see cref="TryGetDemandRoutingGraph"/> 完全一致：选中路径 → 需求固定路径 → 唯一那条。
+    /// 多路径且未登记 ⇒ false（不猜）。
+    /// </summary>
+    public bool TryGetDemandRoutePath(
+        string logicalDemandKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        out RoutePathKey pathKey)
+    {
+        pathKey = default;
+
+        if (ChosenRoutePaths.TryGetValue(logicalDemandKey, out var chosen))
+        {
+            pathKey = chosen;
+            return true;
+        }
+
+        if (!string.IsNullOrEmpty(demandRouteCode) && demandPathId is not null)
+        {
+            pathKey = RoutePathKey.Of(demandRouteCode, demandPathId.Value);
+            return true;
+        }
+
+        if (RoutingGraphs.TryGetValue(materialId, out var byPath) && byPath.Count == 1)
+        {
+            pathKey = byPath.Keys.First();
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 同一物料存在 &gt;1 条 (RouteCode, PathId) 路径、而需求侧无路径选择载体的物料集合。
+    /// V1 装载层归一化为单路径时恒为空；Q1 停用归一化后若出现，即 V2 多路径选路缺口的可见信号。
+    /// </summary>
+    public HashSet<int> AmbiguousRoutingPathMaterialIds { get; set; } = new();
 
     /// <summary>
     /// 本次求解范围内的可达 Stage：MaterialId → StageCode 集合（Phase1 <c>BuildReachableStages</c> 产出）。
@@ -1113,6 +1424,34 @@ internal readonly record struct OperationNodeKey(string StageCode, string Operat
 }
 
 /// <summary>
+/// Routing 路径身份：**(RouteCode, PathId)**。
+/// 依据：《APS_V1_1号位有限产能排程开发实施包 v1.6》新增实施要求 + 本轮统一执行红线 Q1——
+/// 「PathId 必须进入 Graph/Dependency/Eligibility 节点和匹配键，**禁止跨 Path 连边或 Eligibility 混用**」。
+/// 契约 <c>RoutingOperation.PathId</c> / <c>RoutingDependency.PathId</c> / <c>OperationResourceEligibility.PathId</c>
+/// 均为真实值 ⇒ 图/边的分组键可携带。升维后，同 (物料, RouteCode) 但不同 Path 的工序与依赖
+/// **不再被并入同一张图**（旧实现按 RouteCode 单键分组，V2 多路径时会把互斥备选路径并成一张图）。
+/// V1 装载层目前把所有工序归一化为 'DEFAULT'/1（2号位 <c>NormalizeToSingleRoute</c>），
+/// 故本键在 V1 恒为唯一一组，行为与升维前等价；Q1 要求装载层停用该归一化后，本键即真实生效。
+/// </summary>
+/// <summary>
+/// 执行批的**求解态身份**（P0-03）：Phase2 `FormExecutionBatches` 形成后登记，
+/// 供 Phase4 局部修复**逐批**重建（键 + 本批数量）。Scheduling 内部类型，非 1↔2 契约面。
+/// </summary>
+internal readonly record struct ExecutionBatchPlanEntry(
+    string BatchKey,
+    decimal NetOutputQty,
+    decimal PlannedProcessQty);
+
+internal readonly record struct RoutePathKey(string RouteCode, int PathId)
+{
+    /// <summary>空安全构造：null RouteCode 归一化为 string.Empty（与 2号位「RouteCode 恒非空」口径一致）。</summary>
+    public static RoutePathKey Of(string? routeCode, int pathId)
+        => new(routeCode ?? string.Empty, pathId);
+
+    public override string ToString() => $"{RouteCode}::{PathId}";
+}
+
+/// <summary>
 /// 工序资源资格 / 产能系数查找键：MaterialId + ProductionDepartmentId + RouteCode + OperationCode。
 /// ⚠ **结构上限**：契约 <c>OperationResourceEligibility</c>（`LPS.APS.Core/Entities/Aps/OperationResourceEligibility.cs`）
 /// **没有 StageCode 字段** —— 故该查找键**无法**携带 Stage 上下文（裁决 §5.2 的完整复合键在此不可达）。
@@ -1120,9 +1459,16 @@ internal readonly record struct OperationNodeKey(string StageCode, string Operat
 /// 同名工序的资源资格合并成一份 ⇒ 跨部门串资源）。部门维度是「物料×阶段」的联合属性，可作 Stage 的近似区分。
 /// **残留（数据模型限制，非 1号位 可修）**：同物料 + 同部门下若两个 Stage 出现同一 OperationCode，
 /// 其资格仍合并 —— 该情形由装载层诊断登记，1号位 不猜。
+///
+/// 2026-10-05 冻结补齐（《APS_V1_1号位有限产能排程开发实施包 v1.6》新增要求 + Q1）：
+/// **补上 PathId**。原文：「PathId 必须进入 Graph/Dependency/Eligibility 节点和匹配键，
+/// 禁止跨 Path 连边或 Eligibility 混用」。契约 <c>OperationResourceEligibility.PathId</c>
+/// 与 <c>RoutingOperation.PathId</c> 均为真实值 ⇒ 键可携带。补 PathId 后，同
+/// (物料, 部门, RouteCode, OperationCode) 但不同 Path 的资格不再被合并
+/// （2号位 已在 PeggingOrchestrator.cs:3967 记录过该塌组现象）。
 /// </summary>
 internal readonly record struct EligibilityLookupKey(
-    int MaterialId, int ProductionDepartmentId, string RouteCode, string OperationCode);
+    int MaterialId, int ProductionDepartmentId, string RouteCode, int PathId, string OperationCode);
 
 /// <summary>
 /// 工序依赖图（单个物料单条路径）

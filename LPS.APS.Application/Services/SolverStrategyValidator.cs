@@ -33,12 +33,12 @@ public sealed class SolverStrategyValidator
         return new ValidationResult(errors.Count == 0, errors, warnings);
     }
 
-    /// <summary>SolverStrategyMode 枚举合法性（Forward/Backward/Mixed；防御数字越界反序列化）</summary>
+    /// <summary>SolverStrategyMode 枚举合法性（Auto/Forward/Backward/Mixed；防御数字越界反序列化）</summary>
     private static void ValidateMode(SolverStrategyBlock block, List<string> errors)
     {
         if (!Enum.IsDefined(block.Mode))
         {
-            errors.Add($"SolverStrategyMode 必须为 Forward/Backward/Mixed 之一（当前值：{(int)block.Mode}）");
+            errors.Add($"SolverStrategyMode 必须为 Auto/Forward/Backward/Mixed 之一（当前值：{(int)block.Mode}）");
         }
     }
 

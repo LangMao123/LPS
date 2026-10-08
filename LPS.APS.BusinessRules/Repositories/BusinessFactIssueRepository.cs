@@ -30,6 +30,11 @@ public class BusinessFactIssueRepository : IBusinessFactIssueRepository
         // Q5 三级 Scope 处理（31-0 裁决）：
         // ① 有 ExpectedFactory/ActualFactory → 按 Factory Scope 过滤
         // ② Factory 均 NULL → 仅 Global 用户可见（本查询无法通过其他权威关系确定 Scope）
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 标量判空会随列表一起扩成 (…) 导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<BusinessFactIssueDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
     'BOM_WORKSET' AS Source,
@@ -52,7 +57,7 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR Severity = @Severity)
     AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
-    AND (@AllowedFactories IS NULL OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
+    AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
 ORDER BY CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -62,6 +67,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
@@ -86,6 +92,11 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         // Q5 三级 Scope 处理（31-0 裁决）：
         // ① 有 StageCode → 通过 ProcessCodeDict 派生 FactoryCode → 按 Factory Scope 过滤
         // ② StageCode 均无法派生 FactoryCode → 仅 Global 用户可见
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 会导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<BusinessFactIssueDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
     'MATERIAL_STAGE_CONTEXT' AS Source,
@@ -110,7 +121,7 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR m.MaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR m.Severity = @Severity)
     AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
-    AND (@AllowedFactories IS NULL OR pc.FactoryCode IN @AllowedFactories)
+    AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
 ORDER BY m.CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -120,6 +131,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take

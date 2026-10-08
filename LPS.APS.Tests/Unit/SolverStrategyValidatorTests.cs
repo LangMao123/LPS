@@ -49,6 +49,19 @@ public class SolverStrategyValidatorTests
     }
 
     [Fact]
+    public void E4_Auto模式_校验通过()
+    {
+        // Arrange —— 0号位 2026-10-07 裁决：Mode=Auto 合法（1号位 按求解上下文决定最终方向）
+        var block = new SolverStrategyBlock { Mode = SolverStrategyMode.Auto };
+
+        // Act
+        var result = _validator.Validate(block);
+
+        // Assert
+        result.IsValid.Should().BeTrue(result.GetErrorMessage());
+    }
+
+    [Fact]
     public void E4_OnTimeTargetPercent_超100_拒绝()
     {
         // Arrange

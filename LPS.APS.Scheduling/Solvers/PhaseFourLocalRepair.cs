@@ -246,9 +246,10 @@ internal class PhaseFourLocalRepair
                 // 改为 DateTime.MaxValue，仅由后继约束（如有）收紧。
                 DateTime latestEnd = DateTime.MaxValue;
 
-                if (demand != null && constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
+                if (demand != null)
                 {
-                    if (routeGraphs.TryGetValue("DEFAULT", out var graph))
+                    // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                    if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph))
                     {
                         // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
                         // 同码跨 Stage 时若只按 OperationCode 匹配，会把另一 Stage 的同名工序误认为前驱/后继。
@@ -348,6 +349,9 @@ internal class PhaseFourLocalRepair
                         SetupSource = newSetupSource, // SetupSource 填充：新位置命中类型 / 保留原来源
                         Priority = task.Priority,
                         IsVirtual = task.IsVirtual,
+                        // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+                        ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+                        ContinuationKey = task.ContinuationKey,
                         StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
                         StageExecutionBatchQty = task.StageExecutionBatchQty,
                         ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -394,9 +398,10 @@ internal class PhaseFourLocalRepair
                 // 找到该任务对应的Demand和Routing
                 var taskDemand = request.LogicalProductionDemands
                     .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
-                if (taskDemand != null && constraints.RoutingGraphs.TryGetValue(taskDemand.MaterialId, out var taskRouteGraphs))
+                if (taskDemand != null)
                 {
-                    if (taskRouteGraphs.TryGetValue("DEFAULT", out var graph))
+                    // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                    if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph))
                     {
                         // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
                         var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
@@ -512,22 +517,24 @@ internal class PhaseFourLocalRepair
                     foreach (var consumer in materialConsumers)
                     {
                         // 检查是否存在工艺依赖关系
-                        if (constraints.RoutingGraphs.TryGetValue(currentTaskForMaterial.MaterialId, out var materialRouteGraphs))
+                        // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                        if (constraints.TryGetRoutingGraph(
+                                currentTaskForMaterial.MaterialId,
+                                currentTaskForMaterial.RouteCode,
+                                currentTaskForMaterial.PathId,
+                                out var materialGraph))
                         {
-                            if (materialRouteGraphs.TryGetValue("DEFAULT", out var materialGraph))
-                            {
-                                // 检查consumer是否依赖当前Task的工序
-                                // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
-                                var consumerNodeKey = OperationNodeKey.Of(consumer.StageCode, consumer.OperationCode);
-                                var currentTaskNodeKey = OperationNodeKey.Of(
-                                    currentTaskForMaterial.StageCode, currentTaskForMaterial.OperationCode);
+                            // 检查consumer是否依赖当前Task的工序
+                            // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
+                            var consumerNodeKey = OperationNodeKey.Of(consumer.StageCode, consumer.OperationCode);
+                            var currentTaskNodeKey = OperationNodeKey.Of(
+                                currentTaskForMaterial.StageCode, currentTaskForMaterial.OperationCode);
 
-                                if (materialGraph.Dependencies.TryGetValue(consumerNodeKey, out var consumerPreds))
+                            if (materialGraph.Dependencies.TryGetValue(consumerNodeKey, out var consumerPreds))
+                            {
+                                if (consumerPreds.Any(dep => dep.From == currentTaskNodeKey))
                                 {
-                                    if (consumerPreds.Any(dep => dep.From == currentTaskNodeKey))
-                                    {
-                                        nextRoundAffected.Add(consumer.FinalDraftId);
-                                    }
+                                    nextRoundAffected.Add(consumer.FinalDraftId);
                                 }
                             }
                         }
@@ -626,6 +633,13 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // ── P0-02（0号位 2026-10-08 §五 / §十一-1）：硬业务失败禁止普通修复 ──
+            if (scheduleResult.IsBatchPolicyHardFailure(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -643,24 +657,36 @@ internal class PhaseFourLocalRepair
                 dynamicMaterialFloor = contEnd;
             }
 
-            // 尝试资源切换
-            var repairedTasks = TryResourceSwitch(
-                demand,
-                constraints,
-                resourceOccupancy,
-                request,
-                dynamicMaterialFloor);
+            // P0-03：**逐批**修复 —— 局部修复的基本单位 = **执行批**（0号位 (7).md §六），
+            //   每批带本批键 + 本批数量；不得用整份需求数量重建，不得把 Batch-002 写回 Batch-001 的键。
+            //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
+            var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
+            var repairedBatchCount = 0;
 
-            if (repairedTasks.Count > 0)
+            foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
+                var repairedTasks = TryResourceSwitch(
+                    unitDemand,
+                    unitBatchKey,
+                    constraints,
+                    resourceOccupancy,
+                    request,
+                    dynamicMaterialFloor);
+
+                if (repairedTasks.Count == 0)
+                {
+                    continue;
+                }
+
+                repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
-                if (demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo))
+                if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))
                 {
                     var repairEnd = repairedTasks.Max(t => t.PlannedEndTime);
-                    if (!continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
-                        continuityCompletionByPI[demand.ProductionInstructionNo!] = repairEnd;
+                    if (!continuityCompletionByPI.TryGetValue(unitDemand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
+                        continuityCompletionByPI[unitDemand.ProductionInstructionNo!] = repairEnd;
                 }
 
                 // 更新资源占用
@@ -678,7 +704,11 @@ internal class PhaseFourLocalRepair
                     resourceOccupancy[ridRep].Add(new TimeWindow(occStart, task.PlannedEndTime));
                 }
             }
-            else
+
+            // ── P0-03（0号位 2026-10-08 §六 / §十一-2）：需求级成功条件 = **所有未落定批全部修复成功** ──
+            //   旧形态 `repairedAnyBatch`（任一批修出即算需求已修）会同时造成三个错误结果：
+            //     ① 已成功批被重复生产；② 失败批没排出来；③ Demand 却不再标记 Unscheduled。
+            if (repairedBatchCount < repairUnits.Count)
             {
                 result.StillUnscheduledKeys.Add(demandKey);
             }
@@ -713,6 +743,16 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // ── P0-02（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§五 / §十一-1）──
+            //   硬业务失败（`BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT`）⇒ **NonRepairable**：
+            //   **禁止**进入普通 Local Repair。否则 Phase4 会把「Qty10/Min6/Max6」当成普通「资源/日历没排下」
+            //   重新 Resource Switch / Split / Local Repair，最终产出绕过 Min/Max 硬约束的非法 FinalTask。
+            if (scheduleResult.IsBatchPolicyHardFailure(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -730,24 +770,35 @@ internal class PhaseFourLocalRepair
                 dynamicMaterialFloor = contEnd;
             }
 
-            // 尝试资源切换
-            var repairedTasks = TryResourceSwitch(
-                demand,
-                constraints,
-                resourceOccupancy,
-                request,
-                dynamicMaterialFloor);
+            // P0-03：**逐批**修复（同上方 Base 路径；基本单位 = 执行批）。
+            //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
+            var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
+            var repairedBatchCount = 0;
 
-            if (repairedTasks.Count > 0)
+            foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
+                var repairedTasks = TryResourceSwitch(
+                    unitDemand,
+                    unitBatchKey,
+                    constraints,
+                    resourceOccupancy,
+                    request,
+                    dynamicMaterialFloor);
+
+                if (repairedTasks.Count == 0)
+                {
+                    continue;
+                }
+
+                repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
-                if (demand.IsContinuation && !string.IsNullOrEmpty(demand.ProductionInstructionNo))
+                if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))
                 {
                     var repairEnd = repairedTasks.Max(t => t.PlannedEndTime);
-                    if (!continuityCompletionByPI.TryGetValue(demand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
-                        continuityCompletionByPI[demand.ProductionInstructionNo!] = repairEnd;
+                    if (!continuityCompletionByPI.TryGetValue(unitDemand.ProductionInstructionNo!, out var existingEnd) || repairEnd > existingEnd)
+                        continuityCompletionByPI[unitDemand.ProductionInstructionNo!] = repairEnd;
                 }
 
                 // 更新资源占用
@@ -772,7 +823,9 @@ internal class PhaseFourLocalRepair
                 //       （属有界序列优化范畴；Phase5 夜间 FULL 的 OptimizeSetupSequences 已覆盖 FORWARD 方向）。
                 // 注：旧描述「模具/刀具/材质/颜色」属 v1.2 已废止的 SetupAttribute 口径，勿再引用。
             }
-            else
+
+            // P0-03：需求级成功条件 = **所有未落定批全部修复成功**（不是「任一批修出」）。
+            if (repairedBatchCount < repairUnits.Count)
             {
                 result.StillUnscheduledKeys.Add(demandKey);
             }
@@ -871,22 +924,69 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
+    /// P0-03：把需求展开成**执行批修复单元**（本批键 + 批级需求）。
+    ///
+    /// 局部修复的基本单位 = **执行批**（0号位 (7).md §六）：Phase2 登记了几批就修几批，
+    ///   每批带**本批数量**（<see cref="PhaseTwoInitialScheduler.CloneDemandWithBatchQty"/>，其余字段全量逐字拷贝）
+    ///   与**本批键** —— 不得用整份需求数量重建，不得把 Batch-002 写回 Batch-001 的键。
+    ///
+    /// **P0-03 整改（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六 / §十一-2）**：
+    ///   修复单元**只取「未落定执行批」**（<see cref="InitialScheduleResult.FailedExecutionBatches"/>）——
+    ///   Phase2 已成功落定的前序批**禁止**重新展开（否则同一批键产出第二套完整链 ⇒ 重复生产）。
+    ///   未登记失败批（Phase2 未及形成该需求 / 单批回落 / 非批失败类未排）⇒ 回落既有口径，与升维前逐字一致。
+    /// </summary>
+    private static IReadOnlyList<(string BatchKey, LogicalProductionDemand Demand)> ExpandRepairUnits(
+        LogicalProductionDemand demand,
+        InitialScheduleResult scheduleResult,
+        ConstraintContext constraints)
+    {
+        // P0-03：优先按「未落定执行批」展开 —— 已成功批**不在此表**，因此不会被重复修复。
+        var unsettled = scheduleResult.FailedExecutionBatches
+            .Where(f => string.Equals(f.LogicalDemandKey, demand.LogicalDemandKey, StringComparison.Ordinal))
+            .OrderBy(f => f.Ordinal)
+            .ToList();
+
+        if (unsettled.Count > 0)
+        {
+            return unsettled
+                .Select(f => (f.ExecutionBatchDraftKey,
+                    PhaseTwoInitialScheduler.CloneDemandWithBatchQty(
+                        demand, f.BatchQty, f.BatchPlannedProcessQty)))
+                .ToList();
+        }
+
+        if (constraints.ExecutionBatchPlans.TryGetValue(demand.LogicalDemandKey, out var plans) && plans.Count > 0)
+        {
+            if (plans.Count == 1)
+            {
+                // 单批：直接用原实例（零回归）。
+                return new[] { (plans[0].BatchKey, demand) };
+            }
+
+            return plans
+                .Select(p => (p.BatchKey,
+                    PhaseTwoInitialScheduler.CloneDemandWithBatchQty(demand, p.NetOutputQty, p.PlannedProcessQty)))
+                .ToList();
+        }
+
+        return new[] { (PhaseTwoInitialScheduler.ExecutionBatchKey(demand.LogicalDemandKey), demand) };
+    }
+
+    /// <summary>
     /// 尝试资源切换（换到其他合格资源）
     /// </summary>
     private List<FinalTaskDraft> TryResourceSwitch(
         LogicalProductionDemand demand,
+        string batchDraftKey,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DomainSolveRequest request,
         DateTime dynamicMaterialFloor)
     {
-        // 获取工艺路线
-        if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
-        {
-            return new List<FinalTaskDraft>();
-        }
-
-        if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
+        // **批级**取图（P0-03；RT-002「局部修复不得换路径」）：本批选中路径 → 需求固定路径 → 唯一那条。
+        //   多批时各批可能走不同 Path ⇒ 必须按**批键**取，不能按需求键取（否则串批）。
+        if (!constraints.TryGetBatchRoutingGraph(
+                batchDraftKey, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
         {
             return new List<FinalTaskDraft>();
         }
@@ -933,10 +1033,14 @@ internal class PhaseFourLocalRepair
         {
             var operation = operations[i];
 
-            // 获取合格资源列表（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
-            var eligibleResources = OrderResourcesByPreference(
+            // 获取合格资源列表（P1-01：统一走 Phase2 纯函数 —— 在此前 Phase4 自带旧版**只认 Id、完全不看
+            // PreferredResourceCode**，导致 Phase4 局部修复会静默丢弃 Code 软偏好；现与 Phase2 同源。）
+            var eligibleResources = PhaseTwoInitialScheduler.OrderResourcesByPreference(
                 demand,
-                GetEligibleResources(demand.MaterialId, operation, constraints));
+                GetEligibleResources(demand.MaterialId, operation, constraints),
+                constraints,
+                operation.OperationCode,
+                operation.StageCode);   // P1-02：软偏好仅作用于当前承接工序（身份 = StageCode + OperationCode）
 
             FinalTaskDraft? scheduledTask = null;
 
@@ -968,7 +1072,7 @@ internal class PhaseFourLocalRepair
                     var taskStart = occSlot.Start + TimeSpan.FromMinutes((double)setupMinutes);
                     // SetupSource 填充：解析命中类型 → 大写 5 值（5号位 值契约统一 20260921）
                     var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, batchDraftKey, taskSetupSource);
 
                     // 临时占用：从Setup开始
                     if (!resourceOccupancy.ContainsKey(resourceId))
@@ -997,11 +1101,15 @@ internal class PhaseFourLocalRepair
             {
                 // 第4轮Split修复：当前工序无法在任何资源找到完整时间槽时，尝试有限Split
                 // P0-07：连续份额不可被普通 Split 破坏逐工单身份，禁止拆分。
-                if (request.StrategySnapshot.Parameters.AllowSplit && !demand.IsContinuation && demand.PlannedProcessQty > 1.0m)
+                // NoSplitMerge（不拆不合）显式落实（0号位 2026-10-07 裁决 `:246`／职责表 `:357`）：
+                //   与 Phase2 合批守卫同一口径，显式读该冻结字段，不再只靠 IsContinuation 间接覆盖。
+                if (request.StrategySnapshot.Parameters.AllowSplit && !demand.IsContinuation
+                    && !demand.NoSplitMerge && demand.PlannedProcessQty > 1.0m)
                 {
                     var splitTasks = TrySplitOperation(
                         demand,
                         operation,
+                        batchDraftKey,
                         eligibleResources,
                         earliestStart,
                         constraints,
@@ -1169,7 +1277,7 @@ internal class PhaseFourLocalRepair
         // （旧键写死 "DEFAULT" 且无部门 ⇒ 两个部门的同名工序资格被合并 ⇒ 跨部门串资源）。
         // ⚠ 契约 OperationResourceEligibility **无 StageCode 字段**，无法再细到 Stage（残留见键类型注释）。
         var key = new EligibilityLookupKey(
-            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.OperationCode);
+            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.PathId, operation.OperationCode);
 
         if (constraints.OperationResourceEligibility.TryGetValue(key, out var resources))
         {
@@ -1179,42 +1287,9 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
-    /// P1-11：软偏好资源优先——在合法资源集内把 PreferredResourceId 排最前、FallbackResourceId 次之，
-    /// 其余保持原顺序。软偏好不改变合法性（非硬锁），偏好资源不可用时自然回落。
+    /// P1-01：旧版 Phase4 专用「只认 Id」的软偏好排序已**移除**，统一改调
+    /// <see cref="PhaseTwoInitialScheduler.OrderResourcesByPreference"/>（同时消费 Code + Id + P1-02 作用域）。
     /// </summary>
-    private static List<int> OrderResourcesByPreference(
-        LogicalProductionDemand demand,
-        List<int> eligibleResources)
-    {
-        if (demand.PreferredResourceId == null && demand.FallbackResourceId == null)
-        {
-            return eligibleResources;
-        }
-
-        var ordered = new List<int>(eligibleResources.Count);
-
-        if (demand.PreferredResourceId is int preferred && eligibleResources.Contains(preferred))
-        {
-            ordered.Add(preferred);
-        }
-
-        if (demand.FallbackResourceId is int fallback
-            && fallback != demand.PreferredResourceId
-            && eligibleResources.Contains(fallback))
-        {
-            ordered.Add(fallback);
-        }
-
-        foreach (var resourceId in eligibleResources)
-        {
-            if (!ordered.Contains(resourceId))
-            {
-                ordered.Add(resourceId);
-            }
-        }
-
-        return ordered;
-    }
 
     /// <summary>
     /// 正排寻找时间槽
@@ -1298,6 +1373,7 @@ internal class PhaseFourLocalRepair
         DateTime end,
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
         ConstraintContext constraints,
+        string batchDraftKey,     // P0-03：**本批真实归批键**（调用方逐批传入，不由 LogicalDemandKey 反推）
         string? setupSource = null)  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
@@ -1327,7 +1403,14 @@ internal class PhaseFourLocalRepair
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
+            // P0-02：批键**不由 Route/Path 派生**（键域 = (需求键, 批序号)）——
+            //   重建的 Task 属**同一执行批**，必须复用 Phase2 为该批发出的键（否则同一批被劈成两个键）。
+            ContinuationKey = demand.ContinuationKey,
+            // P0-03：批键**逐批由调用方传入**（本批真实键）——不再从 LogicalDemandKey 反推首批键
+            //   （多批时反推会把 Batch-002 的修复结果写回 Batch-001 的键）。
+            ExecutionBatchDraftKey = batchDraftKey
         };
     }
 
@@ -1346,7 +1429,7 @@ internal class PhaseFourLocalRepair
     {
         // 0号位 2026-09-29 裁决 §5.3 落实：与 GetEligibleResources 同步升维（键补 ProductionDepartmentId）
         var key = new EligibilityLookupKey(
-            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.OperationCode);
+            materialId, operation.ProductionDepartmentId, operation.RouteCode, operation.PathId, operation.OperationCode);
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
         {
             if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
@@ -1388,6 +1471,7 @@ internal class PhaseFourLocalRepair
     private List<FinalTaskDraft> TrySplitOperation(
         LogicalProductionDemand demand,
         OperationNode operation,
+        string batchDraftKey,
         List<int> eligibleResources,
         DateTime earliestStart,
         ConstraintContext constraints,
@@ -1477,7 +1561,7 @@ internal class PhaseFourLocalRepair
                         var splitSetupSource = convergedResolution.HasValue
                             ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                             : null;
-                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, qtyPerSplit, splitQuantity, setupMinutes, constraints, splitSetupSource);
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, qtyPerSplit, splitQuantity, setupMinutes, constraints, batchDraftKey, splitSetupSource);
 
                         candidateTasks.Add(splitTask);
 
@@ -1519,6 +1603,7 @@ internal class PhaseFourLocalRepair
         decimal quantity,
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
         ConstraintContext constraints,
+        string batchDraftKey,     // P0-03：**本批真实归批键**（拆分是**批内**有限拆分 ⇒ 与本批同键）
         string? setupSource = null)  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
@@ -1545,7 +1630,13 @@ internal class PhaseFourLocalRepair
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
+            // P0-02：批键**不由 Route/Path 派生**（键域 = (需求键, 批序号)）——
+            //   重建的 Task 属**同一执行批**，必须复用 Phase2 为该批发出的键（否则同一批被劈成两个键）。
+            ContinuationKey = demand.ContinuationKey,
+            // P0-03：批内有限拆分**保持本批键**（拆分不产生新执行批）。
+            ExecutionBatchDraftKey = batchDraftKey
         };
     }
 }

@@ -24,6 +24,39 @@ public sealed class OperationProgressFact
     public string StageCode { get; init; } = string.Empty;
 
     /// <summary>
+    /// 该 MES 工单的「完整计划工序清单」（逗号分隔的工序名，已剥 MES 内部 (瓶颈) 标记）
+    ///
+    /// 来源：OperationProgressSnapshot.RouteCode
+    ///       ← MES SMC_MOM_Technology.T_ProduceJoinTech_Data.ProNameGroup
+    /// 语义：与 RoutingOperationFact.RouteCode **同形态** —— 两者都是「工序名逗号串」，非 "DEFAULT"。
+    /// ⚠️ 但这是**该工单实际要走的工序清单**，未必与 APS 存的标准路线逐字相同
+    ///    （MES 有临时手工建工艺的功能，进不了工艺库）。
+    /// ⚠️ 下方这组数已作废，勿再引用：2026-09-30 5号位 把承接口径改为
+    ///    **RouteCode 完全等值 + 部门并入匹配键 + 不剥「配品,」前缀**（见
+    ///    Database/Scripts/APS/02_派单与回执/5号位致2号位_工序身份Routing承接回执_等值匹配口径_20260930(1).md），
+    ///    旧数是在「子集匹配 + 剥配品」口径下测的，两者不可比。
+    ///    【旧口径实测（2026-09-30，CN_MACH）：等值约 46%；子集匹配唯一 60.2% / 零命中 39.8% / 歧义 0】
+    ///    ⇒ 新口径下的 A(零命中)/B(唯一)/C(同文本多 PathId) 三桶重测中，出数后回填本注释。
+    ///    ⚠️ 但一条不变：下游**不得静默取首条**（零命中即映射失败，须置 Issue）。
+    /// 用途：回答「该工单还剩哪几道工序」——已报工行只覆盖**已开工**工序，
+    ///       未开工工序在快照里没有行；本字段补上了整条清单。
+    /// </summary>
+    public string RouteCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 该工单的「工单创建部门」（APS ProductionDepartment.Id，可空）
+    ///
+    /// 来源：OperationProgressSnapshot.ProductionDepartmentId
+    ///       ← MES 工单创建表 T_ProduceData_Input.NewCode → ProductionDepartment.SourceDeptCode
+    ///         （实测命中 100%；取创建源头而非开工表 OrgId —— 同一工单可多部门开工，OrgId 会漂）
+    /// ⚠️ **与 RoutingOperationFact 的部门不是同一条推导路径**：后者来自
+    ///    MaterialStageDeptContext((MaterialId, StageCode))，本字段来自 MES 工单创建源头。
+    ///    **两者可能不一致**；不一致应视为需要消解的信号，**不得静默取一侧**。
+    /// 用途：路线定位的部门维度（与被定位的 APS RouteCode 同属 (物料, 部门) 空间）。
+    /// </summary>
+    public int? ProductionDepartmentId { get; init; }
+
+    /// <summary>
     /// MES工单号（同一PI可1:N分批）
     ///
     /// 来源：OperationProgressSnapshot.MESWorkOrderNo

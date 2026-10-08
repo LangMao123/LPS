@@ -1,3 +1,4 @@
+using System.Data;
 using System.Text;
 using Dapper;
 using LPS.APS.Core.DTOs.Governance;
@@ -78,14 +79,14 @@ VALUES (@FactoryCode, @StageCode, @ProductionDeptCode, @MaterialCode, @ProductFa
         var p = new DynamicParameters();
         p.Add("FactoryCode", input.FactoryCode);
         p.Add("StageCode", input.StageCode);
-        p.Add("ProductionDeptCode", (object?)input.ProductionDeptCode ?? DBNull.Value);
-        p.Add("MaterialCode", (object?)input.MaterialCode ?? DBNull.Value);
-        p.Add("ProductFamilyCode", (object?)input.ProductFamilyCode ?? DBNull.Value);
+        p.Add("ProductionDeptCode", input.ProductionDeptCode, DbType.String);
+        p.Add("MaterialCode", input.MaterialCode, DbType.String);
+        p.Add("ProductFamilyCode", input.ProductFamilyCode, DbType.String);
         p.Add("LeadTimeDays", input.LeadTimeDays);
         p.Add("LeadTimeHours", input.LeadTimeHours);
         p.Add("Priority", input.Priority);
         p.Add("EffectiveFrom", input.EffectiveFrom);
-        p.Add("EffectiveTo", (object?)input.EffectiveTo ?? DBNull.Value);
+        p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("IsDefault", input.IsDefault);
         p.Add("CreatedAt", now);
         p.Add("UpdatedAt", now);
@@ -158,14 +159,14 @@ WHERE Id = @Id";
         p.Add("Id", id);
         p.Add("FactoryCode", input.FactoryCode);
         p.Add("StageCode", input.StageCode);
-        p.Add("ProductionDeptCode", (object?)input.ProductionDeptCode ?? DBNull.Value);
-        p.Add("MaterialCode", (object?)input.MaterialCode ?? DBNull.Value);
-        p.Add("ProductFamilyCode", (object?)input.ProductFamilyCode ?? DBNull.Value);
+        p.Add("ProductionDeptCode", input.ProductionDeptCode, DbType.String);
+        p.Add("MaterialCode", input.MaterialCode, DbType.String);
+        p.Add("ProductFamilyCode", input.ProductFamilyCode, DbType.String);
         p.Add("LeadTimeDays", input.LeadTimeDays);
         p.Add("LeadTimeHours", input.LeadTimeHours);
         p.Add("Priority", input.Priority);
         p.Add("EffectiveFrom", input.EffectiveFrom);
-        p.Add("EffectiveTo", (object?)input.EffectiveTo ?? DBNull.Value);
+        p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("IsDefault", input.IsDefault);
         p.Add("UpdatedAt", now);
 
@@ -311,9 +312,9 @@ WHERE FactoryCode = @FactoryCode AND StageCode = @StageCode
         var p = new DynamicParameters();
         p.Add("FactoryCode", factoryCode);
         p.Add("StageCode", stageCode);
-        p.Add("Dept", (object?)productionDeptCode ?? DBNull.Value);
-        p.Add("Material", (object?)materialCode ?? DBNull.Value);
-        p.Add("Family", (object?)productFamilyCode ?? DBNull.Value);
+        p.Add("Dept", productionDeptCode, DbType.String);
+        p.Add("Material", materialCode, DbType.String);
+        p.Add("Family", productFamilyCode, DbType.String);
         p.Add("ExcludeId", excludeId);
 
         var count = await _connectionManager.QueryFirstOrDefaultAsync<int>(sql, p, db: DatabaseId.APS);

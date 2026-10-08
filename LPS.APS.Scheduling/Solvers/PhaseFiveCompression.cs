@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 
@@ -57,8 +58,16 @@ internal class PhaseFiveCompression
         // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
         var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
 
+        // P0-04（0号位 2026-10-08 §七）：未排程需求集合（Phase2 未排 ∪ Phase4 未修）——
+        //   数量闭合校验据此区分「已完全排定（必须**严格**闭合）」与「部分执行批失败（允许小于，但**绝不允许放大**）」。
+        var unscheduledDemandKeysForValidation = new HashSet<string>(
+            scheduleResult.UnscheduledDemandKeys, StringComparer.Ordinal);
+        unscheduledDemandKeysForValidation.UnionWith(repairResult.StillUnscheduledKeys);
+
         // 第4轮Item 10：Phase5最终硬约束校验（§十一）
-        var validationResult = ValidateHardResult(allScheduledTasks, allocationShares, taskDependencies, request, constraints);
+        var validationResult = ValidateHardResult(
+            allScheduledTasks, allocationShares, taskDependencies, request, constraints,
+            unscheduledDemandKeysForValidation, scheduleResult.AllocationTaskShare);
         if (!validationResult.IsValid)
         {
             return new DomainSolveResult
@@ -88,35 +97,71 @@ internal class PhaseFiveCompression
         // 收集未排程需求
         var unscheduledTasks = new List<UnscheduledTaskResult>();
 
+        // P0-03（0号位 2026-10-08 §六）：同一需求可能**同时**出现在 Phase2 未排程表与 Phase4 未修复表
+        //   ⇒ 出口必须**去重**，否则一个需求被报两次（错误的最终结果）。
+        var reportedUnscheduled = new HashSet<string>(StringComparer.Ordinal);
+        void ReportUnscheduled(string demandKey, string reason)
+        {
+            if (reportedUnscheduled.Add(demandKey))
+            {
+                unscheduledTasks.Add(new UnscheduledTaskResult { DraftId = demandKey, Reason = reason });
+            }
+        }
+
         // Phase 2 未排程的需求
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
             if (!repairResult.RepairedTasks.Any(t => t.SourceDraftId == demandKey))
             {
+                // ── P0-01 / P0-02（0号位 2026-10-08 §四 / §五）：硬业务失败优先归属 ──
+                //   `BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT` 是**硬失败类别**，
+                //   不得被降格成「Phase 2 初始排程失败」这类泛化原因（§十二 要求 Reason 逐字可判）。
+                if (scheduleResult.BatchPolicyHardFailures.TryGetValue(demandKey, out var hardFailureReason))
+                {
+                    ReportUnscheduled(demandKey, hardFailureReason);
+                    continue;
+                }
+
                 // 最小B：缺失生产部门 Context 的需求，Reason 单独标识
                 var missingDept = IsMissingDepartmentContext(demandKey, request, constraints);
                 // B-1（0号位 2026-09-29 裁决 §2.3）：StageSeq 全序冲突的需求，Reason 单独标识
                 var stageSeqConflict = IsStageSequenceConflict(demandKey, request, constraints);
-                unscheduledTasks.Add(new UnscheduledTaskResult
-                {
-                    DraftId = demandKey,
-                    Reason = missingDept
-                        ? "MISSING_PRODUCTION_DEPARTMENT_CONTEXT"
-                        : stageSeqConflict
-                            ? "STAGE_SEQUENCE_CONFLICT"
-                            : "Phase 2 初始排程失败，Phase 4 修复未成功"
-                });
+                // C-1（0号位 2026-09-28 裁决 §11.3）：真实资源日历覆盖不足 ⇒ Reason 单独标识。
+                // 排在两个「配置类」根因之后：缺部门 / StageSeq 冲突是更具体的根因，优先归属。
+                var calendarCoverageInsufficient = IsCalendarCoverageInsufficient(demandKey, request, constraints);
+                ReportUnscheduled(demandKey, missingDept
+                    ? "MISSING_PRODUCTION_DEPARTMENT_CONTEXT"
+                    : stageSeqConflict
+                        ? "STAGE_SEQUENCE_CONFLICT"
+                        : calendarCoverageInsufficient
+                            ? "CALENDAR_COVERAGE_INSUFFICIENT"
+                            : "Phase 2 初始排程失败，Phase 4 修复未成功");
             }
         }
 
         // Phase 4 仍未排程的需求
         foreach (var demandKey in repairResult.StillUnscheduledKeys)
         {
-            unscheduledTasks.Add(new UnscheduledTaskResult
+            string reason;
+            if (scheduleResult.BatchPolicyHardFailures.TryGetValue(demandKey, out var hardFailureReason))
             {
-                DraftId = demandKey,
-                Reason = "Phase 4 局部修复后仍无法排程"
-            });
+                // 硬失败（缺策略 / 无合法切分）—— Phase4 已按 §五 拒绝修复，出口仍报硬失败类别。
+                reason = hardFailureReason;
+            }
+            else if (allScheduledTasks.Any(t => t.SourceDraftId == demandKey))
+            {
+                // P0-03（§六）：**部分**执行批已落定（Phase2 成功的批仍在最终集合里）、其余仍未排下
+                //   —— 必须区别于「完全没排下」，否则「失败批没排出来」会被「需求已修复」掩盖。
+                //   判据取**最终任务集合**而非 `RepairedTasks`：Phase2 成功的批不在 `RepairedTasks` 里，
+                //   只看 `RepairedTasks` 会把「Phase2 落了一批 / Phase4 一批没修成」误报成「完全没排下」。
+                reason = "Phase 4 局部修复后仍有执行批未排下";
+            }
+            else
+            {
+                reason = "Phase 4 局部修复后仍无法排程";
+            }
+
+            ReportUnscheduled(demandKey, reason);
         }
 
         // P0-03+P0-15修复：区分技术失败与业务Unscheduled
@@ -199,6 +244,115 @@ internal class PhaseFiveCompression
     }
 
     /// <summary>
+    /// 判断某 Demand 是否因「真实资源日历覆盖不足」而排不下（C-1，0号位 2026-09-28 裁决 §11.3）。
+    ///
+    /// 裁定原文（`0号位代码审核意见/20260928/APS_V1_批量正倒排执行批_0号位对1_2_3号位评估回执统一解读与裁决回复_v1.0_20260928.md:509-533`）：
+    ///   「如果直到正式 Calendar 末端仍找不到：返回 `CALENDAR_COVERAGE_INSUFFICIENT` 或现有等价 Issue。
+    ///     其业务含义是：**日历覆盖范围不足，APS 无法证明更远未来的合法产能**。
+    ///     这**不是**『真实产能一定不存在』，也**不是**『普通延期』。」
+    /// 同裁决 §11.1 已明确 PlanningEnd 不是硬终止边界（正排只受日历窗 `calWindow.End` 约束，见
+    /// `PhaseTwoInitialScheduler.FindForwardSlot`）；§11.2 禁止制造虚拟 7×24 日历 / 低置信虚拟 Capacity Slot
+    /// 作为正式计划 ⇒ 本判据**只**看真实 <see cref="ConstraintContext.ResourceCalendars"/>
+    /// （Phase1 `BuildResourceCalendars` 仅装载 `IsAvailable` 窗），不引入任何合成产能。
+    ///
+    /// 【判据 —— 2026-10-07 按 0号位 P1-04 整改为**逐工序**】该 Demand 的**每一个**必须执行的
+    ///   `FINITE_RESOURCE` 工序，都存在「其合法资格资源 × 该资源真实日历窗」能容纳**该工序**时长。
+    ///   · **旧实现的 Bug**（0号位 2026-10-07 审核 P1-04）：原判据为「**任一**工序能塞进**任一**窗」
+    ///     即返回覆盖足够（`durations.Any(d =&gt; d &lt;= windowMinutes)`）。多工序需求下会**漏判** ——
+    ///     例：OP10=30min 塞得进 60min 窗、OP20=180min 永远塞不进，旧码因 OP10 通过而判「覆盖足够」，
+    ///     但 OP20 实无合法日历窗 ⇒ 该 Demand 仍会因日历覆盖不足排不下。三条旧单测**全是单工序**，故未暴露。
+    ///   · 工序身份用 **(ProductionDepartmentId, OperationCode)**：与 <c>EligibilityLookupKey</c> 的部门维度同口径，
+    ///     消解「同物料同工序码跨部门」的歧义（2号位 实测 117 物料）。
+    ///   · 只取 `FINITE_RESOURCE` 工序：`UNCONSTRAINED` / `WAIT_ONLY` 不占正式资源日历
+    ///     （Phase2 对二者跳过资源找槽、Task `ResourceId=NULL`），纳入会误报。
+    ///   · 与 Phase2 <c>FindForwardSlot</c> 同源：该方法对「该资源无日历」与「窗长装不下」**均**返回 null ⇒ 需求 Unscheduled。
+    ///   · 保守性：任一工序在任一资格资源的任一窗装下即视为该工序可排；**不抢**缺部门 / StageSeq 冲突 / 其它根因的归属。
+    /// </summary>
+    private bool IsCalendarCoverageInsufficient(
+        string demandKey,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        var demand = request.LogicalProductionDemands
+            .FirstOrDefault(d => d.LogicalDemandKey == demandKey);
+        if (demand == null)
+        {
+            return false;
+        }
+
+        // P1-04（0号位 2026-10-07 裁决 §3.4）**Path 隔离**：判据必须**只对该需求已选中的 Path** 判 ——
+        //   未选中 Path 的工序混入会过度误报（另一条备选路径的长工序与本需求无关）。
+        //   选中路径 = Phase2 登记 → 需求固定路径 → 唯一那条；多路径且未登记 ⇒ 不抢日历归属。
+        if (!constraints.TryGetDemandRoutePath(
+                demandKey, demand.MaterialId, demand.RouteCode, demand.PathId, out var chosenPath))
+        {
+            return false;
+        }
+
+        // 该物料的**逐工序**时长（含 Setup，与 Phase2 占资源窗口径一致），**限定选中 Path**。
+        // 时长源仍取 RoutingOperation（OperationNode 已按 item1 删除静态 SetupTime 字段）。
+        var operations = request.RoutingOperations
+            .Where(op => op.MaterialId == demand.MaterialId
+                         && string.Equals(op.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
+                         && op.PathId == chosenPath.PathId)
+            .Where(op => string.Equals(op.OperationPlanningMode, "FINITE_RESOURCE", StringComparison.Ordinal))
+            .GroupBy(op => (op.ProductionDepartmentId, op.OperationCode))
+            .Select(g => (
+                DepartmentId: g.Key.ProductionDepartmentId,
+                OperationCode: g.Key.OperationCode,
+                DurationMinutes: g.Max(op => (double)(op.StandardDuration + op.SetupTime))))
+            .ToList();
+        if (operations.Count == 0)
+        {
+            return false;   // 无有限资源工序 ⇒ 根因不是日历
+        }
+
+        // 逐工序校验：**每个**有限资源工序都必须 ∃「其资格资源 × 其真实日历窗」装得下。
+        foreach (var op in operations)
+        {
+            // 该工序有资格的全部资源（按 MaterialId + 部门 + RouteCode + PathId + 工序码归集，
+            // 与 EligibilityLookupKey 口径一致 —— P1-04 Path 隔离：不得跨 Path 混用资格）
+            var eligibleResourceIds = constraints.OperationResourceEligibility
+                .Where(kv => kv.Key.MaterialId == demand.MaterialId
+                             && kv.Key.ProductionDepartmentId == op.DepartmentId
+                             && string.Equals(kv.Key.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
+                             && kv.Key.PathId == chosenPath.PathId
+                             && kv.Key.OperationCode == op.OperationCode)
+                .SelectMany(kv => kv.Value)
+                .Distinct()
+                .ToList();
+            if (eligibleResourceIds.Count == 0)
+            {
+                return false;   // 无资格资源 ⇒ 根因是工艺/资格，不是日历（保守：不抢归属）
+            }
+
+            var anyWindowFits = false;
+            foreach (var resourceId in eligibleResourceIds)
+            {
+                if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var windows) || windows.Count == 0)
+                {
+                    continue;
+                }
+
+                if (windows.Any(w => (w.End - w.Start).TotalMinutes >= op.DurationMinutes))
+                {
+                    anyWindowFits = true;
+                    break;
+                }
+            }
+
+            if (!anyWindowFits)
+            {
+                // 该工序在**所有**资格资源的真实日历中均装不下 ⇒ 日历覆盖不足（按 §11.2 判）
+                return true;
+            }
+        }
+
+        // 所有有限资源工序都至少有一个可容纳窗 ⇒ 覆盖足够（保守返回 false）
+        return false;
+    }
+
+    /// <summary>
     /// P1-05：Gap Compaction —— 保序前向压实（V1 最小实现，Level 3 次级优化）。
     /// 仅 FORWARD 方向执行；把 Task 拉进更早的日历可用空档，全程满足：
     /// - Level 0 硬约束：Calendar/占用含 Setup（复用 Phase4.FindForwardSlot 唯一实现）/不换资源（Eligibility 不变）/
@@ -265,8 +419,7 @@ internal class PhaseFiveCompression
 
             // 2) Routing 前序（同 Demand，含 Lag；Split 多前序 Task 取最大完成）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
-            if (constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var graphs) &&
-                graphs.TryGetValue("DEFAULT", out var graph) &&
+            if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph) &&
                 graph.Dependencies.TryGetValue(
                     OperationNodeKey.Of(task.StageCode, task.OperationCode), out var preds) &&
                 index.BySource.TryGetValue(task.SourceDraftId, out var sameTasks))
@@ -401,6 +554,9 @@ internal class PhaseFiveCompression
             SetupSource = task.SetupSource,   // SetupSource 填充：压实仅移时间不重算 Setup → 透传原来源（2号位 原样落库）
             Priority = task.Priority,
             IsVirtual = task.IsVirtual,
+            // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
             StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
             StageExecutionBatchQty = task.StageExecutionBatchQty,
             ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -600,8 +756,7 @@ internal class PhaseFiveCompression
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
             var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
             RoutingGraph? graph = null;
-            if (constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var graphs))
-                graphs.TryGetValue("DEFAULT", out graph);
+            constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out graph);
             if (graph != null && graph.Dependencies.TryGetValue(taskNodeKey, out var preds) &&
                 index.BySource.TryGetValue(task.SourceDraftId, out var sameTasks))
             {
@@ -860,8 +1015,8 @@ internal class PhaseFiveCompression
 
             // 段内 Routing 前序链：前序在段内必须位于序列更早处（否则违反工艺顺序 → 不可行）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
-            if (constraints.RoutingGraphs.TryGetValue(info.Task.MaterialId, out var graphs) &&
-                graphs.TryGetValue("DEFAULT", out var graph) &&
+            if (constraints.TryGetRoutingGraph(
+                    info.Task.MaterialId, info.Task.RouteCode, info.Task.PathId, out var graph) &&
                 graph.Dependencies.TryGetValue(
                     OperationNodeKey.Of(info.Task.StageCode, info.Task.OperationCode), out var preds))
             {
@@ -955,6 +1110,9 @@ internal class PhaseFiveCompression
             SetupSource = setupSource,   // SetupSource 填充：序列优化重算命中类型 → 大写 5 值（2号位 原样落库）
             Priority = task.Priority,
             IsVirtual = task.IsVirtual,
+            // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
             StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
             StageExecutionBatchQty = task.StageExecutionBatchQty,
             ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -1071,28 +1229,31 @@ internal class PhaseFiveCompression
             if (!demandByKey.TryGetValue(demandGroup.Key, out var demand))
                 continue;
 
-            // 获取工艺路线依赖关系
-            if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
-                continue;
-            if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
-                continue;
-
-            // 标记所有有downstream的Task（非末端）。
-            // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
-            // 同一物料的不同 Stage 可能出现**相同 OperationCode**（2号位 实测 117 物料）。
-            // 边端点升维后 dep.From.StageCode 直接可用 ⇒ **取消**原先「Stage 不可得则退回单键匹配」
-            // 的兜底：那个兜底正是单键任取（会把别的 Stage 的同名 Task 误标为非末端 ⇒ AllocationTaskShare 归错 Task）。
-            foreach (var depList in routingGraph.Dependencies.Values)
+            // P0-04（反证 ⑧）：末端判定同源**逐批** —— 多批时按批键分区 + 按**批键**取图，
+            //   否则需求级图（多批时 `ChosenRoutePaths` 未登记，会回落需求声明路径）可能与本批实际路径不符
+            //   ⇒ 末端集合算错 ⇒ AllocationTaskShare 归错 Task。
+            foreach (var batchTasks in PartitionByExecutionBatch(demandGroup))
             {
-                foreach (var dep in depList)
-                {
-                    var upstreamTask = demandGroup.FirstOrDefault(t =>
-                        t.OperationCode == dep.From.OperationCode &&
-                        string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal));
+                if (!TryGetGraphForBatch(constraints, FirstBatchKey(batchTasks), demand, out var routingGraph))
+                    continue;
 
-                    if (upstreamTask != null)
+                // 标记所有有downstream的Task（非末端）。
+                // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
+                // 同一物料的不同 Stage 可能出现**相同 OperationCode**（2号位 实测 117 物料）。
+                // 边端点升维后 dep.From.StageCode 直接可用 ⇒ **取消**原先「Stage 不可得则退回单键匹配」
+                // 的兜底：那个兜底正是单键任取（会把别的 Stage 的同名 Task 误标为非末端 ⇒ AllocationTaskShare 归错 Task）。
+                foreach (var depList in routingGraph.Dependencies.Values)
+                {
+                    foreach (var dep in depList)
                     {
-                        downstreamTasks.Add(upstreamTask.FinalDraftId);
+                        var upstreamTask = batchTasks.FirstOrDefault(t =>
+                            t.OperationCode == dep.From.OperationCode &&
+                            string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal));
+
+                        if (upstreamTask != null)
+                        {
+                            downstreamTasks.Add(upstreamTask.FinalDraftId);
+                        }
                     }
                 }
             }
@@ -1128,6 +1289,17 @@ internal class PhaseFiveCompression
 
             decimal totalContribution = taskQtys.Sum(x => x.ContributionQty);
 
+            // ── P0-03（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六）：份额闭合目标 = **实际落定数量** ──
+            //   `AllocationTaskShare` 承载的是「**已落定 Task** 上的份额」，故其闭合目标只能是落定数量。
+            //   需求只要有一个执行批没排下（`§六` 的「Batch-001 成功 / Batch-002 失败」），其落定数量就
+            //   **小于**声明数量；此时若仍按声明数量补差，会把**整份需求数量**压到仅存的那个批的 Task 上
+            //   ⇒ `ΣShare > Task.Quantity` ⇒ Phase5 硬校验（第 3 项）判失败 ⇒ **整个求解被中断**
+            //     （实测：`Task ... 的 ΣShare=10 超过 Quantity=5`）。
+            //   需求是否被完整满足由**出口 `UnscheduledTasks`（需求级）** + 下方**第 8 项逐需求逐工序数量闭合**保证，
+            //   不由 Allocation 级份额承担。
+            //   正常（全部落定）时 `totalContribution == expectedQty` ⇒ 逐字等价，零回归。
+            var closureTarget = Math.Min(expectedQty, totalContribution);
+
             for (int i = 0; i < taskQtys.Count; i++)
             {
                 var c = taskQtys[i];
@@ -1135,19 +1307,19 @@ internal class PhaseFiveCompression
 
                 if (i == taskQtys.Count - 1)
                 {
-                    // 最后一个：补差闭合
+                    // 最后一个：补差闭合（闭合到**落定数量**，见上 `closureTarget`）
                     var alreadyAllocated = shares
                         .Where(s => s.AllocationSequence == allocationSeq)
                         .Sum(s => s.ComponentQty);
-                    shareQty = expectedQty - alreadyAllocated;
+                    shareQty = closureTarget - alreadyAllocated;
                 }
                 else if (totalContribution > 0)
                 {
-                    shareQty = Math.Round(expectedQty * c.ContributionQty / totalContribution, 3);
+                    shareQty = Math.Round(closureTarget * c.ContributionQty / totalContribution, 3);
                 }
                 else
                 {
-                    shareQty = expectedQty / taskQtys.Count;
+                    shareQty = closureTarget / taskQtys.Count;
                 }
 
                 shares.Add(new AllocationTaskShare
@@ -1224,75 +1396,81 @@ internal class PhaseFiveCompression
                 .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
             if (demand == null) continue;
 
-            // 获取工艺路线
-            if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
-                continue;
-            if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
-                continue;
-
-            // 遍历工艺路线中的依赖关系
-            // 第5轮修复：Split场景下，一个Operation可能对应多个Task，必须为所有组合建立Dependency
-            foreach (var depList in routingGraph.Dependencies.Values)
+            // ── P0-04（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六 / §十三 反证 ⑧）：**逐批**建边 ──
+            //   旧实现按需求整体取 `demandGroup.Value` ⇒ 同一需求的两批 Task 落在同一集合，
+            //   数量不等时走下方「均摊」分支 ⇒ 给**全部上游 × 全部下游**建边 ⇒ **批间交叉**
+            //   （Batch-001 的 OP10 连到 Batch-002 的 OP20）。分区后每批只在本批 Task 内配对，永不跨批。
+            foreach (var batchTasks in PartitionByExecutionBatch(demandGroup.Value))
             {
-                foreach (var dep in depList)
+                // 取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）：
+                // 多批 ⇒ 按**批键**取本批选中路径（不串批）；无批键 ⇒ 回落需求级取图。
+                if (!TryGetGraphForBatch(constraints, FirstBatchKey(batchTasks), demand, out var routingGraph))
+                    continue;
+
+                // 遍历工艺路线中的依赖关系
+                // 第5轮修复：Split场景下，一个Operation可能对应多个Task，必须为所有组合建立Dependency
+                foreach (var depList in routingGraph.Dependencies.Values)
                 {
-                    // 找到对应的所有上游Task和下游Task
-                    // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)，
-                    // 同码跨 Stage 时单键会把另一 Stage 的同名 Task 也算进来（血缘错接）。
-                    var upstreamTasks = demandGroup.Value
-                        .Where(t => t.OperationCode == dep.From.OperationCode &&
-                                    string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal))
-                        .ToList();
-                    var downstreamTasks = demandGroup.Value
-                        .Where(t => t.OperationCode == dep.To.OperationCode &&
-                                    string.Equals(t.StageCode, dep.To.StageCode, StringComparison.Ordinal))
-                        .ToList();
-
-                    // P0-06修复：Split场景不再做全量交叉积（那会把整条需求数量重复算到每条边）。
-                    // 等数量时按下标一一配对（每条边取下游Task真实数量）；
-                    // 数量不等时，把每个下游Task的数量按上游个数均摊，避免数量重复累计。
-                    if (upstreamTasks.Count == 0 || downstreamTasks.Count == 0)
+                    foreach (var dep in depList)
                     {
-                        continue;
-                    }
+                        // 找到对应的所有上游Task和下游Task
+                        // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)，
+                        // 同码跨 Stage 时单键会把另一 Stage 的同名 Task 也算进来（血缘错接）。
+                        var upstreamTasks = batchTasks
+                            .Where(t => t.OperationCode == dep.From.OperationCode &&
+                                        string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal))
+                            .ToList();
+                        var downstreamTasks = batchTasks
+                            .Where(t => t.OperationCode == dep.To.OperationCode &&
+                                        string.Equals(t.StageCode, dep.To.StageCode, StringComparison.Ordinal))
+                            .ToList();
 
-                    if (upstreamTasks.Count == downstreamTasks.Count)
-                    {
-                        for (int i = 0; i < upstreamTasks.Count; i++)
+                        // P0-06修复：Split场景不再做全量交叉积（那会把整条需求数量重复算到每条边）。
+                        // 等数量时按下标一一配对（每条边取下游Task真实数量）；
+                        // 数量不等时，把每个下游Task的数量按上游个数均摊，避免数量重复累计。
+                        if (upstreamTasks.Count == 0 || downstreamTasks.Count == 0)
                         {
-                            dependencies.Add(new FinalTaskPeggingDraft
-                            {
-                                UpstreamFinalDraftId = upstreamTasks[i].FinalDraftId,
-                                DownstreamFinalDraftId = downstreamTasks[i].FinalDraftId,
-                                UpstreamMaterialId = demand.MaterialId,
-                                DownstreamMaterialId = demand.MaterialId,
-                                Quantity = downstreamTasks[i].Quantity,
-                                UOM = string.Empty,
-                                InheritedPriority = demand.DemandSequence,
-                                DependencyType = dep.DependencyType,
-                                LagTime = dep.LagTime
-                            });
+                            continue;
                         }
-                    }
-                    else
-                    {
-                        foreach (var downstreamTask in downstreamTasks)
+
+                        if (upstreamTasks.Count == downstreamTasks.Count)
                         {
-                            decimal edgeQty = Math.Round(downstreamTask.Quantity / upstreamTasks.Count, 3);
-                            foreach (var upstreamTask in upstreamTasks)
+                            for (int i = 0; i < upstreamTasks.Count; i++)
                             {
                                 dependencies.Add(new FinalTaskPeggingDraft
                                 {
-                                    UpstreamFinalDraftId = upstreamTask.FinalDraftId,
-                                    DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                                    UpstreamFinalDraftId = upstreamTasks[i].FinalDraftId,
+                                    DownstreamFinalDraftId = downstreamTasks[i].FinalDraftId,
                                     UpstreamMaterialId = demand.MaterialId,
                                     DownstreamMaterialId = demand.MaterialId,
-                                    Quantity = edgeQty,
+                                    Quantity = downstreamTasks[i].Quantity,
                                     UOM = string.Empty,
                                     InheritedPriority = demand.DemandSequence,
                                     DependencyType = dep.DependencyType,
                                     LagTime = dep.LagTime
                                 });
+                            }
+                        }
+                        else
+                        {
+                            foreach (var downstreamTask in downstreamTasks)
+                            {
+                                decimal edgeQty = Math.Round(downstreamTask.Quantity / upstreamTasks.Count, 3);
+                                foreach (var upstreamTask in upstreamTasks)
+                                {
+                                    dependencies.Add(new FinalTaskPeggingDraft
+                                    {
+                                        UpstreamFinalDraftId = upstreamTask.FinalDraftId,
+                                        DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                                        UpstreamMaterialId = demand.MaterialId,
+                                        DownstreamMaterialId = demand.MaterialId,
+                                        Quantity = edgeQty,
+                                        UOM = string.Empty,
+                                        InheritedPriority = demand.DemandSequence,
+                                        DependencyType = dep.DependencyType,
+                                        LagTime = dep.LagTime
+                                    });
+                                }
                             }
                         }
                     }
@@ -1305,6 +1483,67 @@ internal class PhaseFiveCompression
         dependencies.AddRange(GenerateCrossMaterialDependencies(tasks, request, constraints));
 
         return dependencies;
+    }
+
+    /// <summary>
+    /// P0-04（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六 / §十三 反证 ⑧）：把一个需求名下的 Task
+    /// 按**执行批**分区 —— 批内自成一条完整链，**批间不得交叉**（TaskDependency / 末端判定同源）。
+    ///
+    /// 分区规则（保守、零回归）：
+    ///   · 该需求名下**至多一个**非空 `ExecutionBatchDraftKey` ⇒ **不分区**（单批 / 全无批键 ⇒ 与旧行为逐字一致）。
+    ///     锚点继承任务在路径身份不可解时 `ExecutionBatchDraftKey = null`（`PhaseTwoInitialScheduler.cs:165`），
+    ///     与同需求的单批新任务同组 ⇒ **不丢边**。
+    ///   · 出现 **≥2 个**不同非空批键 ⇒ 按批键分区；`null` 批键单独成区 —— **不猜批身份**
+    ///     （0号位 §六 明令不得用 `LogicalDemandKey` 反推批身份；无批键的 Task 本就不构成「一条完整 Path 的执行批」）。
+    ///
+    /// 分区内**保持原顺序**（`GroupBy` 保序）⇒ 下游「等数量按下标一一配对」仍按时间序配对，行为不变。
+    /// </summary>
+    private static List<List<FinalTaskDraft>> PartitionByExecutionBatch(IEnumerable<FinalTaskDraft> demandTasks)
+    {
+        var all = demandTasks.ToList();
+
+        var distinctKeys = all
+            .Select(t => t.ExecutionBatchDraftKey)
+            .Where(k => !string.IsNullOrEmpty(k))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (distinctKeys.Count <= 1)
+        {
+            return new List<List<FinalTaskDraft>> { all };
+        }
+
+        return all
+            .GroupBy(t => t.ExecutionBatchDraftKey ?? string.Empty, StringComparer.Ordinal)
+            .Select(g => g.ToList())
+            .ToList();
+    }
+
+    /// <summary>取该分区内的执行批键（分区内最多一个非空键；全空 ⇒ null）。</summary>
+    private static string? FirstBatchKey(IEnumerable<FinalTaskDraft> batchTasks)
+        => batchTasks.Select(t => t.ExecutionBatchDraftKey)
+            .FirstOrDefault(k => !string.IsNullOrEmpty(k));
+
+    /// <summary>
+    /// 取本**批**的 Routing 图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）：
+    ///   有批键 ⇒ <see cref="ConstraintContext.TryGetBatchRoutingGraph"/>（批键未登记时其内部同样回落
+    ///   「需求固定路径 → 唯一那条」，与需求级取图**逐字同源**，故锚点继承批零回归）；
+    ///   无批键 ⇒ 需求级 <see cref="ConstraintContext.TryGetDemandRoutingGraph"/>。
+    /// </summary>
+    private static bool TryGetGraphForBatch(
+        ConstraintContext constraints,
+        string? batchKey,
+        LogicalProductionDemand demand,
+        [NotNullWhen(true)] out RoutingGraph? routingGraph)
+    {
+        if (!string.IsNullOrEmpty(batchKey))
+        {
+            return constraints.TryGetBatchRoutingGraph(
+                batchKey, demand.MaterialId, demand.RouteCode, demand.PathId, out routingGraph);
+        }
+
+        return constraints.TryGetDemandRoutingGraph(
+            demand.LogicalDemandKey, demand.MaterialId, demand.RouteCode, demand.PathId, out routingGraph);
     }
 
     /// <summary>
@@ -1432,7 +1671,9 @@ internal class PhaseFiveCompression
         List<AllocationTaskShare> allocationShares,
         List<FinalTaskPeggingDraft> taskDependencies,
         DomainSolveRequest request,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        HashSet<string> unscheduledDemandKeys,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
     {
         // 1. P0-05修复：验证每个Allocation的ΣShareQty == 该Allocation下所有Demand的NetOutputQty之和
         var allocationTotalNetOutput = request.LogicalProductionDemands
@@ -1443,10 +1684,26 @@ internal class PhaseFiveCompression
             .GroupBy(s => s.AllocationSequence)
             .ToDictionary(g => g.Key, g => g.ToList());
 
+        // ── P0-03（0号位 2026-10-08 §六）：含**未排定需求**的 Allocation 不参与 Allocation 级闭合 ──
+        //   需求若有执行批没排下，它就在出口被报 Unscheduled（§六），其 `AllocationTaskShare` 只承载
+        //   **已落定批**的份额（见 `GenerateAllocationShares` 的 `closureTarget`）⇒
+        //   对它强制「ΣShare == 声明 NetOutputQty」是无意义的，会误判为失败。
+        //   该需求的数量正确性由下方**第 8 项（逐需求逐工序数量闭合：未排定 ⇒ 允许小于、绝不允许放大）**保证；
+        //   同 Allocation 内**已排定**需求的数量正确性同样由第 8 项**严格**保证 ⇒ 不因本跳过而放松。
+        var allocationsWithUnscheduledDemand = new HashSet<long>(
+            request.LogicalProductionDemands
+                .Where(d => unscheduledDemandKeys.Contains(d.LogicalDemandKey))
+                .Select(d => d.AllocationSequence));
+
         foreach (var allocKvp in sharesByAllocation)
         {
             var allocationSeq = allocKvp.Key;
             var shares = allocKvp.Value;
+
+            if (allocationsWithUnscheduledDemand.Contains(allocationSeq))
+            {
+                continue;   // 见上：改由第 8 项逐需求逐工序闭合保证
+            }
 
             if (!allocationTotalNetOutput.TryGetValue(allocationSeq, out var expectedQty))
             {
@@ -1631,7 +1888,109 @@ internal class PhaseFiveCompression
             }
         }
 
+        // 8. P0-04（0号位 2026-10-08 §七）：**最终物理数量闭合**（Final Quantity Closure 链）。
+        //
+        //    §七 原文：「对于每个 Execution Batch 及其工序链：不存在重复批身份下的第二套完整链；
+        //    并且对同一需求：每个业务工序层面，Σ各 Execution Batch Quantity 必须与该 Demand 对应数量一致」。
+        //
+        //    实现要点：
+        //    · 以 Task 的**真实需求构成**归集数量（`GetTaskDemandComposition`，含 merge 血缘），
+        //      **不是** `Task.Quantity` —— 合批 Task 的 Quantity 是多个需求之和，直接相加会误判。
+        //    · 逐「需求 × 工序（StageCode/OperationCode）」归集：`Task.Quantity` 在**同批各工序**上
+        //      恒等于该批净产出 ⇒ 逐工序 Σ 应严格等于该需求 NetOutputQty。
+        //    · 已完全排定的需求 ⇒ **严格闭合**（|Σ − NetOutputQty| ≤ 1e-3）。
+        //      未排定（Phase2 未排 ∪ Phase4 未修）的需求 ⇒ 允许**小于**（部分执行批失败是合法业务结果，
+        //      其未排程状态由 `UnscheduledTasks` 出口表达），但**绝不允许大于**
+        //      —— 这正是 P0-03 重复生产（Batch-001 被 Phase2 与 Phase4 各生成一套）的数值指纹：
+        //      10 件需求产出 15 件 ⇒ 逐工序 Σ=15 > 10 ⇒ 本条硬拒。
+        //    · **刻意不做**「(需求, 批键, 工序) 唯一性」检查：Phase4 的有限 Split（`TrySplitOperation`）
+        //      会在同一 (需求, 批键, 工序) 下**合法**产生多个部分 Task，按键唯一会误杀合法拆分。
+        //      §七 的「第二套完整链」在本条下必然表现为**数量超额** ⇒ 由本条拦下，无需另设唯一性判据。
+        var demandByKeyForClosure = request.LogicalProductionDemands
+            .GroupBy(d => d.LogicalDemandKey)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        var compositionByDemandOp =
+            new Dictionary<(string DemandKey, string StageCode, string OperationCode), decimal>();
+
+        foreach (var task in tasks)
+        {
+            if (task.IsVirtual) continue;   // 虚拟节点（StageTimingNode）非生产载体，不参与数量闭合
+
+            foreach (var (compositionDemand, qty) in GetTaskDemandComposition(task, demandByKeyForClosure, mergeLineage))
+            {
+                var opKey = (compositionDemand.LogicalDemandKey, task.StageCode, task.OperationCode);
+                compositionByDemandOp.TryGetValue(opKey, out var accumulated);
+                compositionByDemandOp[opKey] = accumulated + qty;
+            }
+        }
+
+        foreach (var demandGroup in compositionByDemandOp.GroupBy(kvp => kvp.Key.DemandKey))
+        {
+            if (!demandByKeyForClosure.TryGetValue(demandGroup.Key, out var closureDemand))
+            {
+                continue;   // 构成里出现请求外的需求键（异常数据）⇒ 跳过闭合校验
+            }
+
+            var expectedQty = closureDemand.NetOutputQty;
+            var demandIsUnscheduled = unscheduledDemandKeys.Contains(demandGroup.Key);
+
+            foreach (var opKvp in demandGroup)
+            {
+                var opQty = opKvp.Value;
+
+                if (demandIsUnscheduled)
+                {
+                    if (opQty > expectedQty + 0.001m)
+                    {
+                        return new ValidationResult
+                        {
+                            IsValid = false,
+                            ErrorMessage = $"需求 {demandGroup.Key} 未排定却产出超额 FinalTask: "
+                                + $"工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) Σ数量={opQty} > 需求 NetOutputQty={expectedQty}"
+                                + "（重复执行批链 ⇒ 物理生产数量被放大）"
+                        };
+                    }
+                }
+                else if (Math.Abs(opQty - expectedQty) > 0.001m)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"需求 {demandGroup.Key} 工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) 数量未闭合: "
+                            + $"Σ各 Execution Batch Quantity={opQty}, 需求 NetOutputQty={expectedQty}"
+                    };
+                }
+            }
+        }
+
         return new ValidationResult { IsValid = true };
+    }
+
+    /// <summary>
+    /// **P0-04 测试入口**（0号位 2026-10-08 §十二 第 8 行：「重复Batch ⇒ 必须被最终硬校验拒绝」）。
+    ///
+    /// 为什么要这个入口：P0-03 修好之后，「重复执行批链」在**正式 SolveAsync 路径上已不可达**
+    ///   （Phase4 只修失败批 ⇒ 不会再生成已成功批的第二套链）。因此「硬校验确实会拒绝」这一性质
+    ///   **只能**用**手工构造的重复 Task 集合**直接驱动校验器来证明 —— 否则该守卫永不被触发、也就永不被验证。
+    ///   这不是「绕过正式路径」，而是「给守卫本身造一次真实输入」（§十二 另 8 条仍全部走 `SolveAsync`）。
+    ///
+    /// 仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）使用；生产路径仍只经 <see cref="Compress"/>。
+    /// </summary>
+    internal static (bool IsValid, string ErrorMessage) ValidateHardResultForTest(
+        List<FinalTaskDraft> tasks,
+        List<AllocationTaskShare> allocationShares,
+        List<FinalTaskPeggingDraft> taskDependencies,
+        DomainSolveRequest request,
+        ConstraintContext constraints,
+        HashSet<string> unscheduledDemandKeys,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
+    {
+        var validation = new PhaseFiveCompression().ValidateHardResult(
+            tasks, allocationShares, taskDependencies, request, constraints,
+            unscheduledDemandKeys, mergeLineage);
+
+        return (validation.IsValid, validation.ErrorMessage);
     }
 
     /// <summary>

@@ -9,7 +9,9 @@ namespace LPS.APS.Tests.Unit;
 /// 跨版本连续性分桶纯函数测试（逐 MES 工单契约，§8/§9/§16）。
 /// 契约：Q=100、WO001 在制 E=30 → 1号位必须同时看到 Continuation 30 + Free 70；Q 不被 WIP 供给扣小。
 /// 多工单绝不合并（P0 红线）；E&gt;Q 不砍单、不产新自由 Task、登记 Execution Over-Commit。
-/// ContinuationKey = 源 key + "/WO:" + MESWorkOrderNo；Free = 源 key + "/FREE"；共用源 AllocationSequence。
+/// Slice 键（LogicalDemandKey）= 源 key + "/WO:" + MESWorkOrderNo；Free = 源 key + "/FREE"；共用源 AllocationSequence。
+/// **ContinuationKey 与 Slice 键是两回事**（红线 Q3）：ContinuationKey = f(ScheduleRun, MESWorkOrderNo)，
+/// 同一 MES 工单的全部 Slice 共享同一个 Key，**不得拼入 LogicalDemandKey**（否则同一工单裂分）。
 /// PlannedProcessQty 逐片按材料级良率单位投入比（源 PlannedProcessQty/NetOutputQty）反算。
 /// </summary>
 public class ContinuityBucketingTests
@@ -77,7 +79,7 @@ public class ContinuityBucketingTests
         result.Should().HaveCount(2);
         var continuation = result.Single(d => d.IsContinuation);
         continuation.NetOutputQty.Should().Be(30m);
-        continuation.LogicalDemandKey.Should().Be("328_1/WO:WO001");   // ContinuationKey 带工单身份
+        continuation.LogicalDemandKey.Should().Be("328_1/WO:WO001");   // Slice 键带工单身份（≠ ContinuationKey）
         continuation.AllocationSequence.Should().Be(1);                 // 不新建 Allocation
         continuation.DemandKey.Should().Be("D-1");
 
@@ -99,6 +101,42 @@ public class ContinuityBucketingTests
         continuations.Select(c => c.NetOutputQty).Should().BeEquivalentTo(new[] { 20m, 30m });
 
         result.Single(d => !d.IsContinuation).NetOutputQty.Should().Be(50m);   // Free = Q − ΣE = 50
+    }
+
+    [Fact]
+    public void 连续份额键_按工单身份生成_不随Slice裂分()
+    {
+        // 红线 Q3（0号位 2026-10-07 裁决 §六）：一个 ScheduleRun 内，一个 MESWorkOrderNo
+        // 有且仅有一个 ContinuationKey；同一工单多个 Slice **共享同一 Key**，不得拼入 LogicalDemandKey。
+        var demands = new List<LogicalProductionDemand>
+        {
+            Demand("328_11", 11, "PI-C11", 100m),
+            Demand("328_12", 12, "PI-C11", 40m),   // 同一 PI 下的另一条需求 ⇒ 另一个 Slice 来源
+        };
+        var ctxs = Map(Ctx("PI-C11", "WO900", 30m));   // 两条需求都源自同一张 MES 工单
+
+        var result = Bucket(demands, ctxs);
+        var conts = result.Where(d => d.IsContinuation).ToList();
+
+        conts.Should().HaveCount(2);                                  // 逐需求各切一片，工单不合并
+        conts.Select(c => c.LogicalDemandKey).Distinct().Should().HaveCount(2);   // Slice 键确实不同…
+        conts.Select(c => c.ContinuationKey).Distinct().Should().ContainSingle()  // …但 Key 只有一个
+             .Which.Should().Be("CK-328-WO900");                      // = f(PlanVersionId, MESWorkOrderNo)
+        conts.Should().OnlyContain(c => !c.ContinuationKey!.Contains(c.LogicalDemandKey));
+
+        // A/B 恒 NoSplitMerge（1号位 PhaseTwoInitialScheduler.cs:292 硬校验）；Free 不得置位
+        conts.Should().OnlyContain(c => c.NoSplitMerge);
+        result.Where(d => !d.IsContinuation).Should().OnlyContain(d => !d.NoSplitMerge);
+    }
+
+    [Fact]
+    public void 连续份额键_跨运行不同_同一运行内确定性()
+    {
+        // 红线：作用域 = 本 ScheduleRun ⇒ 同工单跨 Run 的 Key 不同；纯函数 ⇒ 同输入必得同值。
+        PeggingOrchestrator.ContinuationKeyOf(328, "WO900").Should().Be("CK-328-WO900");
+        PeggingOrchestrator.ContinuationKeyOf(329, "WO900").Should().Be("CK-329-WO900");
+        PeggingOrchestrator.ContinuationKeyOf(328, "WO900")
+            .Should().Be(PeggingOrchestrator.ContinuationKeyOf(328, "WO900"));
     }
 
     [Fact]
