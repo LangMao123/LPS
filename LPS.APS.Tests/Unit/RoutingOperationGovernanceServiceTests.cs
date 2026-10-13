@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
 using LPS.APS.Application.Services;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
@@ -26,6 +27,7 @@ namespace LPS.APS.Tests.Unit;
 public class RoutingOperationGovernanceServiceTests
 {
     private readonly Mock<IAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IDataScopeService> _dataScope = new();
 
     private static Mock<DatabaseConnectionManager> CreateConnectionMock()
     {
@@ -39,7 +41,7 @@ public class RoutingOperationGovernanceServiceTests
     }
 
     private RoutingOperationGovernanceService CreateService(Mock<DatabaseConnectionManager> connection)
-        => new(connection.Object, _auditRepo.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+        => new(connection.Object, _auditRepo.Object, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
     // ---------- 构造守卫 ----------
 
@@ -47,7 +49,7 @@ public class RoutingOperationGovernanceServiceTests
     public void 构造_connectionManager为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            null!, _auditRepo.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+            null!, _auditRepo.Object, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("connectionManager");
     }
@@ -56,16 +58,25 @@ public class RoutingOperationGovernanceServiceTests
     public void 构造_auditLogRepository为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            CreateConnectionMock().Object, null!, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+            CreateConnectionMock().Object, null!, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("auditLogRepository");
+    }
+
+    [Fact]
+    public void 构造_dataScopeService为null_抛ArgumentNullException()
+    {
+        Action act = () => new RoutingOperationGovernanceService(
+            CreateConnectionMock().Object, _auditRepo.Object, null!, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+
+        act.Should().Throw<ArgumentNullException>().WithParameterName("dataScopeService");
     }
 
     [Fact]
     public void 构造_logger为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            CreateConnectionMock().Object, _auditRepo.Object, null!);
+            CreateConnectionMock().Object, _auditRepo.Object, _dataScope.Object, null!);
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("logger");
     }
@@ -76,7 +87,7 @@ public class RoutingOperationGovernanceServiceTests
     public async Task ListOperationsAsync_materialId非正_抛ArgumentException()
     {
         var svc = CreateService(CreateConnectionMock());
-        Func<Task> act = () => svc.ListOperationsAsync(0, CancellationToken.None);
+        Func<Task> act = () => svc.ListOperationsAsync(0, 1, CancellationToken.None);
 
         await act.Should().ThrowAsync<ArgumentException>().WithParameterName("materialId");
     }
@@ -89,12 +100,15 @@ public class RoutingOperationGovernanceServiceTests
             new() { Id = 1, MaterialId = 100, OperationCode = "OP10", OperationPlanningMode = OperationPlanningModeValues.FiniteResource },
             new() { Id = 2, MaterialId = 100, OperationCode = "OP20", OperationPlanningMode = OperationPlanningModeValues.Unconstrained },
         };
+        // 3-NEW-P0-02：默认 Global 用户（不过滤，与旧语义一致）。
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Global);
         var conn = CreateConnectionMock();
         conn.Setup(c => c.QueryAsync<RoutingOperationDto>(
                 It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
             .ReturnsAsync(rows);
 
-        var result = await CreateService(conn).ListOperationsAsync(100);
+        var result = await CreateService(conn).ListOperationsAsync(100, 1);
 
         result.Should().HaveCount(2);
         result[0].OperationCode.Should().Be("OP10");
@@ -102,6 +116,70 @@ public class RoutingOperationGovernanceServiceTests
 
         conn.Verify(c => c.QueryAsync<RoutingOperationDto>(
             It.Is<string>(s => s.Contains("MaterialId = @MaterialId")),
+            It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Once);
+    }
+
+    // ---------- 3-NEW-P0-02（0号位 再审核）Department Scope 列表过滤 ----------
+
+    [Fact]
+    public async Task ListOperationsAsync_非Global无部门授权_返回空列表不查库()
+    {
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Factory, "BJ") }));
+        var conn = CreateConnectionMock();
+
+        var result = await CreateService(conn).ListOperationsAsync(100, 1);
+
+        result.Should().BeEmpty();
+        conn.Verify(c => c.QueryAsync<RoutingOperationDto>(
+            It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ListOperationsAsync_非Global仅返回授权部门工序()
+    {
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Department, "DEPT_A") }));
+        var conn = CreateConnectionMock();
+        conn.Setup(c => c.QueryAsync<int>(
+                It.Is<string>(s => s.Contains("SELECT Id FROM ProductionDepartment WHERE DeptCode IN @Codes")),
+                It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new List<int> { 101 });
+        conn.Setup(c => c.QueryAsync<RoutingOperationDto>(
+                It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new List<RoutingOperationDto>
+            {
+                new() { Id = 1, MaterialId = 100, ProductionDepartmentId = 101, OperationCode = "OP10", OperationPlanningMode = OperationPlanningModeValues.FiniteResource },
+            });
+
+        var result = await CreateService(conn).ListOperationsAsync(100, 1);
+
+        result.Should().ContainSingle().Which.OperationCode.Should().Be("OP10");
+        conn.Verify(c => c.QueryAsync<RoutingOperationDto>(
+            It.Is<string>(s => s.Contains("ProductionDepartmentId IN @AllowedDeptIds")),
+            It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ListOperationsAsync_Global不过滤()
+    {
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Global);
+        var rows = new List<RoutingOperationDto>
+        {
+            new() { Id = 1, MaterialId = 100, ProductionDepartmentId = 101, OperationCode = "OP10", OperationPlanningMode = OperationPlanningModeValues.FiniteResource },
+            new() { Id = 2, MaterialId = 100, ProductionDepartmentId = 202, OperationCode = "OP20", OperationPlanningMode = OperationPlanningModeValues.Unconstrained },
+        };
+        var conn = CreateConnectionMock();
+        conn.Setup(c => c.QueryAsync<RoutingOperationDto>(
+                It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(rows);
+
+        var result = await CreateService(conn).ListOperationsAsync(100, 1);
+
+        result.Should().HaveCount(2);
+        conn.Verify(c => c.QueryAsync<RoutingOperationDto>(
+            It.Is<string>(s => s.Contains("MaterialId = @MaterialId") && !s.Contains("IN @AllowedDeptIds")),
             It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Once);
     }
 

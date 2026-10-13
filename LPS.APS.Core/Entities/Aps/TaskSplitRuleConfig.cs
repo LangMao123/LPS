@@ -11,8 +11,11 @@ namespace LPS.APS.Core.Entities.APS;
 /// 2. FrozenStrategySnapshot.BatchPolicy —— 发布时把 active + 生效区间内规则投影进版本 ContentSnapshotJson.BatchPolicy 子块，
 ///    供 1号位 Solver 经快照消费（缺策略 fail-closed：BATCH_POLICY_MISSING）。
 ///
-/// 正式匹配粒度（V1）：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId NULL = Material 级默认）。
+/// 正式匹配粒度（V1）：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 正式业务键须明确，NULL 仅历史兼容，
+/// v5.1.10 收口④：NULL 部门历史记录不默认为所有部门的生效规则，治理写路径拒绝新增/更新为 NULL 部门规则）。
 /// 兼容字段（ResourceGroupId / MinimumOrderQuantity / EconomicOrderQuantity）仅历史兼容，不参与 V1 正式匹配、不投快照。
+/// v5.1.10 收口①②（2026-10-09 生效）：MaxOptimizationSplitCount / MaxBatchCandidates（1号位 Solver 技术预算）与
+/// BottleneckSplitStrategy / NonBottleneckStrategy（历史兼容列，V1 主链不得消费拆/合批倾向）不再作为治理业务配置，物理列保留历史。
 /// </summary>
 [Table("TaskSplitRuleConfig")]
 public class TaskSplitRuleConfig
@@ -22,7 +25,7 @@ public class TaskSplitRuleConfig
     /// <summary>物料（正式业务键，NOT NULL）</summary>
     public int MaterialId { get; set; }
 
-    /// <summary>生产部门（可空 = Material 级默认）</summary>
+    /// <summary>生产部门（正式业务键须明确；可空仅历史兼容，不默认为所有部门生效）</summary>
     public int? ProductionDepartmentId { get; set; }
 
     /// <summary>硬最小执行批量</summary>
@@ -40,10 +43,10 @@ public class TaskSplitRuleConfig
     /// <summary>是否允许合并</summary>
     public bool AllowMerge { get; set; }
 
-    /// <summary>仅限制优化性拆分搜索的最大拆分次数（不限制硬 Max 强制拆分）</summary>
+    /// <summary>历史列（v5.1.10 收口①：1号位 Solver 技术预算，版本化安全默认，治理不再维护/投影）</summary>
     public int? MaxOptimizationSplitCount { get; set; }
 
-    /// <summary>单问题最多评估的候选数</summary>
+    /// <summary>历史列（v5.1.10 收口①：1号位 Solver 技术预算，版本化安全默认，治理不再维护/投影）</summary>
     public int? MaxBatchCandidates { get; set; }
 
     /// <summary>兼容字段（v5.0 已废弃 ResourceGroup，不为 V1 正式粒度）</summary>
@@ -55,10 +58,10 @@ public class TaskSplitRuleConfig
     /// <summary>兼容字段（旧 EOQ）</summary>
     public decimal? EconomicOrderQuantity { get; set; }
 
-    /// <summary>瓶颈资源拆分/合并策略（PREFER_SPLIT / PREFER_MERGE）</summary>
+    /// <summary>历史兼容列（v5.1.10 收口②：V1 主链无论 NULL/非 NULL 均不得消费拆/合批倾向，仅追溯）</summary>
     public string? BottleneckSplitStrategy { get; set; }
 
-    /// <summary>非瓶颈批量策略（PREFER_LARGE_BATCH / PREFER_SMALL_BATCH）</summary>
+    /// <summary>历史兼容列（v5.1.10 收口②：V1 主链无论 NULL/非 NULL 均不得消费拆/合批倾向，仅追溯）</summary>
     public string? NonBottleneckStrategy { get; set; }
 
     public bool IsActive { get; set; } = true;

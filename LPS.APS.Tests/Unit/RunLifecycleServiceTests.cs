@@ -72,10 +72,10 @@ public class RunLifecycleServiceTests
             RunType = "FULL_SCHEDULE",
             Status = "RUNNING",
             TriggeredBy = "Hangfire",
-            DataCutoffTime = DateTime.UtcNow,
+            DataCutoffTime = DateTime.Now,
             StrategyProfileVersionId = 10,
             ExpectedDomainKeysJson = expectedJson,
-            StartedAt = DateTime.UtcNow,
+            StartedAt = DateTime.Now,
         };
 
     /// <summary>构造合法 RESCHEDULE（Candidate）运行（单 Domain）</summary>
@@ -86,10 +86,10 @@ public class RunLifecycleServiceTests
             RunType = "MANUAL_RESCHEDULE",
             Status = "RUNNING",
             TriggeredBy = "API",
-            DataCutoffTime = DateTime.UtcNow,
+            DataCutoffTime = DateTime.Now,
             StrategyProfileVersionId = 11,
             ExpectedDomainKeysJson = expectedJson,
-            StartedAt = DateTime.UtcNow,
+            StartedAt = DateTime.Now,
         };
 
     /// <summary>构造 CANDIDATE 计划版本（D7：候选身份在 VersionCategory，Status 走执行词表完成态 Computed；默认关联可激活来源 Run 2）</summary>
@@ -102,7 +102,7 @@ public class RunLifecycleServiceTests
             DomainKey = domainKey,
             Status = "Computed",
             SourceScheduleRunId = sourceScheduleRunId,
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.Now,
         };
 
     /// <summary>构造"已完成最小人工确认"的审计记录（P0-04 激活硬前置）</summary>
@@ -115,7 +115,7 @@ public class RunLifecycleServiceTests
                 EntityType = "PlanVersion",
                 EntityId = planVersionId.ToString(),
                 UserCode = "u1",
-                OccurredAt = DateTime.UtcNow,
+                OccurredAt = DateTime.Now,
             },
         };
 
@@ -127,9 +127,9 @@ public class RunLifecycleServiceTests
             RunType = "INSERT_ORDER_WHATIF",
             Status = "COMPLETED",
             TriggeredBy = "API",
-            DataCutoffTime = DateTime.UtcNow,
+            DataCutoffTime = DateTime.Now,
             ExpectedDomainKeysJson = """["D1"]""",
-            StartedAt = DateTime.UtcNow,
+            StartedAt = DateTime.Now,
         };
 
     // ==================== ValidateExpectedDomainKeysAsync ====================
@@ -564,7 +564,7 @@ public class RunLifecycleServiceTests
         // Arrange
         var failed = FullRun(1, expectedJson: """["D1","D2"]""");
         failed.Status = "FAILED";
-        failed.CompletedAt = DateTime.UtcNow;
+        failed.CompletedAt = DateTime.Now;
         failed.ErrorMessage = "致命错误";
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
         _scheduleRunRepo.Setup(r => r.InsertForRecoveryWithShellsAsync(
@@ -654,7 +654,7 @@ public class RunLifecycleServiceTests
         // Arrange
         var run = FullRun(1, expectedJson: """["D1"]""");
         run.Status = "COMPLETED";
-        run.CompletedAt = DateTime.UtcNow;
+        run.CompletedAt = DateTime.Now;
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(run);
 
         _strategyProfileVersionRepo.Setup(r => r.GetByIdAsync(10, It.IsAny<CancellationToken>()))
@@ -716,7 +716,7 @@ public class RunLifecycleServiceTests
             Status = "ACTIVE",
             PlanHorizonStart = DateTime.Today,
             PlanHorizonEnd = DateTime.Today.AddDays(90),
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.Now,
         };
 
     /// <summary>构造默认 PUBLISHED 策略包版本列表（默认 1 条，无生效窗口限制）</summary>

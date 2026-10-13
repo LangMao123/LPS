@@ -1,6 +1,7 @@
 using LPS.APS.Application.Services;
 using LPS.APS.Application.Services.Dto;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -52,23 +53,29 @@ public class ManualCapacityController : ControllerBase
         }
     }
 
-    /// <summary>查询人工槽主档（软删不含在默认查询；可按部门/工序过滤）</summary>
+    /// <summary>查询人工槽主档（软删不含在默认查询；可按部门/工序过滤；分页 PageResult，4号位 10-12 函）</summary>
     [HttpGet("slots")]
-    public async Task<ApiResponse<List<ManualCapacitySlotDto>>> GetSlots(
+    public async Task<ApiResponse<PageResult<ManualCapacitySlotDto>>> GetSlots(
         [FromQuery] int? departmentId = null,
         [FromQuery] string? operationName = null,
         [FromQuery] bool includeInactive = false,
+        [FromQuery] int pageIndex = 1,
+        [FromQuery] int pageSize = 20,
         CancellationToken ct = default)
     {
         try
         {
-            var rows = await _service.GetSlotsAsync(departmentId, operationName, includeInactive, ct);
-            return ApiResponse<List<ManualCapacitySlotDto>>.Success(rows);
+            if (pageIndex <= 0) pageIndex = 1;
+            if (pageSize <= 0 || pageSize > 200) pageSize = 20;
+
+            var rows = await _service.GetSlotsAsync(
+                departmentId, operationName, includeInactive, pageIndex, pageSize, ct);
+            return ApiResponse<PageResult<ManualCapacitySlotDto>>.Success(rows);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "ManualCapacity GetSlots failed");
-            return ApiResponse<List<ManualCapacitySlotDto>>.Fail(400, ex.Message);
+            return ApiResponse<PageResult<ManualCapacitySlotDto>>.Fail(400, ex.Message);
         }
     }
 

@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text;
 using Dapper;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.Auth;
 using LPS.APS.Core.Exceptions;
@@ -30,21 +31,25 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
 
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly IAuditLogRepository _auditLogRepository;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<StageLeadTimeParamGovernanceService> _logger;
 
     public StageLeadTimeParamGovernanceService(
         DatabaseConnectionManager connectionManager,
         IAuditLogRepository auditLogRepository,
+        IDataScopeService dataScopeService,
         ILogger<StageLeadTimeParamGovernanceService> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _auditLogRepository = auditLogRepository ?? throw new ArgumentNullException(nameof(auditLogRepository));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<StageLeadTimeParamDto>> ListAsync(
-        string? factoryCode, string? stageCode, string? productionDeptCode, bool? isActive, CancellationToken ct = default)
+        string? factoryCode, string? stageCode, string? productionDeptCode, bool? isActive,
+        int actorUserId, CancellationToken ct = default)
     {
         var sql = new StringBuilder($"SELECT {SelectColumns} FROM StageLeadTimeParam WHERE 1=1");
         var p = new DynamicParameters();
@@ -53,6 +58,37 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
         if (!string.IsNullOrWhiteSpace(stageCode)) { sql.Append(" AND StageCode = @StageCode"); p.Add("StageCode", stageCode); }
         if (!string.IsNullOrWhiteSpace(productionDeptCode)) { sql.Append(" AND ProductionDeptCode = @ProductionDeptCode"); p.Add("ProductionDeptCode", productionDeptCode); }
         if (isActive.HasValue) { sql.Append(" AND IsActive = @IsActive"); p.Add("IsActive", isActive.Value); }
+
+        // P0-03（0号位 审核 2026-10-09）：以受信主体 Business Scope 约束列表（Auth §9.3 禁止先全量再前端隐藏）。
+        // 非 Global：Factory 授权集合（若授权）IN 约束；Department 授权集合（若授权）IN 约束（NULL 部门行放行——无部门归属不越权）；
+        // 维度未授权（GetValues=null）不施加约束；无任何授权（Empty）→ fail-closed 空列表。
+        var scope = await _dataScopeService.ResolveScopeAsync(actorUserId, ct);
+        if (scope.IsEmpty)
+        {
+            return new List<StageLeadTimeParamDto>();
+        }
+
+        if (!scope.IsGlobal)
+        {
+            var factories = scope.GetValues(DataScopeTypes.Factory);
+            if (factories is { Count: > 0 })
+            {
+                sql.Append(" AND FactoryCode IN @Factories");
+                p.Add("Factories", factories);
+            }
+            else
+            {
+                // 非 Global 且无 Factory 授权：每行必有 FactoryCode，AND 交集语义下无任何可见行 → fail-closed 空列表。
+                return new List<StageLeadTimeParamDto>();
+            }
+
+            var depts = scope.GetValues(DataScopeTypes.Department);
+            if (depts is { Count: > 0 })
+            {
+                sql.Append(" AND (ProductionDeptCode IS NULL OR ProductionDeptCode IN @Depts)");
+                p.Add("Depts", depts);
+            }
+        }
 
         sql.Append(" ORDER BY FactoryCode, StageCode, Priority, Id");
 
@@ -65,9 +101,10 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
         SaveStageLeadTimeParamRequest input, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         Validate(input);
+        await EnsureTargetInScopeAsync(input.FactoryCode, input.ProductionDeptCode, actorUserId, ct);
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: 0);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         const string insertSql = @"
 INSERT INTO StageLeadTimeParam
 (FactoryCode, StageCode, ProductionDeptCode, MaterialCode, ProductFamilyCode,
@@ -90,6 +127,10 @@ VALUES (@FactoryCode, @StageCode, @ProductionDeptCode, @MaterialCode, @ProductFa
         p.Add("IsDefault", input.IsDefault);
         p.Add("CreatedAt", now);
         p.Add("UpdatedAt", now);
+
+        // P1-03（0号位 审核 §五 P1-03）：审计前置预检先于 DML（治理 DML 在 APS / 审计在 Auth，跨库无 2PC）——
+        // 审计库不可写则整操作失败、业务零变更（杜绝「已生效但无追溯审计」的参数）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         var id = await _connectionManager.QueryFirstOrDefaultAsync<int>(insertSql, p, db: DatabaseId.APS);
 
@@ -143,9 +184,13 @@ VALUES (@FactoryCode, @StageCode, @ProductionDeptCode, @MaterialCode, @ProductFa
             throw new ResourceNotFoundException($"阶段提前期参数（StageLeadTimeParam.Id={id}）不存在。");
         }
 
+        // P0-03：老归属 + 新归属分别校验，防 IDOR 式跨工厂/跨部门记录迁移。
+        await EnsureTargetInScopeAsync(existing.FactoryCode, existing.ProductionDeptCode, actorUserId, ct);
+        await EnsureTargetInScopeAsync(input.FactoryCode, input.ProductionDeptCode, actorUserId, ct);
+
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: id);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         const string updateSql = @"
 UPDATE StageLeadTimeParam SET
   FactoryCode = @FactoryCode, StageCode = @StageCode, ProductionDeptCode = @ProductionDeptCode,
@@ -169,6 +214,9 @@ WHERE Id = @Id";
         p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("IsDefault", input.IsDefault);
         p.Add("UpdatedAt", now);
+
+        // P1-03：审计前置预检（同 Create，先于 DML）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         await _connectionManager.ExecuteAsync(updateSql, p, db: DatabaseId.APS);
 
@@ -220,7 +268,12 @@ WHERE Id = @Id";
             throw new ResourceNotFoundException($"阶段提前期参数（StageLeadTimeParam.Id={id}）不存在。");
         }
 
-        var now = DateTime.UtcNow;
+        await EnsureTargetInScopeAsync(existing.FactoryCode, existing.ProductionDeptCode, actorUserId, ct);
+
+        // P1-03：审计前置预检（同 Create/Update，先于 DML）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var now = DateTime.Now;
         await _connectionManager.ExecuteAsync(
             "UPDATE StageLeadTimeParam SET IsActive = 0, UpdatedAt = @UpdatedAt WHERE Id = @Id",
             new { UpdatedAt = now, Id = id },
@@ -295,6 +348,31 @@ WHERE Id = @Id";
         if (input.EffectiveTo.HasValue && input.EffectiveTo.Value < input.EffectiveFrom)
         {
             throw new SetupRuleDataRedLineException("EffectiveTo 不能早于 EffectiveFrom。");
+        }
+    }
+
+    /// <summary>
+    /// P0-03（0号位 审核）：写路径（Create/Update/Deactivate）按 Factory + Department 维度校验目标归属（Auth §9.3/9.4，fail-closed）。
+    /// 非 Global 用户：FactoryCode 必在 Factory 授权内；ProductionDeptCode 非空时必在 Department 授权内（不同维度 AND）。
+    /// 越界 → ScopeViolationException（Controller 映射 403）。
+    /// </summary>
+    private async Task EnsureTargetInScopeAsync(string factoryCode, string? productionDeptCode, int actorUserId, CancellationToken ct)
+    {
+        var scope = await _dataScopeService.ResolveScopeAsync(actorUserId, ct);
+        if (scope.IsGlobal)
+        {
+            return;
+        }
+
+        if (!scope.Allows(DataScopeTypes.Factory, factoryCode))
+        {
+            throw new ScopeViolationException(DataScopeTypes.Factory, factoryCode);
+        }
+
+        if (!string.IsNullOrWhiteSpace(productionDeptCode)
+            && !scope.Allows(DataScopeTypes.Department, productionDeptCode))
+        {
+            throw new ScopeViolationException(DataScopeTypes.Department, productionDeptCode);
         }
     }
 

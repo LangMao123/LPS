@@ -46,6 +46,7 @@ public class StageLeadTimeParamController : ControllerBase
         return ex switch
         {
             SetupRuleDataRedLineException data => UnprocessableEntity(ApiResponse.Fail(422, data.Message)),
+            ScopeViolationException scope => StatusCode(403, ApiResponse.Fail(403, scope.Message)),
             ResourceNotFoundException missing => NotFound(ApiResponse.Fail(404, missing.Message)),
             ArgumentException argument => BadRequest(ApiResponse.Fail(400, argument.Message)),
             _ => throw ex,
@@ -69,7 +70,7 @@ public class StageLeadTimeParamController : ControllerBase
     {
         try
         {
-            var data = await _service.ListAsync(factoryCode, stageCode, productionDeptCode, isActive, ct);
+            var data = await _service.ListAsync(factoryCode, stageCode, productionDeptCode, isActive, GetCurrentUserId(), ct);
             return Ok(ApiResponse<IReadOnlyList<StageLeadTimeParamDto>>.Success(data));
         }
         catch (Exception ex)

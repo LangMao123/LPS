@@ -204,7 +204,8 @@ public sealed class SolverStrategyBlock
     // P1-02 补充（2026-09-14，2号位 出字段 / 3号位 冻结参数值 / 1号位 换读）：
     // BottleneckMode 只定「选哪个锚点」，不覆盖「利用率超多少判瓶颈」的百分比阈值——这是两个可调旋钮。
     // 0.85 判瓶颈资源（1号位 PhaseThreeDiagnostics.cs:92，填 BottleneckResourceIds，影响展示）；
-    // 0.90 判延期根因 RESOURCE_CAPACITY_SHORTAGE（PhaseThreeDiagnostics.cs:170，影响产能短缺责任归属）。
+    // 0.90 判延期根因 RESOURCE_CAPACITY_WAIT（PhaseThreeDiagnostics.cs:183，影响产能短缺责任归属）。
+    //    2026-10-12（1号位 §2.1 附带）：旧名 RESOURCE_CAPACITY_SHORTAGE 已退役、不在 15 码内，此处仅为注释引用，随之改名。
     // 拆两个独立阈值（目标不同、可单独调）。归 3号位 冻结。
     public decimal BottleneckUtilizationThreshold { get; set; } = 0.85m;           // 利用率 > 此值 → 判瓶颈资源
     public decimal CapacityShortageUtilizationThreshold { get; set; } = 0.90m;     // 利用率 > 此值 → 判延期根因产能短缺
@@ -283,23 +284,97 @@ public sealed class SetupTransitionRuleSnapshot
 
 /// <summary>
 /// ⑧ 批量策略（Batch Policy）规则快照——本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码）。
-/// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 可空=Material 级默认）。
-/// 来源：TaskSplitRuleConfig 物理表 active + 生效区间内规则，由 FrozenStrategySnapshotProvider 装配时投影。
+/// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 正式业务键须明确，NULL 仅历史兼容，
+/// v5.1.10 收口④：NULL 部门历史记录不默认为所有部门生效，投影端已按 HasValue 排除）。
+/// 来源：**本 Run 冻结策略包的 ⑧ 块**（`ParameterSetVersion.ContentSnapshotJson.BatchPolicy`），
+/// 由 FrozenStrategySnapshotProvider.DeserializeBatchPolicy 反序列化（投影端 TaskSplitRuleConfigProjector.ProjectFromSnapshot）。
+/// ⚠ 该子块是**「发布」时点**从 TaskSplitRuleConfig 物理表 active 规则**抄录的快照**，发布后**不再随物理表变化**
+/// （刷新唯一路径 = 重新发布参数集版本）；装载层**不回读**物理表。
 /// 缺策略（某 Material+Dept 无命中规则）由消费侧 fail-closed（BATCH_POLICY_MISSING），本块不承载信号位。
 /// 仅业务键 + 参数，不含审计字段（Id/Created/Updated/IsActive——投影时只取有效规则）。
+/// v5.1.10 收口①②（2026-10-09 生效）：MaxOptimizationSplitCount / MaxBatchCandidates / BottleneckSplitStrategy / NonBottleneckStrategy
+/// 投影恒 null、主链不得消费（Solver 技术预算归 1号位 版本化安全默认；策略列仅追溯）。字段保留仅为兼容旧快照反序列化与 1号位 消费侧类型，
+/// 不构成有效预算/拆合批倾向来源。
 /// </summary>
 public sealed class BatchPolicyRuleSnapshot
 {
     public int MaterialId { get; set; }                         // 物料（正式业务键）
-    public int? ProductionDepartmentId { get; set; }            // 生产部门（可空=Material 级默认）
+    public int? ProductionDepartmentId { get; set; }            // 生产部门（正式命中须明确；可空仅历史兼容，不默认为所有部门生效）
+
+    /// <summary>
+    /// 生效窗口起点（半开区间 <c>[EffectiveFrom, EffectiveTo)</c>；null = 无下界）。
+    /// **2026-10-13 新增**：发布侧 <c>TaskSplitRuleConfigProjector.Project</c> 填充（此前被丢弃），
+    /// 装载期按**本 Run 生效时点**重判 —— 「发布时有效、Run 时已失效」的行因此可被显式判成
+    /// <see cref="BatchPolicyState.Invalid"/>，而不再被原样下发为有效。
+    /// 依据：冻结 06 集成接口 v1.37 <c>:25</c>（业务键含**生效时点**）＋ 规则清单 v1.8 <c>B-013</c>。
+    /// 旧快照（如 PSV 807）无此字段 ⇒ 反序列化为 null ⇒ 无界，**向后兼容、零行为变化**。
+    /// </summary>
+    public DateTime? EffectiveFrom { get; set; }
+
+    /// <summary>生效窗口终点（半开区间；null = 无上界）。与 <see cref="EffectiveFrom"/> 同批新增、同口径。</summary>
+    public DateTime? EffectiveTo { get; set; }
 
     public decimal? MinExecutionBatchQty { get; set; }          // 硬最小批量
     public decimal? MaxExecutionBatchQty { get; set; }          // 硬最大批量（NULL=无硬上限）
-    public decimal? PreferredBatchQty { get; set; }             // 软偏好切点
+    public decimal? PreferredBatchQty { get; set; }             // 软偏好切点（业务生效必填且 >0、处于硬 Min/Max 内，由治理发布校验）
     public bool AllowSplit { get; set; }                        // 是否允许拆分
     public bool AllowMerge { get; set; }                        // 是否允许合并
-    public int? MaxOptimizationSplitCount { get; set; }         // 仅限制优化性拆分搜索（不限制硬 Max 强制拆分）
-    public int? MaxBatchCandidates { get; set; }                // 单问题最多评估候选数
-    public string? BottleneckSplitStrategy { get; set; }        // PREFER_SPLIT / PREFER_MERGE（瓶颈资源拆分/合并策略）
-    public string? NonBottleneckStrategy { get; set; }          // PREFER_LARGE_BATCH / PREFER_SMALL_BATCH（非瓶颈批量策略）
+    public int? MaxOptimizationSplitCount { get; set; }         // v5.1.10 收口①：恒 null 不投（1号位 Solver 技术预算）；仅类型兼容
+    public int? MaxBatchCandidates { get; set; }                // v5.1.10 收口①：恒 null 不投（1号位 Solver 技术预算）；仅类型兼容
+    public string? BottleneckSplitStrategy { get; set; }        // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
+    public string? NonBottleneckStrategy { get; set; }          // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
+}
+
+/// <summary>
+/// ⑧块 Batch Policy **三态＋不可用**（2→1 最小技术合同，2026-10-13）。
+///
+/// 依据（逐字）：06 集成接口 v1.37 <c>:25</c>（G2-T01 补正）——2号位须按
+/// <c>MaterialId + ProductionDepartmentId + 运行版本/Scope/生效时点</c> 的业务键**准确区分并传递**
+/// <c>VALID/MISSING/INVALID</c> 三态；「现有2→1合同确实不能无歧义表达三态时，仅允许经1/2号位契约审核确认
+/// **最小DTO或逻辑状态载体**，**不得增加Batch表**或**把所有物料规则发送Solver**；此处不预命名新字段。」
+/// ＋ 规则清单 v1.8 <c>B-013</c>（「不创第二Batch数据库真相」）
+/// ＋ 0号位 2026-10-13《未命名的Markdown文件3》<c>§2</c>（**新增第 4 类「不可用（技术失败）」**：
+/// 「接口未传递状态、规则数据装载失败或 DTO 无法表达三态，**不得直接视为 MISSING**」）。
+///
+/// 本载体**不新增数据库表、不新增第二份规则真相、不把全部物料规则发给 Solver** —— 只随本 Run 载荷
+/// 逐业务键附一条 <c>(状态, 真实匹配来源)</c>；规则参数本身仍走既有的
+/// <c>SolverStrategySnapshot.BatchPolicies</c>（仅承载 VALID 行）。
+/// </summary>
+public enum BatchPolicyState
+{
+    /// <summary>精确业务键命中，且记录**满足发布/有效化资格**且在**本 Run 生效时点**的生效窗口内。</summary>
+    Valid = 0,
+
+    /// <summary>经完整核对后本业务键**确无匹配规则**（含「⑧块整体为空（完全缺配）」与「本部门无命中而别的部门有记录」）
+    /// ⇒ 06 <c>:281</c> 允许 1号位 走 B-010 取 <c>Q_C</c> 作本 Run 软 Preferred 兜底。</summary>
+    Missing = 1,
+
+    /// <summary>**本键有规则但不合法/冲突/失效且未治理隔离**（含「发布时有效、本 Run 生效时点已失效」）
+    /// ⇒ 06 <c>:281</c> 逐字「**不得假装 MISSING 兜底，应暴露 Issue 等待治理**」⇒ 1号位 Fail Closed，**不启 Q_C**。</summary>
+    Invalid = 2,
+
+    /// <summary>**不可用（技术失败）**：接口未传递状态／规则数据装载失败／DTO 无法表达三态
+    /// ⇒ 0号位 文件3 <c>§2</c>「**不得直接视为 MISSING**」⇒ 1号位 Fail Closed，**不启 Q_C**。
+    /// 过渡形态：载体整体缺席（<c>SolverStrategySnapshot.BatchPolicyStates is null</c>）亦按本类处置。</summary>
+    Unavailable = 3
+}
+
+/// <summary>
+/// 三态载体的**逐业务键**条目（2→1 最小技术合同，2026-10-13）。**不含规则参数** —— 参数仍由
+/// <c>BatchPolicies</c> 承载，本条目只回答「这个键是什么状态、凭什么判的」。
+/// </summary>
+public sealed class BatchPolicyStateSnapshot
+{
+    /// <summary>业务键①：物料。</summary>
+    public int MaterialId { get; set; }
+
+    /// <summary>业务键②：生产部门。**null = 本 Run 未能确定该物料的生产部门**（业务键不完整）
+    /// —— 显式给出而非省略，使消费侧不必把「键缺失」误读成「未传递状态」。</summary>
+    public int? ProductionDepartmentId { get; set; }
+
+    /// <summary>状态。</summary>
+    public BatchPolicyState State { get; set; }
+
+    /// <summary>**真实匹配来源**（B-013 逐字要求「状态、**真实匹配来源**与 <c>Q_C</c>」）—— 供 1号位 追溯本状态据以判定的来源事实。</summary>
+    public string MatchSource { get; set; } = "";
 }

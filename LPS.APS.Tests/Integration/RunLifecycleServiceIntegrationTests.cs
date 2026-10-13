@@ -10,6 +10,7 @@ using LPS.APS.Engine.Repositories.Governance;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 using PlanVersion = LPS.APS.Core.Entities.APS.PlanVersion;
@@ -53,7 +54,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
 
     public RunLifecycleServiceIntegrationTests()
     {
-        _now = DateTime.UtcNow;
+        _now = DateTime.Now;
         _uniqueSuffix = $"{_now:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}".Substring(0, 30);
 
         _cm = TestEnvironment.GetConnectionManager();
@@ -111,7 +112,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         var options = new DbContextOptionsBuilder<AuthDbContext>()
             .UseSqlServer(authConn)
             .Options;
-        return new AuditLogRepository(new AuthDbContext(options));
+        return new AuditLogRepository(new AuthDbContext(options), NullLogger<AuditLogRepository>.Instance);
     }
 
     [SkippableFact]

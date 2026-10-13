@@ -133,6 +133,8 @@ public class NextOperationContextTests
 
     /// <summary>
     /// 测试UNLOCATED时IsUnlocated=true
+    /// （2026-10-12 按 0号位 §4.1 调整输入形态：零事实+有StagePath 现走可信首Stage兜底、不再产 UNLOCATED；
+    ///   本用例改用"部分事实+缺口"形态合法产生 UNLOCATED，测试意图不变）
     /// </summary>
     [Test]
     public async Task NextOp_Unlocated_SetsIsUnlocatedTrue()
@@ -145,6 +147,17 @@ public class NextOperationContextTests
             FactoryId = 5001,
             FactoryCode = "CN",
             ErpRemainingQty = 100m,
+            // 部分进度事实：CN_MACHINING 累计 60 ⇒ Stage 位置 60，缺口 40 → UNLOCATED
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_MACHINING",
+                    GoodCompletedQty = 60m,
+                    StageSequence = 1,
+                    SnapshotId = 1
+                }
+            },
             StagePath = new[]
             {
                 new StagePathFact { StageCode = "CN_MACHINING", StageSequence = 1, IsStartStage = true }

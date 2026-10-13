@@ -86,7 +86,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
             throw new InvalidOperationException("FAILED 恢复建壳列表为空（须至少一个预期 Domain 壳）");
         }
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var ts = now.ToString("yyyyMMddHHmmss");
 
         return await _connectionManager.ExecuteInTransactionAsync(async (connection, transaction) =>
@@ -164,7 +164,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
     {
         // B-1 白天候选运行创建：ScheduleRun + Candidate 壳 单事务原子写（沿用 ReplaceActiveAsync 事务模式）。
         // 任一失败整体回滚，不产生孤立 RUNNING 运行；触发 2号位 主流程不在本方法内（契约接缝，IRunLifecycleService）。
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var expectedDomainKeysJson = System.Text.Json.JsonSerializer.Serialize(new[] { spec.DomainKey });
         // A 口径（2号位 2026-09-21 回执定案）：ScopeJsonV2 序列化为契约字符串码
         // （BusinessTriggerType/PriorityMode 类型级 EnumMemberJsonConverter 读 EnumMember，实测 STJ 内置 JsonStringEnumConverter 不读 EnumMember），

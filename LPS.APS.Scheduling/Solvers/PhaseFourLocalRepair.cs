@@ -178,7 +178,9 @@ internal class PhaseFourLocalRepair
         // 修复背景：初始集原未排除锚点，导致「既是锚点又是变化种子」的 Task 会被 relocation 主循环搬走
         //           （该主循环只排连带牺牲者，不查 immovableTasks 自身）。
         // 注：IdentifyImmovableTasks 只认 request.ExecutionConstraints；当前生产侧该字段恒空
-        //     （PeggingOrchestrator.cs:210「当前锚点机制未建……故预留为空」），本保护在锚点通道接通后生效。
+        //     （`PeggingOrchestrator.cs:403-406`「当前锚点机制未建……故预留为空」+ `ExecutionConstraints =
+        //     Array.Empty<ExecutionConstraint>()`；2026-10-12 更正：原引 `:210` 已漂移成 catch 块），
+        //     本保护在锚点通道接通后生效。
         affectedTasks.ExceptWith(immovableTasks);
 
         // 初始化所有已排任务的快照
@@ -210,9 +212,16 @@ internal class PhaseFourLocalRepair
 
             var nextRoundAffected = new HashSet<string>();
 
+            // 热点计时（0号位 2026-10-08 §九）：传播循环整体（含其内部全表扫描）。
+            long swPropagation = SolverDiagnostics.HotspotStart();
+
             // 第9轮P0-02.1修复：先尝试重排受影响Task，让它们真实变化
             foreach (var affectedTaskId in currentRoundAffected)
             {
+                // 性能计数（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九「Phase4 传播 Task 数」）：
+                //   传播循环**实际访问**（含 `ScheduledTasks.FirstOrDefault` 全表扫描，见 §7.4）的 Task 次数。
+                SolverDiagnostics.CountPhase4PropagatedTask();
+
                 var task = scheduleResult.ScheduledTasks.FirstOrDefault(t => t.FinalDraftId == affectedTaskId);
                 if (task == null) continue;
 
@@ -574,6 +583,7 @@ internal class PhaseFourLocalRepair
             // 无真实变化时停止传播
             if (!hasRealChanges || nextRoundAffected.Count == 0)
             {
+                SolverDiagnostics.HotspotEnd(swPropagation, SolverDiagnostics.Hotspot.Phase4Propagation);
                 break;
             }
 
@@ -587,6 +597,7 @@ internal class PhaseFourLocalRepair
             }
 
             currentRoundAffected = nextRoundAffected;
+            SolverDiagnostics.HotspotEnd(swPropagation, SolverDiagnostics.Hotspot.Phase4Propagation);
         }
 
         // 第9轮P0-03.1修复：轮次耗尽时自动触发Fallback
@@ -680,6 +691,21 @@ internal class PhaseFourLocalRepair
 
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
+                //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
+                //   （所有 Routing 试排均不成功）无方向留痕，Phase4 修复出的 Task 虽带批键却查不到批级方向
+                //   ⇒ Phase5 回落需求级/Run 级 ⇒ 可能误动或误锁该批。
+                //   **不变量（代码可证）**：Phase4 的**全部**放置路径都是**正排** —— 两处逐批修复循环
+                //   （`RepairWithPropagation` / `RepairUnscheduledDemands`）均经 `TryResourceSwitch` 以
+                //   `earliestStart` 为下界、只调 `FindForwardSlot`（本文件放置调用 `:319`/`:1105`/`:1569` 全为
+                //   `FindForwardSlot`，**无任何倒排/交期锚定路径**）⇒ 修复批的**实际落定方向唯一且恒为
+                //   `FORWARD`**。故此处登记**本批实际方向**（可追溯到本批键），而非回落猜测。
+                //   已落定批不在修复单元内（`ExpandRepairUnits` 只取 `FailedExecutionBatches`）⇒ `TryAdd`
+                //   保证不覆盖 Phase2 的既有登记（零回归）。
+                //   ⚠ 不得改变冻结的 Route/Path/批身份：取图走 `TryGetBatchRoutingGraph(unitBatchKey, ...)`
+                //      （批键 → 本批路径 → 需求固定路径 → 唯一那条），本处只登记方向、不动任何身份字段。
+                constraints.ResolvedBatchDirections.TryAdd(unitBatchKey, SchedulingDirectionResolver.Forward);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
                 if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))
@@ -793,6 +819,21 @@ internal class PhaseFourLocalRepair
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
+                // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
+                //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
+                //   （所有 Routing 试排均不成功）无方向留痕，Phase4 修复出的 Task 虽带批键却查不到批级方向
+                //   ⇒ Phase5 回落需求级/Run 级 ⇒ 可能误动或误锁该批。
+                //   **不变量（代码可证）**：Phase4 的**全部**放置路径都是**正排** —— 两处逐批修复循环
+                //   （`RepairWithPropagation` / `RepairUnscheduledDemands`）均经 `TryResourceSwitch` 以
+                //   `earliestStart` 为下界、只调 `FindForwardSlot`（本文件放置调用 `:319`/`:1105`/`:1569` 全为
+                //   `FindForwardSlot`，**无任何倒排/交期锚定路径**）⇒ 修复批的**实际落定方向唯一且恒为
+                //   `FORWARD`**。故此处登记**本批实际方向**（可追溯到本批键），而非回落猜测。
+                //   已落定批不在修复单元内（`ExpandRepairUnits` 只取 `FailedExecutionBatches`）⇒ `TryAdd`
+                //   保证不覆盖 Phase2 的既有登记（零回归）。
+                //   ⚠ 不得改变冻结的 Route/Path/批身份：取图走 `TryGetBatchRoutingGraph(unitBatchKey, ...)`
+                //      （批键 → 本批路径 → 需求固定路径 → 唯一那条），本处只登记方向、不动任何身份字段。
+                constraints.ResolvedBatchDirections.TryAdd(unitBatchKey, SchedulingDirectionResolver.Forward);
+
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
                 if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))
                 {
@@ -835,9 +876,28 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
-    /// 识别不可移动任务（Execution/Firm/Frozen/Protection）
+    /// 识别不可移动任务。
     /// 文档：§四 4.8 ImmovableFacts
     /// P1-05：internal static 供 Phase5 Gap Compaction 复用（同一套不可移动语义，不另建）。
+    ///
+    /// ⚠ **2026-10-13 就地更正（原标题写「Execution/Firm/Frozen/Protection」= 4 来源，与实现不符）**：
+    ///   本方法**唯一**来源 = <c>request.ExecutionConstraints</c>（**契约①**，锁物理位置）。逐项说明：
+    ///   <list type="bullet">
+    ///     <item><b>Frozen（窗口层 ＋ 执行事实）</b> ⇒ **经契约①进入**。2号位 <c>ExecutionConstraintProjector</c>
+    ///       <c>:217-219</c> 自证：「1号位 消费端实查：<c>IdentifyImmovableTasks</c> 的**唯一**来源就是
+    ///       <c>request.ExecutionConstraints</c>……没有独立的 <c>immovableTasks</c> 入参」。⇒ 本方法无需为
+    ///       窗口层另开入口。</item>
+    ///     <item><b>Firm</b> ⇒ **明确不入**。<c>PM回复0923-1</c> §三.2 逐字「**Firm 不是锁。Firm 不是不可移动。**」
+    ///       ⇒ Firm 走**契约②**只作通报（见下条），**不得**据以禁移。</item>
+    ///     <item><b>Protection（契约② <c>request.OrderProtections</c>）</b> ⇒ **只通报、不约束**。
+    ///       <c>DomainSolveRequest.cs:409</c> 逐字：「**只通报、不约束**：1号位 **不得**据此禁止移动任何 Task」；
+    ///       <c>OrderProtectionType.Frozen</c> 自述「本类型在**契约② 里只作事实通报**；其**物理位置保护**由
+    ///       **契约①**（同订单 Task 的 <c>ExecutionConstraint</c>）承担」。⇒ **本方法刻意不新增
+    ///       <c>OrderProtection</c> 来源**（2号位 已于 2026-10-13 落契约②生产端，见 <c>PeggingOrchestrator.cs:421</c>）。</item>
+    ///   </list>
+    ///   【历史项已关闭】2026-09-23《订单保护事实载体_2号位致1号位_收敛回执》§六 曾拟「<c>IdentifyImmovableTasks</c>
+    ///   新增 <c>OrderProtection</c> 来源」并约「同批联调」；该项已被 **2026-10-13 契约①／②分工**取代
+    ///   （Frozen 的物理保护归契约①）⇒ **不再执行**，非漏做。
     /// </summary>
     internal static HashSet<string> IdentifyImmovableTasks(
         DomainSolveRequest request,

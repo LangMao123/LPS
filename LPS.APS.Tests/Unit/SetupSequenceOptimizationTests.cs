@@ -179,6 +179,105 @@ public class SetupSequenceOptimizationTests
         Assert.Equal(70m, d1.SetupTime + d2.SetupTime + anchor.SetupTime);
     }
 
+    // ════════════════════════════════════════════════════════════
+    // ⑥ P1-02 补充验收（0号位 2026-10-09《APS_V1_3_20261009.md》§三 P1-02）：
+    //    「同资源不同窗口、**前后都有固定锚点**、同需求多批混合方向下，Optimization 改变顺序后
+    //      始终保持硬约束与 JIT 语义」—— 本用例覆盖前两项几何（第三项见
+    //      `Phase5BatchDirectionTests.同需求两批方向分歧_BACKWARD批不提前_FORWARD批仍可优化`）。
+    //
+    // 场景：同一资源两段**互不相连**的日历窗（中间 12:00–15:00 停机）
+    //   W1 = [08:00, 13:00]、W2 = [15:00, 20:00]；
+    //   前后各有**固定锚点**（FIRM 锁定、位置绝不动）：A1(m9) [08:00,09:00]、A2(m8) [15:00,16:00]。
+    //   中间可移动段 = D2(m2, seq1) / D1(m1, seq2) 各 1 件 60min；Phase2 基线按需求序 ⇒ D2 先、Σ=120。
+    //   换型规则：m9→m1=5、m9→m2=60、m1↔m2=60（对称）、→m8 无规则（=0）。
+    //     · 基线 D2,D1：0(A1) + 60 + 60 + 0(A2) = 120；
+    //     · 换序 D1,D2：0 + 5 + 60 + 0 = 65 ⇒ **严格下降** ⇒ 优化体必须接受换序。
+    // 断言 = 「换序确实发生 + 两条硬约束（锚点原位、不跨停机段）+ 交期语义」：
+    //   · D1 换到段首（Setup=5、09:05 起）—— 基线形态下会落在 11:00 起（Setup=60）⇒ 本断言**红**；
+    //   · A1 / A2 **分毫不动**（前后锚点均是段边界，绝不跨锚点重排）；
+    //   · 全部加工窗落在各自可用窗内（中间停机段 [13:00,15:00] 无任何占用）；
+    //   · 无新增延期（各需求 end ≤ 交期）。
+    // ════════════════════════════════════════════════════════════
+    [Fact]
+    public async Task 同资源两窗口_前后固定锚点_重排后硬约束与锚点不动()
+    {
+        var rules = new List<SetupTransitionRuleSnapshot>
+        {
+            Rule(9, 1, 5m), Rule(9, 2, 60m), Rule(1, 2, 60m), Rule(2, 1, 60m)
+        };
+        var demands = new List<LogicalProductionDemand>
+        {
+            Demand("D2", 1, 2, 1),      // 需求序在 D1 之前 ⇒ Phase2 基线 D2 先（换型 60）
+            Demand("D1", 2, 1, 2),      // 换到段首后换型仅 5
+            Demand("A1", 3, 9, 3),      // 段前固定锚点（锁在 W1 头部）
+            Demand("A2", 4, 8, 4)       // 段后固定锚点（锁在 W2 头部）
+        };
+
+        var request = Build(demands, new[] { 1, 2, 9, 8 }, rules,
+            constraints: new List<ExecutionConstraint>
+            {
+                new ExecutionConstraint
+                {
+                    DraftId = "A1", ResourceId = 1,
+                    LockedStart = Day.AddHours(8), LockedEnd = Day.AddHours(9),
+                    ConstraintType = "FIRM", StageCode = "STAGE1", OperationCode = "OP10",
+                    LockedQuantity = 1m, LockedNetOutputQty = 1m, LockedPlannedProcessQty = 1m
+                },
+                new ExecutionConstraint
+                {
+                    DraftId = "A2", ResourceId = 1,
+                    LockedStart = Day.AddHours(15), LockedEnd = Day.AddHours(16),
+                    ConstraintType = "FIRM", StageCode = "STAGE1", OperationCode = "OP10",
+                    LockedQuantity = 1m, LockedNetOutputQty = 1m, LockedPlannedProcessQty = 1m
+                }
+            },
+            calendarWindows: new[]
+            {
+                (Day.AddHours(8), Day.AddHours(13)),    // W1
+                (Day.AddHours(15), Day.AddHours(20))    // W2（与 W1 之间有 12:00–15:00 停机）
+            });
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal(4, result.FinalTasks.Count);
+
+        var a1 = result.FinalTasks.Single(t => t.SourceDraftId == "A1");
+        var a2 = result.FinalTasks.Single(t => t.SourceDraftId == "A2");
+        var d1 = result.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        var d2 = result.FinalTasks.Single(t => t.SourceDraftId == "D2");
+
+        // ① 换序**确实发生**：D1 换到段首（紧随 A1）、换型仅 5 ⇒ 09:05 起。
+        //   基线形态（D2 先）下 D1 会在 11:00 才起、换型 60 ⇒ 本断言**红**。
+        Assert.Equal(5m, d1.SetupTime);
+        Assert.Equal(Day.AddHours(9).AddMinutes(5), d1.PlannedStartTime);
+        Assert.Equal(Day.AddHours(10).AddMinutes(5), d1.PlannedEndTime);
+        Assert.Equal(60m, d2.SetupTime);
+        Assert.Equal(Day.AddHours(11).AddMinutes(5), d2.PlannedStartTime);
+        Assert.Equal(Day.AddHours(12).AddMinutes(5), d2.PlannedEndTime);
+        Assert.Equal(65m, result.FinalTasks.Sum(t => t.SetupTime));
+
+        // ② 前后固定锚点**分毫不动**（段边界锚点绝不跨段重排）。
+        Assert.Equal(Day.AddHours(8), a1.PlannedStartTime);
+        Assert.Equal(Day.AddHours(9), a1.PlannedEndTime);
+        Assert.Equal(Day.AddHours(15), a2.PlannedStartTime);
+        Assert.Equal(Day.AddHours(16), a2.PlannedEndTime);
+
+        // ③ 硬约束：全部加工窗落在**各自可用窗**内，中间停机段无任何占用。
+        var gapStart = Day.AddHours(13);
+        var gapEnd = Day.AddHours(15);
+        Assert.All(result.FinalTasks, t =>
+        {
+            Assert.False(t.PlannedStartTime < gapEnd && t.PlannedEndTime > gapStart,
+                $"{t.SourceDraftId} 占用跨越停机段 [{gapStart:HH:mm}-{gapEnd:HH:mm}]");
+        });
+        Assert.All(result.FinalTasks.Where(t => t.SourceDraftId is "D1" or "D2"),
+            t => Assert.True(t.PlannedEndTime <= Day.AddHours(13), $"{t.SourceDraftId} 越出 W1"));
+
+        // ④ 交期语义：换序不得引入新增延期。
+        Assert.All(result.FinalTasks, t => Assert.True(t.PlannedEndTime <= Day.AddDays(20)));
+    }
+
     // ─────────────────────────── 构造辅助 ───────────────────────────
 
     private static SetupTransitionRuleSnapshot Rule(int from, int to, decimal minutes)
@@ -195,6 +294,7 @@ public class SetupSequenceOptimizationTests
         {
             LogicalDemandKey = key, PlanVersionId = 1L, DomainKey = "DOMAIN",
             AllocationSequence = alloc, DemandKey = key, MaterialId = materialId, FactoryId = 1,
+            StartStageCode = "STAGE1",
             NetOutputQty = 1m, PlannedProcessQty = 1m,
             RequiredAvailableTime = due ?? Day.AddDays(20), DemandSequence = seq
         };
@@ -238,7 +338,8 @@ public class SetupSequenceOptimizationTests
         List<SetupTransitionRuleSnapshot> rules,
         CandidateContext? candidate = null,
         List<ExecutionConstraint>? constraints = null,
-        List<MaterialAvailabilitySlice>? materialSlices = null)
+        List<MaterialAvailabilitySlice>? materialSlices = null,
+        IReadOnlyList<(DateTime Start, DateTime End)>? calendarWindows = null)
     {
         return new DomainSolveRequest
         {
@@ -268,10 +369,12 @@ public class SetupSequenceOptimizationTests
             {
                 new() { ResourceId = 1, ResourceCode = "R1", FactoryCode = "F1", Capacity = 1m }
             },
-            CalendarSlots = new List<ResourceCalendarSlot>
-            {
-                new() { ResourceId = 1, Start = Day.AddHours(8), End = Day.AddHours(18), IsAvailable = true }
-            },
+            CalendarSlots = (calendarWindows ?? new[] { (Day.AddHours(8), Day.AddHours(18)) })
+                .Select(w => new ResourceCalendarSlot
+                {
+                    ResourceId = 1, Start = w.Start, End = w.End, IsAvailable = true
+                })
+                .ToList(),
             ExecutionConstraints = constraints ?? new List<ExecutionConstraint>(),
             MaterialConstraints = materialSlices ?? new List<MaterialAvailabilitySlice>(),
             CandidateContext = candidate,
@@ -285,7 +388,7 @@ public class SetupSequenceOptimizationTests
                 },
                 // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
                 //   本夹具验证的是 Setup 序列优化，非批决策 ⇒ Material 级宽松策略（恒 1 批）。
-                BatchPolicies = TestBatchPolicy.Permissive(materials),
+                BatchPolicies = TestBatchPolicy.Permissive(materials, 100),
                 SetupTransitionRules = rules
             }
         };

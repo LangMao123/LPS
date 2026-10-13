@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
 using LPS.APS.Application.Services;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
@@ -26,6 +27,7 @@ namespace LPS.APS.Tests.Unit;
 public class StageLeadTimeParamGovernanceServiceTests
 {
     private readonly Mock<IAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IDataScopeService> _dataScope = new();
 
     private static Mock<DatabaseConnectionManager> CreateConnectionMock()
     {
@@ -38,8 +40,14 @@ public class StageLeadTimeParamGovernanceServiceTests
         return new Mock<DatabaseConnectionManager>(Options.Create(options));
     }
 
+    /// <summary>构造服务；默认 Scope=Global（全放行），越权用例在测试内单独 Setup。</summary>
     private StageLeadTimeParamGovernanceService CreateService(Mock<DatabaseConnectionManager> connection)
-        => new(connection.Object, _auditRepo.Object, Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
+    {
+        _dataScope.Reset();
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Global);
+        return new(connection.Object, _auditRepo.Object, _dataScope.Object, Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
+    }
 
     private static SaveStageLeadTimeParamRequest Request(
         string factoryCode = "BJ",
@@ -66,7 +74,7 @@ public class StageLeadTimeParamGovernanceServiceTests
     public void 构造_connectionManager为null_抛ArgumentNullException()
     {
         Action act = () => new StageLeadTimeParamGovernanceService(
-            null!, _auditRepo.Object, Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
+            null!, _auditRepo.Object, Mock.Of<IDataScopeService>(), Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("connectionManager");
     }
@@ -75,16 +83,25 @@ public class StageLeadTimeParamGovernanceServiceTests
     public void 构造_auditLogRepository为null_抛ArgumentNullException()
     {
         Action act = () => new StageLeadTimeParamGovernanceService(
-            CreateConnectionMock().Object, null!, Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
+            CreateConnectionMock().Object, null!, Mock.Of<IDataScopeService>(), Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("auditLogRepository");
+    }
+
+    [Fact]
+    public void 构造_dataScopeService为null_抛ArgumentNullException()
+    {
+        Action act = () => new StageLeadTimeParamGovernanceService(
+            CreateConnectionMock().Object, _auditRepo.Object, null!, Mock.Of<ILogger<StageLeadTimeParamGovernanceService>>());
+
+        act.Should().Throw<ArgumentNullException>().WithParameterName("dataScopeService");
     }
 
     [Fact]
     public void 构造_logger为null_抛ArgumentNullException()
     {
         Action act = () => new StageLeadTimeParamGovernanceService(
-            CreateConnectionMock().Object, _auditRepo.Object, null!);
+            CreateConnectionMock().Object, _auditRepo.Object, Mock.Of<IDataScopeService>(), null!);
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("logger");
     }
@@ -104,7 +121,7 @@ public class StageLeadTimeParamGovernanceServiceTests
                 It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
             .ReturnsAsync(rows);
 
-        var result = await CreateService(conn).ListAsync(null, null, null, null);
+        var result = await CreateService(conn).ListAsync(null, null, null, null, actorUserId: 1);
 
         result.Should().HaveCount(2);
         result[0].StageCode.Should().Be("BJ_ASSY");
@@ -119,7 +136,7 @@ public class StageLeadTimeParamGovernanceServiceTests
                 It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
             .ReturnsAsync(new List<StageLeadTimeParamDto>());
 
-        await CreateService(conn).ListAsync("BJ", "BJ_ASSY", "DEPT-1", true);
+        await CreateService(conn).ListAsync("BJ", "BJ_ASSY", "DEPT-1", true, actorUserId: 1);
 
         conn.Verify(c => c.QueryAsync<StageLeadTimeParamDto>(
             It.Is<string>(s => s.Contains("AND FactoryCode = @FactoryCode")
@@ -127,6 +144,65 @@ public class StageLeadTimeParamGovernanceServiceTests
                             && s.Contains("AND ProductionDeptCode = @ProductionDeptCode")
                             && s.Contains("AND IsActive = @IsActive")),
             It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Once);
+    }
+
+    // ---------- P0-03 Business Scope（0号位 审核 2026-10-09） ----------
+
+    [Fact]
+    public async Task ListAsync_非Global工厂与部门授权_拼入IN条件()
+    {
+        // P0-03：非 Global 用户按 Factory/Department 授权集合过滤（Auth §9.3 禁止先全量再前端隐藏）。
+        var conn = CreateConnectionMock();
+        conn.Setup(c => c.QueryAsync<StageLeadTimeParamDto>(
+                It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new List<StageLeadTimeParamDto>());
+
+        var svc = CreateService(conn);
+        _dataScope.Reset();
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[]
+            {
+                (DataScopeTypes.Factory, "BJ"),
+                (DataScopeTypes.Department, "DEPT-1"),
+            }));
+
+        await svc.ListAsync(null, null, null, null, actorUserId: 1);
+
+        conn.Verify(c => c.QueryAsync<StageLeadTimeParamDto>(
+            It.Is<string>(s => s.Contains("AND FactoryCode IN @Factories")
+                            && s.Contains("AND (ProductionDeptCode IS NULL OR ProductionDeptCode IN @Depts)")),
+            It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ListAsync_无任何授权_返回空列表且不查库()
+    {
+        // P0-03：无任何业务范围 → fail-closed 空列表（禁止泄露其它工厂/部门数据）。
+        var conn = CreateConnectionMock();
+        var svc = CreateService(conn);
+        _dataScope.Reset();
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Empty);
+
+        var result = await svc.ListAsync(null, null, null, null, actorUserId: 1);
+
+        result.Should().BeEmpty();
+        conn.Verify(c => c.QueryAsync<StageLeadTimeParamDto>(
+            It.IsAny<string>(), It.IsAny<object>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateAsync_工厂越权_抛ScopeViolationException()
+    {
+        // P0-03：Factory=SH 越出授权（仅 BJ）→ 403（写路径 fail-closed）。
+        var svc = CreateService(CreateConnectionMock());
+        _dataScope.Reset();
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Factory, "BJ") }));
+
+        Func<Task> act = () => svc.CreateAsync(Request(factoryCode: "SH"), 1, "u", CancellationToken.None);
+
+        await act.Should().ThrowAsync<ScopeViolationException>();
     }
 
     // ---------- Create 校验红线 ----------

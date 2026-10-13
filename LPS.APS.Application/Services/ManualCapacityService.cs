@@ -14,8 +14,8 @@ public interface IManualCapacityService
     /// <summary>新增人工槽主档（唯一键 Dept+OperationName+SlotCode）</summary>
     Task<ManualCapacitySlotDto> CreateSlotAsync(ManualCapacitySlotDto slot, CancellationToken ct = default);
 
-    /// <summary>查询人工槽主档（可按部门/工序过滤，支持含软删）</summary>
-    Task<List<ManualCapacitySlotDto>> GetSlotsAsync(int? departmentId = null, string? operationName = null, bool includeInactive = false, CancellationToken ct = default);
+    /// <summary>查询人工槽主档（可按部门/工序过滤，支持含软删；分页返 PageResult，4号位 10-12 函）</summary>
+    Task<PageResult<ManualCapacitySlotDto>> GetSlotsAsync(int? departmentId = null, string? operationName = null, bool includeInactive = false, int pageIndex = 1, int pageSize = 20, CancellationToken ct = default);
 
     /// <summary>软删人工槽主档（IsActive=0）</summary>
     Task<bool> SoftDeleteSlotAsync(int manualSlotId, CancellationToken ct = default);
@@ -78,26 +78,53 @@ public class ManualCapacityService : IManualCapacityService
         };
     }
 
-    public async Task<List<ManualCapacitySlotDto>> GetSlotsAsync(int? departmentId = null, string? operationName = null, bool includeInactive = false, CancellationToken ct = default)
+    public async Task<PageResult<ManualCapacitySlotDto>> GetSlotsAsync(
+        int? departmentId = null, string? operationName = null, bool includeInactive = false,
+        int pageIndex = 1, int pageSize = 20, CancellationToken ct = default)
     {
+        // 分页契约（4号位 10-12 函）：沿用 PageResult<T>{items,total,page,pageSize}，同 ManualETA / business-fact-issues 模式。
+        if (pageIndex <= 0) pageIndex = 1;
+        var skip = (pageIndex - 1) * pageSize;
+
+        var where = @"
+WHERE (@Dept IS NULL OR ms.ProductionDepartmentId = @Dept)
+  AND (@Op IS NULL OR ms.OperationName = @Op)
+  AND (@IncludeInactive = 1 OR ms.IsActive = 1)";
+
+        var parameters = new
+        {
+            Dept = departmentId,
+            Op = operationName,
+            IncludeInactive = includeInactive ? 1 : 0,
+            Skip = skip,
+            Take = pageSize
+        };
+
+        var total = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            "SELECT COUNT(*) FROM dbo.ManualCapacitySlot ms" + where,
+            parameters, CommandType.Text, DatabaseId.APS, 60);
+
         var sql = @"
 SELECT ms.ManualSlotId, ms.ProductionDepartmentId, pd.DeptName AS DepartmentName,
        ms.OperationName, ms.SlotCode, ms.IsActive,
        CASE WHEN EXISTS(SELECT 1 FROM dbo.ManualCapacitySlotCalendar mc WHERE mc.ManualSlotId = ms.ManualSlotId)
             THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS HasCalendar
 FROM dbo.ManualCapacitySlot ms
-LEFT JOIN dbo.ProductionDepartment pd ON pd.Id = ms.ProductionDepartmentId
-WHERE (@Dept IS NULL OR ms.ProductionDepartmentId = @Dept)
-  AND (@Op IS NULL OR ms.OperationName = @Op)
-  AND (@IncludeInactive = 1 OR ms.IsActive = 1)
-ORDER BY ms.ProductionDepartmentId, ms.OperationName, ms.SlotCode;";
+LEFT JOIN dbo.ProductionDepartment pd ON pd.Id = ms.ProductionDepartmentId"
+    + where + @"
+ORDER BY ms.ProductionDepartmentId, ms.OperationName, ms.SlotCode
+OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;";
 
         var rows = await _connectionManager.QueryAsync<ManualCapacitySlotDto>(
-            sql,
-            new { Dept = departmentId, Op = operationName, IncludeInactive = includeInactive ? 1 : 0 },
-            CommandType.Text, DatabaseId.APS, 60);
+            sql, parameters, CommandType.Text, DatabaseId.APS, 60);
 
-        return rows.ToList();
+        return new PageResult<ManualCapacitySlotDto>
+        {
+            Items = rows.ToList(),
+            Total = total,
+            Page = pageIndex,
+            PageSize = pageSize
+        };
     }
 
     public async Task<bool> SoftDeleteSlotAsync(int manualSlotId, CancellationToken ct = default)

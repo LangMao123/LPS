@@ -300,7 +300,19 @@ public class SetupOptimizer
 /// </summary>
 internal sealed class ResourceProductTimeline
 {
-    private readonly Dictionary<int, List<(DateTime End, int MaterialId)>> _byResource = new();
+    private Dictionary<int, List<(DateTime End, int MaterialId)>> _byResource = new();
+
+    /// <summary>
+    /// 克隆快照（**仅克隆实例非 null**）：记录「本实例某资源的 list 是否仍与快照共享」
+    /// ⇒ 共享则写入前需深拷该 list（copy-on-write）。
+    /// </summary>
+    private Dictionary<int, List<(DateTime End, int MaterialId)>>? _pristine;
+
+    /// <summary>
+    /// 本实例**已被 Clone 过**：下游快照可能正引用本实例的 list ⇒ 本实例写入前必须先把
+    /// 全部 list 换成自有副本，以**冻结**那些快照（否则下游 COW 会拷到已被我改过的状态）。
+    /// </summary>
+    private bool _sharedAsPristine;
 
     /// <summary>从既有 Task 集合构建（Phase2 Schedule 入口重置 / Phase4 兜底重跑时用）。</summary>
     public static ResourceProductTimeline FromTasks(IEnumerable<FinalTaskDraft> tasks)
@@ -316,19 +328,70 @@ internal sealed class ResourceProductTimeline
     }
 
     /// <summary>
-    /// 深拷贝（C桶候选内择优用）：每个候选 Path 必须在**同一初始上下文**上试排，互不污染；
+    /// 拷贝（C桶候选内择优用）：每个候选 Path 必须在**同一初始上下文**上试排，互不污染；
     /// 试排结果择优后再在真实上下文上重跑选中候选落定（0号位 2026-10-07 裁决 Q-2：
     /// 「候选评价必须看到当前 Domain 真实的资源占用、Calendar、已排 Task…」，故不能只跑孤立试算）。
+    ///
+    /// ── 2026-10-08 性能（0号位《未命名的Markdown文件 (2)(1).md》§7.1/§7.2 + §十 允许的「增量 Delta /
+    ///    Copy-on-write」）──
+    /// 旧实现**每次**深拷 `_byResource` 的**每一个** list。实测本方法在 42,261 Task 场景被调用
+    /// **94,940 次**（= 批方案候选试跑 14,046 + 候选路径试排 80,894），累计 17,778 ms = **ΣPhase 的 13.1%**，
+    /// 且因「每次 O(全部资源 × 全部占用窗)」而随 N 呈 **O(N²)**（任务 ×1.97 ⇒ 本项耗时 ×3.30，实测）。
+    ///
+    /// 新实现改为**惰性深拷**：`Clone()` 只做 **O(资源数)** 的浅拷（list 仍共享）+ 一份**冻结快照**；
+    /// 谁的 list 真被写、谁才付费深拷该 list。单条需求试排最多命中其工序合格资源（本例 ≤3 个），
+    /// 而资源数为 200 ⇒ **单次克隆的 list 复制量降到约 1/66**。
+    /// **语义零变化**：`GetPrevMaterial` 读到的内容、以及各候选之间的隔离性与旧实现逐字相同
+    /// （脱钩规则见 <see cref="Mutable"/>，对「源被克隆后再写」「克隆再被克隆」两种情形都作了冻结处理）。
     /// </summary>
     public ResourceProductTimeline Clone()
     {
-        var clone = new ResourceProductTimeline();
-        foreach (var (resourceId, list) in _byResource)
+        var clone = new ResourceProductTimeline
         {
-            clone._byResource[resourceId] = new List<(DateTime End, int MaterialId)>(list);
+            // 浅拷：只复制「资源 Id → list 引用」这一层（O(资源数)），list 本体暂共享
+            _byResource = new Dictionary<int, List<(DateTime End, int MaterialId)>>(_byResource),
+            // 冻结快照：与浅拷分开一份，作为「哪些 list 仍共享」的判据，且本身**永不被改写**
+            _pristine = new Dictionary<int, List<(DateTime End, int MaterialId)>>(_byResource),
+        };
+        // 通知本实例：你的 list 已被快照引用 ⇒ 你下次写入前要先自脱钩
+        _sharedAsPristine = true;
+        return clone;
+    }
+
+    /// <summary>
+    /// 取「可写」的资源 list（必要时先 copy-on-write —— **逐资源**脱钩，不整表拷贝）。
+    ///
+    /// 不变式：**任何实例都不得原地修改一个可能被别人（父实例 或 任何快照）引用的 list**。
+    /// 需要脱钩的两种情形（其余情况可原地写，因为该 list 已为本实例独占）：
+    ///   ① 本实例**已被 Clone 过**（`_sharedAsPristine`）⇒ 下游快照可能正引用该 list；
+    ///   ② 本实例是**克隆**，且该资源 list 仍与自己的冻结快照共享 ⇒ 父侧仍引用该 list。
+    /// 脱钩方式统一为「把**自己这一条**换成新 list（拷贝），再在副本上写」——
+    /// 快照与被共享的原 list **始终不被改写**，故下游 COW 拿到的永远是克隆时刻的状态。
+    ///
+    /// ⚠ 为什么不整表脱钩：winner 落定是**逐批**写真实上下文（`clone ×k → 写真实 → clone ×k …` 交替），
+    ///   整表脱钩会**每批**触发一次 O(全部资源 × 全部占用窗) 的拷贝 ⇒ 实测收益归零。
+    ///   逐资源脱钩下，单批只为其工序命中的 ≤3 个资源付费。
+    /// </summary>
+    private List<(DateTime End, int MaterialId)> Mutable(int resourceId)
+    {
+        if (!_byResource.TryGetValue(resourceId, out var list))
+        {
+            list = new List<(DateTime End, int MaterialId)>();
+            _byResource[resourceId] = list;
+            return list;
         }
 
-        return clone;
+        var sharedWithMySnapshot = _pristine is not null
+                                   && _pristine.TryGetValue(resourceId, out var snapshot)
+                                   && ReferenceEquals(list, snapshot);
+
+        if (_sharedAsPristine || sharedWithMySnapshot)
+        {
+            list = new List<(DateTime End, int MaterialId)>(list);
+            _byResource[resourceId] = list;
+        }
+
+        return list;
     }
 
     /// <summary>上一相邻 Task 产品：最晚占用结束时间 ≤ occStart 者；null = 无可追溯上一产品（初始设备状态，Setup=0）。</summary>
@@ -351,11 +414,8 @@ internal sealed class ResourceProductTimeline
     /// <summary>登记一个已放置 Task 的产品与占用结束时间（有序插入）。</summary>
     public void Place(int resourceId, DateTime occEnd, int materialId)
     {
-        if (!_byResource.TryGetValue(resourceId, out var list))
-        {
-            list = new List<(DateTime, int)>();
-            _byResource[resourceId] = list;
-        }
+        // COW：源被克隆过后，源自己写入也须先脱钩（否则会改到下游快照可见的 list）
+        var list = Mutable(resourceId);
 
         int lo = 0, hi = list.Count;
         while (lo < hi)
@@ -370,8 +430,11 @@ internal sealed class ResourceProductTimeline
     /// <summary>移除一个 Task 的登记（移动/重建前调用；按 End+MaterialId 匹配第一条）。</summary>
     public void Remove(int resourceId, DateTime occEnd, int materialId)
     {
-        if (!_byResource.TryGetValue(resourceId, out var list))
+        if (!_byResource.TryGetValue(resourceId, out _))
             return;
+
+        // COW：同上 —— 任何写入前先确保该 list 为本实例独有
+        var list = Mutable(resourceId);
 
         for (int i = 0; i < list.Count; i++)
         {

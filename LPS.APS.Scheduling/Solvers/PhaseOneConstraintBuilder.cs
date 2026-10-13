@@ -859,26 +859,40 @@ internal class PhaseOneConstraintBuilder
     /// </summary>
     private void BuildLockedTasks(DomainSolveRequest request, ConstraintContext context)
     {
-        // P1-07：复合键 (DraftId, OperationCode)。同一 LogicalDemand 多操作锚点（多 ExecutionConstraint）
-        // 不再因重复 DraftId 抛 ToDictionary 异常；OperationCode 归一化为 string.Empty（2号位 口径：恒非空）。
-        var lockedTasks = request.ExecutionConstraints
-            .ToDictionary(
-                ec => (ec.DraftId, ec.OperationCode ?? string.Empty),
-                ec => new LockedTaskConstraint
-                {
-                    DraftId = ec.DraftId,
-                    ResourceId = ec.ResourceId,
-                    LockedStart = ec.LockedStart,
-                    LockedEnd = ec.LockedEnd,
-                    ConstraintType = ec.ConstraintType,
-                    StageCode = ec.StageCode,
-                    OperationCode = ec.OperationCode,
-                    LockedQuantity = ec.LockedQuantity,
-                    LockedNetOutputQty = ec.LockedNetOutputQty,
-                    LockedPlannedProcessQty = ec.LockedPlannedProcessQty,
-                    TaskKey = ec.TaskKey
-                }
-            );
+        // P1-07：复合键。同一 LogicalDemand 多操作锚点（多 ExecutionConstraint）不再因重复 DraftId 抛异常；
+        //   StageCode / OperationCode 归一化为 string.Empty（2号位 口径：恒非空）。
+        // P0-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：键域**必须含 StageCode** ——
+        //   已生效工序身份规则要求 StageCode 与 OperationCode **共同**定位工序，不得假设 OperationCode 全局唯一。
+        //   并改**显式循环 + 重复检测**（`ToDictionary` 的重复 Key 抛的是未受控 ArgumentException）：
+        //   同一三元键出现两条 ⇒ 输入契约无法唯一标识锚点 ⇒ **不得静默抹除锚点**，须受控 Fail Closed
+        //   （抛 `SolverInputContractException`，由 `FiniteCapacitySolver.SolveAsync` 捕获）。
+        var lockedTasks = new Dictionary<(string DraftId, string StageCode, string OperationCode), LockedTaskConstraint>();
+        foreach (var ec in request.ExecutionConstraints)
+        {
+            var lockedKey = (ec.DraftId, ec.StageCode ?? string.Empty, ec.OperationCode ?? string.Empty);
+            if (lockedTasks.ContainsKey(lockedKey))
+            {
+                throw new SolverInputContractException(
+                    "锁定约束键域冲突：同一 (DraftId, StageCode, OperationCode) 出现多条 ExecutionConstraint ⇒ " +
+                    $"无法唯一标识锚点，不得静默抹除。DraftId={ec.DraftId}, " +
+                    $"StageCode={ec.StageCode ?? "(null)"}, OperationCode={ec.OperationCode ?? "(null)"}");
+            }
+
+            lockedTasks[lockedKey] = new LockedTaskConstraint
+            {
+                DraftId = ec.DraftId,
+                ResourceId = ec.ResourceId,
+                LockedStart = ec.LockedStart,
+                LockedEnd = ec.LockedEnd,
+                ConstraintType = ec.ConstraintType,
+                StageCode = ec.StageCode,
+                OperationCode = ec.OperationCode,
+                LockedQuantity = ec.LockedQuantity,
+                LockedNetOutputQty = ec.LockedNetOutputQty,
+                LockedPlannedProcessQty = ec.LockedPlannedProcessQty,
+                TaskKey = ec.TaskKey
+            };
+        }
 
         context.LockedTasks = lockedTasks;
     }
@@ -938,12 +952,15 @@ internal class PhaseOneConstraintBuilder
     ///
     /// 数据链路：`TaskSplitRuleConfig`（3号位 治理）→ 本 Run 一次性 `FrozenStrategySnapshot.BatchPolicies`
     ///   → 2号位 投影进 `SolverStrategySnapshot.BatchPolicies`（1↔2 契约，0号位 (7).md §十）
-    ///   → 此处**整块逐字收进** `ConstraintContext`（**不在装载层裁剪、不按 Domain 塌成单值**）
+    ///   → 此处**整块逐字收进** `ConstraintContext`（本层**不裁剪**；载荷的**物料轴**裁剪由 2号位 在**上游**完成，
+    ///     本层只做保真搬运、不按 Domain 塌成单值）
     ///   → `PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy` 按 `(MaterialId, Dept)` **逐需求**解析。
     ///
-    /// **不得**在装载层做「同键合并 / 取第一条」等裁剪：键域语义（精确命中 + Material 级默认回落）
-    ///   由解析侧 `ResolveExecutionBatchPolicy` 统一负责，装载层只做**保真搬运**。
-    /// 空（`StrategySnapshot` 为 null 或 ⑧块为空）⇒ 策略集为空 ⇒ 每需求恒 1 批，行为与旧版**逐字一致**。
+    /// **不得**在本层做「同键合并 / 取第一条」等裁剪：键域语义（**仅 `(MaterialId, 明确 ProductionDepartmentId)`
+    ///   精确命中**；⚠ AUD-1-004 起**已删除** Material 级默认回落）由解析侧 `ResolveExecutionBatchPolicy`
+    ///   统一负责，本层只做**保真搬运**。
+    /// 空（`StrategySnapshot` 为 null 或 ⑧块为空）⇒ 策略集为空 ⇒ **C 桶需求一律判 `BATCH_POLICY_MISSING`
+    ///   并 Fail Closed**（P0-01 起；**不再**是「每需求恒 1 批」）。
     /// </summary>
     private static void BuildExecutionBatchPolicies(DomainSolveRequest request, ConstraintContext context)
     {
@@ -1124,6 +1141,39 @@ internal class ConstraintContext
     public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// 需求 → **本 Run 该需求自决后的排程方向**（`LogicalDemandKey` → `FORWARD`/`BACKWARD`/`MIXED`）。
+    ///
+    /// Phase2 在**本需求进入批/路由择优之前**用 `SchedulingDirectionResolver` 解析一次并登记
+    ///   （P1-01 整改：同一 ResolvedDirection 贯穿 试排/候选比较/落定）；Phase5 的空隙压实与
+    ///   Setup 序列优化据此判定「本需求是否 FORWARD」，**不再使用 Run 级原始策略值**。
+    ///
+    /// ⚠ 为什么必须登记而不是在 Phase5 重算：Phase2 的解析输入含**本需求的候选工序集**与
+    ///   `dynamicMaterialFloor`（试排上下文）；Phase5 已无该上下文 ⇒ 重算会**漂移**。登记 = 一次解析、全链一致。
+    ///
+    /// Run 级 `FORWARD`/`BACKWARD` ⇒ 全量同向（Phase2 不解析、直接取原值）⇒ Phase5 行为与整改前**逐字一致**；
+    /// Run 级 `AUTO` ⇒ 逐需求方向不同 ⇒ Phase5 得以按需求粒度门控（整改前 Phase5 见到 `AUTO` 恒跳过两项优化）。
+    /// 未登记（旁路/早期 continue 的需求）⇒ 消费侧回落 Run 级原值（保守，与整改前一致）。
+    /// </summary>
+    public Dictionary<string, string> ResolvedDirections { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// **执行批键 → 该批实际落定所用方向**（NEW-P1-01，0号位 2026-10-09《APS_V1_3_20261009.md》§三）。
+    ///
+    /// 【为什么单靠 <see cref="ResolvedDirections"/> 不够】
+    ///   冻结模型是「**每个 Execution Batch 独立**做 Direction + RoutingCandidate + Resource + Calendar + Setup
+    ///   联合求解」⇒ 同一 `LogicalDemand` 的不同执行批**可以各自落定到不同方向**（例如 Batch-001 选中长 Lead 的
+    ///   Path 自决 BACKWARD，Batch-002 选中短 Lead 的 Path 自决 FORWARD）。
+    ///   而 <see cref="ResolvedDirections"/> 是**需求级单值**，只能承载「最后一个落定批」的方向
+    ///   ⇒ 用它驱动 Phase5 会**把某一批的方向套到全需求**（复审判词：「多批方向被需求级单值覆盖」）。
+    ///
+    /// 【消费口径】Phase5 先按 **Task 自己的 `ExecutionBatchDraftKey`** 查本表；未命中才回落
+    ///   <see cref="ResolvedDirections"/>（需求级，兼容旁路/单批），再回落 Run 级原值。
+    ///   回调顺序保证**零回归**：Run 级 `FORWARD`/`BACKWARD` ⇒ 两级登记的均是该原值；
+    ///   单批需求 ⇒ 批级与需求级同值。
+    /// </summary>
+    public Dictionary<string, string> ResolvedBatchDirections { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// ⑧块 Batch Policy —— **按 `(MaterialId, ProductionDepartmentId?)` 键控的策略集**
     /// （P0-01 整改，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
     ///
@@ -1133,16 +1183,17 @@ internal class ConstraintContext
     ///   用单值代表整个 Domain 会让不同物料/部门**错误共用批量硬约束**，直接改变排程业务结果。
     ///
     /// **解析**：<see cref="PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy"/> 按需求
-    ///   `(MaterialId, StartStageCode → ProductionDepartmentId)` 精确命中；未命中回落
-    ///   `(MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（该默认语义由 ⑧块 DTO 自身承载）；
-    ///   仍无命中 ⇒ **缺策略**。⚠ P0-01（0号位 2026-10-08 §四）后缺策略**不再**等于「不拆、恒 1 批」：
+    ///   `(MaterialId, StartStageCode → ProductionDepartmentId)` 精确命中；未精确命中 ⇒ `null`（**缺策略**）——
+    ///   ⚠ **AUD-1-004（2026-10-10）起已删除** `(MaterialId, ProductionDepartmentId == null)` 的
+    ///   「Material 级默认」回落（NULL 部门行是历史兼容记录，不得在 Solver 里复活）。
+    ///   ⚠ P0-01（0号位 2026-10-08 §四）后缺策略**不再**等于「不拆、恒 1 批」：
     ///   C 桶需求一律判 `BATCH_POLICY_MISSING` 并 **Fail Closed**（不产 FinalTask、不进 Phase4）。
     ///   正式兜底链第③级「Global Batch Default」由 2/3号位 在上游**投影成有效 Policy** 后再交 1号位，
     ///   1号位 不得自行展开该级、更不得把末级 `null` 解释成「单批合法」。
     ///
     /// **载体**：`SolverStrategySnapshot.BatchPolicies`（⑧块，1↔2 契约，0号位 (7).md §十/§十一）⇒
-    ///   `PhaseOneConstraintBuilder.BuildExecutionBatchPolicies` **整块逐字**收进本集合（**不在装载层裁剪**，
-    ///   键域解析统一由 `ResolveExecutionBatchPolicy` 负责）。
+    ///   `PhaseOneConstraintBuilder.BuildExecutionBatchPolicies` **整块逐字**收进本集合（本层**不裁剪**；
+    ///   载荷的**物料轴**裁剪由 2号位 在**上游**完成，键域解析统一由 `ResolveExecutionBatchPolicy` 负责）。
     ///   空集合 ⇒ 每个 C 桶需求均判 `BATCH_POLICY_MISSING`（Fail Closed）。
     /// </summary>
     public List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot> ExecutionBatchPolicies { get; set; } = new();
@@ -1336,10 +1387,15 @@ internal class ConstraintContext
     public Dictionary<long, List<MaterialAvailabilitySegment>> MaterialAvailability { get; set; } = new();
 
     /// <summary>
-    /// 锁定任务约束：P1-07 复合键 (DraftId, OperationCode) → 锁定信息。
-    /// 同一 LogicalDemand 可有多操作锚点，故不能再用 DraftId 单键。
+    /// 锁定任务约束：复合键 <c>(DraftId, StageCode, OperationCode)</c> → 锁定信息。
+    ///
+    /// · P1-07：同一 LogicalDemand 可有多操作锚点 ⇒ 不能再用 DraftId 单键。
+    /// · P0-02（0号位 2026-10-09 第四轮复审《APS_V1_2_20261009.md》§三）：**必须含 StageCode**。
+    ///   已生效的工序身份规则要求 `StageCode` 与 `OperationCode` **共同**定位工序，不得假设
+    ///   `OperationCode` 全局唯一；否则「同 DraftId、Stage A/OP10 与 Stage B/OP10 同时锁定」
+    ///   会在建字典阶段抛重复 Key 异常。此前仅二维键 ⇒ 键域不足。
     /// </summary>
-    public Dictionary<(string DraftId, string OperationCode), LockedTaskConstraint> LockedTasks { get; set; } = new();
+    public Dictionary<(string DraftId, string StageCode, string OperationCode), LockedTaskConstraint> LockedTasks { get; set; } = new();
 
     /// <summary>
     /// 共享资源占用块：ResourceId → 占用时间块列表
@@ -1572,6 +1628,18 @@ internal class LockedTaskConstraint
     public decimal? LockedPlannedProcessQty { get; set; }
 
     public string? TaskKey { get; set; }
+}
+
+/// <summary>
+/// 求解器**输入契约**异常：输入无法满足冻结契约要求的唯一标识 / 完整身份（不是业务「排不下」）。
+///
+/// 由 <see cref="FiniteCapacitySolver.SolveAsync"/> 捕获 ⇒ **受控 Fail Closed**（`Success=false` + `ErrorMessage`），
+/// 不向外抛未处理异常、也不静默抹除锚点。
+/// 依据：0号位 2026-10-09《APS_V1_2_20261009.md》§三 P0-02（「SolveAsync 没有对该异常做受控 Fail Closed」）。
+/// </summary>
+internal sealed class SolverInputContractException : Exception
+{
+    public SolverInputContractException(string message) : base(message) { }
 }
 
 /// <summary>

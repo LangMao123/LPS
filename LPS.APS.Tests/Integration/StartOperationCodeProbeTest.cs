@@ -33,8 +33,18 @@ namespace LPS.APS.Tests.Integration;
 /// </summary>
 public class StartOperationCodeProbeTest
 {
-    private const int PlanVersionId = 633;
-    private const long StrategyProfileVersionId = 811L;
+    /// <summary>
+    /// 探针目标 PlanVersion。默认 = 夜间 PV2（NIGHTLY_20261008_FAMILY_X，SourceScheduleRunId=1，
+    /// MES 三快照齐备）；可用 <c>APS_PROBE_PLAN_VERSION</c> 覆盖。
+    /// ⚠️ 探针要能触达连续性装载，目标 PV 的 <c>SourceScheduleRunId</c> **必须指向一个真有 MES 快照的 run**；
+    ///    指向一个新建的 APS 求解 run（快照恒空）时，连续性必然 0 上下文——那是 run 选错，不是代码缺陷。
+    /// </summary>
+    private static int PlanVersionId =>
+        int.TryParse(Environment.GetEnvironmentVariable("APS_PROBE_PLAN_VERSION"), out var v) ? v : 2;
+
+    /// <summary>策略包版本（默认生产默认包 811）；可用 <c>APS_PROBE_STRATEGY_VERSION</c> 覆盖。</summary>
+    private static long StrategyProfileVersionId =>
+        long.TryParse(Environment.GetEnvironmentVariable("APS_PROBE_STRATEGY_VERSION"), out var v) ? v : 811L;
 
     [Fact(DisplayName = "只读探针：续排起点 StartOperationCode 出口值 vs 1号位 OperationCode 匹配空间")]
     public async Task StartOperationCode_ExitSpace()
@@ -60,7 +70,15 @@ public class StartOperationCodeProbeTest
         // ⚠️ `[EECTX]` 是字面匹配，**不会**命中 `[EECTX-STARTSTAGE]` 行（中间隔着 `-`）；若要核
         //    5号位 DetermineEffectiveStartStage 是否把 startStage 错推，需把 `[EECTX-STARTSTAGE]`
         //    一并加进数组（本次未加）。
-        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug).AddProvider(new MarkerLoggerProvider(new[] { "[Pegging][红线]", "[EECTX]" })));
+        // 2026-10-09 追加两类标记（T2-01/T2-04 整改验收）：
+        //   `[Pegging][T2-01]`   —— PI 权威剩余事实装载汇总（1 行）：PI 数 / Σ原始量 / Σ已入库 / Σ剩余 / 边界计数。
+        //   `[Pegging][Continuity]` —— 连续性事实摘要 + 分桶完成（各 1~2 行）：PI Position 数 / 上下文数 / ΣE。
+        //   判「PI 宇宙是否被 Stage 把门」看 `[Continuity] 事实摘要(回路前)` 的 `PI Position=` 是否 = [Order] 的 PI 数。
+        // 2026-10-09 收窄：`MaxPrint=400` 是**全局**静态计数（见 MarkerLoggerProvider），
+        // 真实域下 `[EECTX]` 单跑就能刷 400+ 条 ⇒ 末尾的 `[Pegging][T2-02]` 承接汇总/分层行**必被折叠**,
+        // 探针等于没输出（T2-01/T2-02 验收跑就是这么被吃掉的）。本次核 T2-01/T2-02，去掉 `[EECTX]`。
+        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug).AddProvider(new MarkerLoggerProvider(
+            new[] { "[Pegging][红线]", "[Pegging][T2-01]", "[Pegging][T2-02]", "[Pegging][Continuity]" })));
         services.AddScoped<DatabaseConnectionManager>();
 
         var sp = services.BuildServiceProvider();
@@ -111,9 +129,12 @@ public class StartOperationCodeProbeTest
         //    别把「表是空的」升级成缺陷或裁决项。
         if (!MarkerLoggerProvider.SawRedline)
             Console.WriteLine(
-                "PROBE-结果：未打出 [Pegging][红线] 定位行 ⇒ PI Position 装载未触达（wipStageRows 为空）。" +
-                "本次不能作为「续排起点全为空」的证据。常见原因=该 PV 的快照批次尚未由夜间全量同步灌入（非缺陷）；" +
-                "先跑夜间同步，或临时借用已灌批次（如 run 477）观察、跑完还原。");
+                "PROBE-结果：未打出 [Pegging][红线] 定位行 ⇒ PI Position 装载未触达。" +
+                "**2026-10-09（T2-04）起判据已换**：不再看「wipStageRows 是否为空」，而是看 [Order] 里" +
+                "有没有 `MTS_InstructionNo IS NOT NULL` 的行（看上面 [Pegging][T2-01] 那行的 PI 数）。" +
+                "PI 数=0 ⇒ 订单同步链没把 PI 带进 [Order]（先跑订单装载）；" +
+                "PI 数>0 但连续性仍 0 上下文 ⇒ 该 PV 的 SourceScheduleRunId 指向的 run 没有 MES 快照" +
+                "（工单/工序进度按 ScheduleRunId 过滤，恒 0 行）——这是 run 选错，不是数据缺口。");
         else
             Console.WriteLine("PROBE-结果：已触达续排起点装载，结论取上面的 [红线] 两行。");
     }

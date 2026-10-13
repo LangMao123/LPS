@@ -99,6 +99,38 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         var piInventoryPositions = CalculatePiInventoryPositions(input, issues);
         positions.AddRange(piInventoryPositions);
 
+        // 第四步半：可信首Stage待生产位置兜底（0号位 2026-10-12《业务口径两问统一回复》§4.1）
+        // 「新PI尚无MES工单、且可确认没有更后Stage/在途/XC/开工证据时，其未生产剩余量应归入
+        //   真实首Stage待生产位置，不得因为没有MES工单就视为Stage剩余量为零」；
+        //   真正无法定位（StagePath 也空等）才进 UNLOCATED/Issue。
+        // 门禁：有 IN_PROGRESS 工单时不触发（那走 E 侧诉求2 兜底链，A/B 已有执行连续性归属）。
+        if (stagePositions.Count == 0 && xcPositions.Count == 0
+            && transitPositions.Count == 0 && piInventoryPositions.Count == 0
+            && (input.WorkOrders == null || !input.WorkOrders.Any(wo => wo.WorkOrderStatus == "IN_PROGRESS"))
+            && (input.OperationProgress == null || input.OperationProgress.All(op => op.GoodQty <= 0))
+            && input.ErpRemainingQty > 0)
+        {
+            // 首Stage取数与 GetEarliestStage 同口径：IsStartStage 优先，其次最小 StageSequence
+            var firstStage = input.StagePath?
+                .Where(sp => sp.IsStartStage)
+                .OrderBy(sp => sp.StageSequence)
+                .FirstOrDefault()
+                ?? input.StagePath?.OrderBy(sp => sp.StageSequence).FirstOrDefault();
+
+            if (firstStage != null)
+            {
+                positions.Add(new PositionSlice
+                {
+                    PositionType = PositionType.FIRST_STAGE_PENDING,
+                    StageCode = firstStage.StageCode,
+                    Quantity = input.ErpRemainingQty,
+                    IsStrongEvidence = false,
+                    SourceKey = "FIRST_STAGE_FALLBACK",
+                    IsUnlocated = false
+                });
+            }
+        }
+
         // 第五步：处理强事实
         ApplyStrongFacts(input, positions, issues);
 
@@ -757,11 +789,14 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             }
         }
 
-        // 合并结果：去重后的Stage + 所有XC + 所有Transit
+        // 合并结果：去重后的Stage + 所有XC + 所有Transit + FIRST_STAGE_PENDING 透传
+        // （FIRST_STAGE_PENDING 是"尚未开工"的待生产位置，不参与 XC/Transit 扣减——
+        //   扣减只作用于 STAGE_WAITING；此前被丢弃导致首Stage缺失，0号位 2026-10-12 §4.1 纠正）
         var result = new List<PositionSlice>();
         result.AddRange(deduplicatedStages);
         result.AddRange(xcPositions);
         result.AddRange(transitPositions);
+        result.AddRange(positions.Where(p => p.PositionType == PositionType.FIRST_STAGE_PENDING));
 
         return result;
     }
@@ -1114,10 +1149,30 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         IReadOnlyList<OperationProgressFact> operationProgress,
         string stageCode)
     {
+        var frontier = FindTopologicalFrontierList(routingOps, routingDeps, operationProgress, stageCode);
+
+        if (frontier.Count == 1)
+            return (frontier[0].OpName, 1, false);
+        if (frontier.Count > 1)
+            return (null, frontier.Count, true); // AMBIGUOUS（多前沿，调用方自行决定是否多 Slice）
+        return (null, 0, false); // 前沿未找到或无已开工未完成
+    }
+
+    /// <summary>
+    /// 返回当前 Stage 的拓扑前沿列表（已开工未完成且前驱全部完成的操作节点）。
+    /// 多前沿 = 并行分支（39-0 §五：不得重新线性化），由调用方决定「各开一个 Slice」还是「AMBIGUOUS 降级」。
+    /// 返回元素为 (OpCode=APS Routing.OperationCode, OpName=OperationName)。
+    /// </summary>
+    private static List<(string OpCode, string OpName)> FindTopologicalFrontierList(
+        IReadOnlyList<RoutingOperationFact> routingOps,
+        IReadOnlyList<RoutingDependencyFact> routingDeps,
+        IReadOnlyList<OperationProgressFact> operationProgress,
+        string stageCode)
+    {
         // 1. 过滤到当前 Stage 的路由节点
         var stageOps = routingOps.Where(op => op.StageCode == stageCode).ToList();
         if (stageOps.Count == 0)
-            return (null, 0, false);
+            return new List<(string OpCode, string OpName)>();
 
         // 2. 构建前驱映射（仅 Stage 内边）
         var opCodes = new HashSet<string>(stageOps.Select(op => op.OperationCode), StringComparer.Ordinal);
@@ -1152,7 +1207,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         }
 
         if (remainingCandidates.Count == 0)
-            return (null, 0, false); // 无已开工未完成的工序
+            return new List<(string OpCode, string OpName)>(); // 无已开工未完成的工序
 
         // 4. 拓扑前沿：候选节点的前驱全部完成
         var frontier = new List<(string OpCode, string OpName)>();
@@ -1163,13 +1218,66 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 frontier.Add(candidate);
         }
 
-        if (frontier.Count == 1)
-            return (frontier[0].OpName, 1, false);
+        return frontier;
+    }
 
-        if (frontier.Count > 1)
-            return (null, frontier.Count, true); // AMBIGUOUS
+    /// <summary>
+    /// 形态② 起点推导：后道工序在 MES 快照**无行**（该 Stage 的 MES 行全部完工 / 无行 ⇒ remainingOps.Count==0）时，
+    /// 从 Routing DAG 推「前驱全部完工、自身未完工/无行」的工序。
+    ///
+    /// 背景：此时 DAG 拓扑前沿（只认"已开工"候选）为空、MES 侧也拿不到后道工序名，
+    ///       但 Routing 数据在手，可由 DAG 拓扑推出"下一个该做的工序"。
+    ///
+    /// 规则（与 2号位 约定）：
+    /// - 唯一候选 → 返回 (码, 名)；
+    /// - 多候选（并行分支）→ `Ambiguous=true`，调用方**不得静默取首条**；
+    /// - 零候选（所有工序已完工 = 末工序真空）/ 无路由节点 → (null, null, false)。
+    ///
+    /// ⚠️ 仅应在有 Routing（`input.RoutingDependencies.Count > 0`）时调用；无 Routing 保持原样（不推）。
+    /// </summary>
+    private static (string? OpCode, string? OpName, bool Ambiguous) ResolveNextOperationFromRouting(
+        ProductionInstructionPositionInput input,
+        string? stageCode,
+        IReadOnlyList<OperationProgressFact> stageRows)
+    {
+        if (string.IsNullOrEmpty(stageCode))
+            return (null, null, false);
 
-        return (null, 0, false); // 前沿未找到（前驱条件不满足）
+        var stageOps = input.RoutingOperations.Where(op => op.StageCode == stageCode).ToList();
+        if (stageOps.Count == 0)
+            return (null, null, false);
+
+        var opCodes = new HashSet<string>(stageOps.Select(op => op.OperationCode), StringComparer.Ordinal);
+        var predecessors = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var op in stageOps)
+            predecessors[op.OperationCode] = new List<string>();
+        foreach (var dep in input.RoutingDependencies)
+            if (opCodes.Contains(dep.FromOperationCode) && opCodes.Contains(dep.ToOperationCode))
+                predecessors[dep.ToOperationCode].Add(dep.FromOperationCode);
+
+        // 已完工集：MES 行 RemainingQty<=0 的工序（按 OperationName 匹配路由节点）
+        var completed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var row in stageRows)
+        {
+            var matched = stageOps.FirstOrDefault(r =>
+                string.Equals(r.OperationName, row.OperationName, StringComparison.Ordinal));
+            if (matched == null)
+                continue;
+            if (row.RemainingQty <= 0)
+                completed.Add(matched.OperationCode);
+        }
+
+        // 候选 = 非已完工 且 前驱全部已完工（含 MES 无行、尚未开工的工序）
+        var candidates = stageOps
+            .Where(op => !completed.Contains(op.OperationCode))
+            .Where(op => predecessors[op.OperationCode].All(p => completed.Contains(p)))
+            .ToList();
+
+        if (candidates.Count == 1)
+            return (candidates[0].OperationCode, candidates[0].OperationName, false);
+        if (candidates.Count > 1)
+            return (null, null, true);
+        return (null, null, false); // 零候选：末工序真空
     }
 
     // ========================================================================
@@ -1219,6 +1327,15 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         // 2号位 v2.1 §四：Stage 级 RemainingQty 按工单 PlannedQty 比例拆分的分母
         var totalPlannedQty = inProgressWorkOrders.Sum(w => w.PlannedQty);
 
+        // 诉求2 §四②：ERP 兜底总量 = max(ErpRemainingQty − Σ已定位 Position 量, 0)，不得与已定位重复计
+        decimal locatedQty = finalPositions
+            .Where(p => p.PositionType != PositionType.UNLOCATED)
+            .Sum(p => p.Quantity);
+        decimal erpFallbackTotal = Math.Max(input.ErpRemainingQty - locatedQty, 0m);
+        System.Diagnostics.Debug.Assert(
+            erpFallbackTotal >= 0m && erpFallbackTotal <= input.ErpRemainingQty,
+            $"[EECTX] PI={input.ProductionInstructionNo}: ERP兜底总量{erpFallbackTotal}越界(ErpRemainingQty={input.ErpRemainingQty})");
+
         foreach (var wo in inProgressWorkOrders)
         {
             // 39-0 裁决 §四/§八：退出 OrderBy(OperationSequence)，改用三档降级判定
@@ -1237,129 +1354,125 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 operations.Count(op => op.RemainingQty > 0),
                 input.OperationProgress.Count);
 
-            string? startOperationCode = null;
-            string? lastReportResourceCode = null;
-            decimal derivedRemainingQty = 0;
-
+            // 多 Slice：一个 MES 工单可同时处于多道工序的不同进度（接口 v1.35 §18.3）
+            // 先产 Slice 列表，再回填工单级单值字段作兼容投影（N=1 时镜像唯一 Slice）。
+            var slices = new List<ExistingExecutionSliceDto>();
             bool hasIssue = string.IsNullOrEmpty(startStageCode);
             string? issueDesc = hasIssue ? "无法确定有效执行起点Stage" : null;
 
             if (operations.Count > 0)
             {
-                bool resolved = false;
-
                 // 优先：DAG 拓扑前沿（Routing 数据可用时，39-0 §二/§五）
                 if (input.RoutingDependencies.Count > 0)
                 {
-                    var (dagStartOp, dagFrontierCount, dagAmbiguous) = FindTopologicalFrontier(
+                    var frontier = FindTopologicalFrontierList(
                         input.RoutingOperations, input.RoutingDependencies, operations, startStageCode);
 
-                    if (dagStartOp != null)
+                    if (frontier.Count > 0)
                     {
-                        // DAG 唯一前沿
-                        var frontierOp = operations.FirstOrDefault(op =>
-                            string.Equals(op.OperationName, dagStartOp, StringComparison.Ordinal));
-                        if (frontierOp != null)
+                        foreach (var f in frontier)
                         {
-                            startOperationCode = dagStartOp;
-                            derivedRemainingQty = frontierOp.RemainingQty;
-                            lastReportResourceCode = frontierOp.LastReportResourceCode;
-                            resolved = true;
+                            var progressOp = operations.FirstOrDefault(op =>
+                                string.Equals(op.OperationName, f.OpName, StringComparison.Ordinal));
+                            if (progressOp == null)
+                                continue;
+                            slices.Add(new ExistingExecutionSliceDto
+                            {
+                                StartStageCode = startStageCode,
+                                StartOperationCode = f.OpCode,
+                                StartOperationName = f.OpName,
+                                SliceQty = progressOp.RemainingQty,
+                                LastReportResourceCode = progressOp.LastReportResourceCode
+                            });
                         }
-                    }
-                    else if (dagAmbiguous)
-                    {
-                        // DAG 多前沿（并行分支）→ AMBIGUOUS
-                        startOperationCode = null;
-                        hasIssue = true;
-                        issueDesc = $"NEXT_OPERATION_AMBIGUOUS: DAG拓扑前沿{dagFrontierCount}个并行分支, 无法唯一定位";
-                        var dagRemainingOps = operations.Where(op => op.RemainingQty > 0).ToList();
-                        derivedRemainingQty = dagRemainingOps.Sum(op => op.RemainingQty);
-                        lastReportResourceCode = dagRemainingOps.LastOrDefault()?.LastReportResourceCode;
-                        resolved = true;
-                    }
-                    // else: DAG 无结果（无匹配/前驱条件不满足）→ 降级到中间态
-                }
-
-                // 备用：中间态三档降级（无 Routing 数据或 DAG 无结果时）
-                if (!resolved)
-                {
-                    var remainingOps = operations.Where(op => op.RemainingQty > 0).ToList();
-
-                    if (remainingOps.Count == 0)
-                    {
-                        // 工序层全部完成，但 Stage 层可能仍有剩余（2号位 v2.1 §二证据3：405个工单工序=0而阶段>0）
-                        // 回退取 Stage 级 RemainingQty，按工单 PlannedQty 比例拆分（Stage RemainingQty 是 PI 级，工单 1:N）
-                        startOperationCode = null;
-                        lastReportResourceCode = operations.LastOrDefault()?.LastReportResourceCode;
-
-                        var stageFact = input.StageProgress
-                            .Where(sp => sp.StageCode == startStageCode)
-                            .FirstOrDefault();
-
-                        derivedRemainingQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, inProgressWorkOrders.Count);
-                    }
-                    else if (remainingOps.Count == 1)
-                    {
-                        // 唯一一道有剩余的工序 → 唯一 frontier
-                        var frontier = remainingOps[0];
-                        startOperationCode = frontier.OperationName;
-                        derivedRemainingQty = frontier.RemainingQty;
-                        lastReportResourceCode = frontier.LastReportResourceCode;
                     }
                     else
                     {
-                        // 多道工序有剩余 → 检查已开工未完成的 frontier 候选
-                        var frontierCandidates = remainingOps.Where(op => op.GoodQty > 0).ToList();
-
-                        if (frontierCandidates.Count == 1)
-                        {
-                            // 唯一一个已开工未完成 → 当前执行前沿
-                            var frontier = frontierCandidates[0];
-                            startOperationCode = frontier.OperationName;
-                            derivedRemainingQty = frontier.RemainingQty;
-                            lastReportResourceCode = frontier.LastReportResourceCode;
-                        }
-                        else
-                        {
-                            // 无法唯一定位 → NEXT_OPERATION_AMBIGUOUS
-                            // 39-0 §四.2：StartOperationCode = NULL +降级 Stage/UNLOCATED
-                            startOperationCode = null;
-                            hasIssue = true;
-                            issueDesc = $"NEXT_OPERATION_AMBIGUOUS: {remainingOps.Count}道工序有剩余, {frontierCandidates.Count}道已开工, 无法唯一定位执行前沿";
-                            derivedRemainingQty = remainingOps.Sum(op => op.RemainingQty);
-                            lastReportResourceCode = frontierCandidates.LastOrDefault()?.LastReportResourceCode
-                                ?? operations.LastOrDefault()?.LastReportResourceCode;
-                        }
+                        // DAG 无结果（无匹配/前驱条件不满足）→ 降级到中间态
+                        slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal, ref hasIssue, ref issueDesc);
                     }
+                }
+                else
+                {
+                    // 无 Routing 数据 → 中间态
+                    slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal, ref hasIssue, ref issueDesc);
                 }
             }
             else
             {
-                // 无该工单工序进度数据，保守使用 Stage 级 RemainingQty 兜底
-                // 2号位 v2.1 残留口径修复：同样按工单 PlannedQty 比例拆分，
-                // 防止同 PI 内「全部完成工单（拆分）」+「无工序数据工单（全量）」混现时 ΣE 超 Stage 剩余
+                // 无该工单工序进度数据 → 有 Routing 时从 DAG 推起点（形态②），否则 Stage 级兜底
                 var stageFact = input.StageProgress
                     .Where(sp => sp.StageCode == startStageCode)
                     .FirstOrDefault();
 
-                derivedRemainingQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, inProgressWorkOrders.Count);
+                string? nextOpCode = null, nextOpName = null;
+                if (input.RoutingDependencies.Count > 0)
+                {
+                    var (c, n, _) = ResolveNextOperationFromRouting(input, startStageCode, Array.Empty<OperationProgressFact>());
+                    nextOpCode = c;
+                    nextOpName = n;
+                }
+
+                var stageSliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal);
+                stageSliceQty = Math.Min(stageSliceQty, wo.PlannedQty);
+                stageSliceQty = Math.Max(stageSliceQty, 0);
+                slices.Add(new ExistingExecutionSliceDto
+                {
+                    StartStageCode = startStageCode,
+                    StartOperationCode = nextOpCode,
+                    StartOperationName = nextOpName,
+                    SliceQty = stageSliceQty,
+                    LastReportResourceCode = null,
+                    IssueCode = stageFact == null ? "UNLOCATED_STAGE" : (hasIssue ? "STAGE_ONLY" : null)
+                });
             }
 
-            // 衍生剩余量上限：不能超过工单计划数量
-            derivedRemainingQty = Math.Min(derivedRemainingQty, wo.PlannedQty);
-            derivedRemainingQty = Math.Max(derivedRemainingQty, 0);
+            // 数量上限：各 Slice 不超工单计划数量（Stage 兜底分支已 cap，此处对 DAG/中间态再 cap）
+            for (int i = 0; i < slices.Count; i++)
+            {
+                var s = slices[i];
+                var capped = Math.Min(Math.Max(s.SliceQty, 0), wo.PlannedQty);
+                if (capped != s.SliceQty)
+                    slices[i] = new ExistingExecutionSliceDto
+                    {
+                        StartStageCode = s.StartStageCode,
+                        StartOperationCode = s.StartOperationCode,
+                        StartOperationName = s.StartOperationName,
+                        SliceQty = capped,
+                        LastReportResourceCode = s.LastReportResourceCode,
+                        IssueCode = s.IssueCode
+                    };
+            }
+
+            // 兼容投影：工单级单值字段 = 唯一 Slice 镜像（N=1）；N>1 时为 null + 总量
+            var derivedRemainingQty = slices.Sum(s => s.SliceQty);
+            var startOperationCode = slices.Count == 1 ? slices[0].StartOperationCode : null;
+            var startOperationName = slices.Count == 1 ? slices[0].StartOperationName : null;
+            var lastReportResourceCode = slices.Count == 1 ? slices[0].LastReportResourceCode
+                : slices.LastOrDefault()?.LastReportResourceCode;
+
+            // 工单级 Routing 定位维度（该工单所有 OperationProgress 行共享 RouteCode / 部门）
+            var woProgressRow = input.OperationProgress
+                .FirstOrDefault(op => op.MESWorkOrderNo == wo.MESWorkOrderNo);
+            var productionDepartmentId = woProgressRow?.ProductionDepartmentId;
+            var routeCode = woProgressRow?.RouteCode ?? string.Empty;
 
             contexts.Add(new ExistingExecutionContextDto
             {
                 ProductionInstructionNo = input.ProductionInstructionNo,
+                MaterialCode = wo.MaterialCode,
                 MESWorkOrderNo = wo.MESWorkOrderNo,
                 WorkOrderStatus = wo.WorkOrderStatus,
                 StartStageCode = startStageCode,
                 StartOperationCode = startOperationCode,
+                StartOperationName = startOperationName,
+                ProductionDepartmentId = productionDepartmentId,
+                RouteCode = routeCode,
+                PathId = null,
                 DerivedRemainingQty = derivedRemainingQty,
                 LastReportResourceCode = lastReportResourceCode,
                 DataCutoffTime = wo.DataCutoffTime,
+                Slices = slices,
                 HasIssue = hasIssue,
                 IssueDescription = issueDesc
             });
@@ -1369,14 +1482,148 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     }
 
     /// <summary>
-    /// Stage 级 RemainingQty 按工单 PlannedQty 比例拆分（2号位 v2.1 §四 + 残留口径修复）
+    /// 中间态多 Slice 构建（无 Routing 数据或 DAG 无结果时，39-0 三档降级的多 Slice 版）。
+    ///
+    /// 规则（沿 39-0 §四/§五，退出 OrderBy(OperationSequence)）：
+    /// - 无剩余工序 → Stage 级兜底，产 1 个 Slice（StartOperationCode=null，Stage 比例拆分）
+    /// - 唯一剩工序 → 1 个 Slice（StartOperationCode=该工序名，后续由 2号位 反查号，见 v1.7）
+    /// - 多剩工序但唯一已开工 → 1 个 Slice（该已开工候选）
+    /// - 多剩且多已开工 → 每道已开工未完成各产一个 Slice（并行各带各的剩余），不再静默 AMBIGUOUS 丢量
+    ///   （这正是多 Slice 的真实来源；若仍无法唯一定位则降级为单个 null Slice + Issue）
+    /// </summary>
+    private List<ExistingExecutionSliceDto> BuildIntermediateSlices(
+        IReadOnlyList<OperationProgressFact> operations,
+        string? startStageCode,
+        ProductionInstructionPositionInput input,
+        WorkOrderSnapshotFact wo,
+        decimal totalPlannedQty,
+        int workOrderCount,
+        decimal erpFallbackTotal,
+        ref bool hasIssue,
+        ref string? issueDesc)
+    {
+        var slices = new List<ExistingExecutionSliceDto>();
+        var remainingOps = operations.Where(op => op.RemainingQty > 0).ToList();
+
+        // 诉求1 恢复的范围界定：只有存在 APS Routing 时，工序名才有反查意义（"有 Routing、前沿为空"形态）。
+        // 无 Routing（RoutingDependencies==0）= 无 APS 路由可反查的 StageLeadTimeParam 降级域 ⇒ 不吐名、保持原样。
+        bool emitOperationName = input.RoutingDependencies.Count > 0;
+
+        if (remainingOps.Count == 0)
+        {
+            // 工序层全部完成 / 后道无行，但 Stage 层可能仍有剩余 → Stage 级兜底
+            var stageFact = input.StageProgress
+                .Where(sp => sp.StageCode == startStageCode)
+                .FirstOrDefault();
+
+            // 形态②：有 Routing 时从 DAG 推后道起点（后道在 MES 快照无行，5号位 无 MES 事实可给）
+            string? nextOpCode = null, nextOpName = null, fallbackIssue = null;
+            if (input.RoutingDependencies.Count > 0)
+            {
+                var (c, n, ambiguous) = ResolveNextOperationFromRouting(input, startStageCode, operations);
+                if (ambiguous)
+                {
+                    hasIssue = true;
+                    issueDesc = $"NEXT_OPERATION_AMBIGUOUS: Stage {startStageCode} 路由后继多个并行分支，无法唯一定位";
+                    fallbackIssue = "NEXT_OPERATION_AMBIGUOUS";
+                }
+                else
+                {
+                    nextOpCode = c;
+                    nextOpName = n;
+                }
+            }
+
+            slices.Add(new ExistingExecutionSliceDto
+            {
+                StartStageCode = startStageCode ?? string.Empty,
+                StartOperationCode = nextOpCode,
+                StartOperationName = nextOpName,
+                SliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, workOrderCount, erpFallbackTotal),
+                LastReportResourceCode = operations.LastOrDefault()?.LastReportResourceCode,
+                IssueCode = fallbackIssue ?? (stageFact == null ? "UNLOCATED_STAGE" : null)
+            });
+            return slices;
+        }
+
+        if (remainingOps.Count == 1)
+        {
+            var frontier = remainingOps[0];
+            slices.Add(new ExistingExecutionSliceDto
+            {
+                StartStageCode = startStageCode ?? string.Empty,
+                StartOperationCode = null, // 中间态手上只有 OperationName，无 APS 码；由 2号位 按 RouteCode+名 反查（v1.7）
+                StartOperationName = emitOperationName ? frontier.OperationName : null, // 诉求1：仅"有 Routing、前沿为空"时吐名供反查
+                SliceQty = frontier.RemainingQty,
+                LastReportResourceCode = frontier.LastReportResourceCode
+            });
+            return slices;
+        }
+
+        // 多剩工序：已开工未完成候选
+        var frontierCandidates = remainingOps.Where(op => op.GoodQty > 0).ToList();
+
+        if (frontierCandidates.Count == 1)
+        {
+            var frontier = frontierCandidates[0];
+            slices.Add(new ExistingExecutionSliceDto
+            {
+                StartStageCode = startStageCode ?? string.Empty,
+                StartOperationCode = null, // 同上，中间态无 APS 码
+                StartOperationName = emitOperationName ? frontier.OperationName : null, // 同上，仅"有 Routing"吐名
+                SliceQty = frontier.RemainingQty,
+                LastReportResourceCode = frontier.LastReportResourceCode
+            });
+            return slices;
+        }
+
+        if (frontierCandidates.Count > 1)
+        {
+            // 并行已开工未完成 → 各产一个 Slice（多 Slice 真实来源）
+            foreach (var f in frontierCandidates)
+            {
+                slices.Add(new ExistingExecutionSliceDto
+                {
+                    StartStageCode = startStageCode ?? string.Empty,
+                    StartOperationCode = null, // 中间态无 APS 码
+                    StartOperationName = emitOperationName ? f.OperationName : null, // 各 Slice 各带各的名（仅"有 Routing"）
+                    SliceQty = f.RemainingQty,
+                    LastReportResourceCode = f.LastReportResourceCode
+                });
+            }
+            return slices;
+        }
+
+        // 无法唯一定位 → NEXT_OPERATION_AMBIGUOUS，降级单个 null Slice
+        hasIssue = true;
+        issueDesc = $"NEXT_OPERATION_AMBIGUOUS: {remainingOps.Count}道工序有剩余, {frontierCandidates.Count}道已开工, 无法唯一定位执行前沿";
+        slices.Add(new ExistingExecutionSliceDto
+        {
+            StartStageCode = startStageCode ?? string.Empty,
+            StartOperationCode = null,
+            StartOperationName = null, // 无法唯一定位 → 不传名（避免误导反查）
+            SliceQty = remainingOps.Sum(op => op.RemainingQty),
+            LastReportResourceCode = frontierCandidates.LastOrDefault()?.LastReportResourceCode
+                ?? operations.LastOrDefault()?.LastReportResourceCode,
+            IssueCode = "NEXT_OPERATION_AMBIGUOUS"
+        });
+        return slices;
+    }
+
+    /// <summary>
+    /// Stage 级 RemainingQty 按工单 PlannedQty 比例拆分（2号位 v2.1 §四 + 诉求2 兜底拆分口径）
     ///
     /// StageProgress.RemainingQty 是 PI 级、工单 1:N；逐工单独立输出时必须拆分，
     /// 否则同 PI 内多工单各取全量会导致 ΣE 超 Stage 剩余。
     ///
-    /// 规则：
-    /// - Stage 无剩余（null 或 RemainingQty ≤ 0）→ 0
-    /// - totalPlannedQty > 0 → RemainingQty × wo.PlannedQty / totalPlannedQty（先乘后除避免精度损失）
+    /// 两种「0」不合并（诉求2 §四①）：
+    /// - stageFact == null（无该 PI-Stage 行）= 信息缺口 → 走 ERP 兜底（erpFallbackTotal，已扣已定位量）
+    /// - stageFact != null && RemainingQty <= 0 = 该 Stage 确实做完 → 判 0 正确，不动
+    ///
+    /// 分摊规则（诉求2 §四③/④）：
+    /// - 兜底总量已在调用侧扣减过已定位 Position 量，故此处直接按工单 PlannedQty 比例分摊
+    /// - 向下取整、不放大，保证 ΣE ≤ ErpRemainingQty
+    /// - totalPlannedQty > 0 → qty × wo.PlannedQty / totalPlannedQty（先乘后除避免精度损失）
     /// - totalPlannedQty = 0（异常）→ 均分
     ///
     /// 两处调用（「全部完成」分支 + 「无工序数据」分支）共用同一口径，保证混现时 ΣE 闭合。
@@ -1385,17 +1632,29 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         StageProgressFact? stageFact,
         WorkOrderSnapshotFact wo,
         decimal totalPlannedQty,
-        int workOrderCount)
+        int workOrderCount,
+        decimal erpFallbackTotal)
     {
-        if (stageFact == null || stageFact.RemainingQty <= 0)
+        // 诉求2 §四①：有行且真的做完 → 判 0
+        if (stageFact != null && stageFact.RemainingQty <= 0)
             return 0;
 
-        if (totalPlannedQty > 0)
-            return stageFact.RemainingQty * wo.PlannedQty / totalPlannedQty;
+        // 诉求2 §四①：无行 = 信息缺口 → ERP 兜底（erpFallbackTotal 已在调用侧扣减已定位量，≤ ErpRemainingQty）
+        // 诉求2 §四③：随行有 RemainingQty>0 的工单按 PlannedQty 比例分摊
+        decimal qty = stageFact?.RemainingQty ?? erpFallbackTotal;
+        bool isErpFallback = stageFact == null;
 
-        return workOrderCount > 0
-            ? stageFact.RemainingQty / workOrderCount
-            : 0;
+        if (qty <= 0)
+            return 0;
+
+        decimal allocated;
+        if (totalPlannedQty > 0)
+            allocated = qty * wo.PlannedQty / totalPlannedQty;
+        else
+            allocated = workOrderCount > 0 ? qty / workOrderCount : 0;
+
+        // 诉求2 §四④：向下取整、不放大（仅兜底分支；有真实 Stage 行时保留原始精度防 ΣE 缩水）
+        return isErpFallback ? Math.Floor(allocated) : allocated;
     }
 
     /// <summary>

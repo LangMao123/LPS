@@ -123,7 +123,11 @@ public static class StageTimingNodeBuilder
             var segments = new List<StageTimingSegmentFact>();
             DateTime? requiredStageEnd = null;
 
-            var routelessStages = GetRoutelessStages(demand.MaterialId, effectiveStages, request);
+            // ①「严格改法」（2026-10-12）：传入本需求**末端真实 Task 的选中路径** —— 归一化 OFF 时按
+            //   真实 `RouteCode/PathId` 过滤；两列为空（未排下 / 归一化 ON）⇒ 退回 `DEFAULT` 口径，零行为变化。
+            var routelessStages = GetRoutelessStages(
+                demand.MaterialId, effectiveStages, request,
+                terminal?.RouteCode, terminal?.PathId);
             if (routelessStages.Count > 0 &&
                 chainByMaterial.TryGetValue(demand.MaterialId, out var chain) &&
                 chain.Stages.Count > 0)
@@ -278,23 +282,58 @@ public static class StageTimingNodeBuilder
     /// 用求解范围（Phase1 可达 Stage）而非全量 BOM StagePath ——
     /// 否则会把 StartOperation/StartStage 之前已完成、本次不求解的 Stage 也算进来，凭空多出提前期。
     /// </summary>
-    private static List<string> GetRoutelessStages(
+    // 可见性：`internal`（而非 private）—— 供 `LPS.APS.Tests` 经 `InternalsVisibleTo` **直接覆盖**
+    // 「①严格改法」的三条分支（有选中路径 / 无选中路径退回 DEFAULT / 多路径不得误判）。生产调用点只有 `BuildCore`。
+    internal static List<string> GetRoutelessStages(
         int materialId,
         IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
-        DomainSolveRequest request)
+        DomainSolveRequest request,
+        string? selectedRouteCode = null,
+        long? selectedPathId = null)
     {
         if (!effectiveStages.TryGetValue(materialId, out var inScopeStages) || inScopeStages.Count == 0)
         {
             return new List<string>();
         }
 
+        // ═══ ①「严格改法」（2026-10-12，答 2号位《技术事项汇总回执》§一 / §九#3）═══
+        //   旧实现把 `op.RouteCode != "DEFAULT"` 写死 ⇒ 只在 **归一化 ON**（`NormalizeToSingleRoute`
+        //   把所有 op 改成 `DEFAULT/1`）时成立。一旦 2号位 停归一化、载荷带来真实 `RouteCode/PathId`，
+        //   该条件**恒假** ⇒ `stagesWithRouting` 恒空 ⇒ **范围内所有 Stage 都被当成「无路由」**
+        //   ⇒ **凭空多出提前期**（2号位 在回执 §一 逐字复述了我方 §4 的这条判断，双方一致）。
+        //
+        //   严格口径：**只认该需求「已选中」那条路径上的工序**。
+        //     选中路径来源 = 本需求末端真实 Task 的 `(RouteCode, PathId)`（`FinalTaskDraft` 已有该两列）。
+        //     · 有选中路径 ⇒ 按 `RouteCode`（+ `PathId`，有值时）过滤 —— 多路径下**不会**把
+        //       未选中路径上的 Stage 误判成「有路由」（那会**漏**提前期，方向与旧实现相反）。
+        //     · **无选中路径**（需求整条没排下 / 该两列未填）⇒ 退回 V1 归一化口径（`DEFAULT`），
+        //       与旧行为**逐字等价** ⇒ 归一化 ON 的今天**零行为变化**（无回归）。
+        //   ⇒ 本改动在归一化 ON 时是**严格 no-op**；只有「归一化 OFF + 真实 RouteCode/PathId」才生效。
+        var restrictToSelectedRoute = !string.IsNullOrWhiteSpace(selectedRouteCode);
+
         var stagesWithRouting = new HashSet<string>(StringComparer.Ordinal);
         foreach (var op in request.RoutingOperations)
         {
-            if (op.MaterialId != materialId ||
-                op.RouteCode != "DEFAULT" ||
-                string.IsNullOrEmpty(op.StageCode))
+            if (op.MaterialId != materialId || string.IsNullOrEmpty(op.StageCode))
             {
+                continue;
+            }
+
+            if (restrictToSelectedRoute)
+            {
+                if (!string.Equals(op.RouteCode, selectedRouteCode, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (selectedPathId.HasValue && op.PathId != selectedPathId.Value)
+                {
+                    continue;
+                }
+            }
+            else if (op.RouteCode != "DEFAULT")
+            {
+                // 归一化口径（V1 现状：全部 op 均为 `DEFAULT/1`）
                 continue;
             }
 

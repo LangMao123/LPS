@@ -62,7 +62,7 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
         {
             var cachedSnapshot = JsonSerializer.Deserialize<FrozenStrategySnapshot>(cachedJson, JsonOptions)
                 ?? throw new InvalidOperationException($"策略包版本 {strategyProfileVersionId} 的缓存快照反序列化失败");
-            cachedSnapshot.FrozenAt = DateTime.UtcNow;
+            cachedSnapshot.FrozenAt = DateTime.Now;
             return cachedSnapshot;
         }
 
@@ -97,7 +97,7 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
             StrategyProfileVersionId = strategyProfileVersionId,
             RuleSetVersionId = ruleSetVersion.Id,
             ParameterSetVersionId = parameterSetVersion.Id,
-            FrozenAt = DateTime.UtcNow,
+            FrozenAt = DateTime.Now,
 
             // ① Demand Priority（来自 RuleSetVersion.ContentSnapshotJson.DemandPriority 子块）
             DemandPriority = DeserializeRuleSetBlock(ruleSetVersion, strategyProfileVersionId),

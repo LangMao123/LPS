@@ -11,6 +11,9 @@ using LPS.APS.Engine.Data;
 using LPS.APS.Scheduling.Algorithms;
 using LPS.APS.Shared.Models;
 using Microsoft.Extensions.Logging;
+// ⚠ 用别名而非 `using LPS.APS.Core.Entities.APS;`：该命名空间里有实体 `Task`，
+//   整体引入会与 `System.Threading.Tasks.Task` 二义（CS0104），本文件多处 async 方法签名会炸。
+using ProductionWorkCalendarSlot = LPS.APS.Core.Entities.APS.ProductionWorkCalendarSlot;
 
 namespace LPS.APS.Application.Services;
 
@@ -719,20 +722,22 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// <summary>
     /// 阶段1: 装载排程沙盘（从APS库读取数据组装 SchedulingContext）
     /// 
-    /// 子步骤（2号位端到端通路）：
-    ///   1.1 订单加载          → context.Orders（供2号位Pegging使用）
-    ///   1.2 BOM 加载          → 保留接口（V1 不真装载 BOM，由 5号位 Pegging 真正消费）
-    ///   1.3 物料属性           → 订单加载时 JOIN Material 取得 ProductFamilyId/LLC
-    ///   1.4 资源 + 日历        → context.Resources / context.ResourceCalendars（日历 V1 默认 7x24）
-    ///   1.5 库存装载           → context.InventorySupplies（从 InventoryBalance）
-    ///   1.6 Task 拆批          → 按 RoutingOperation 把每个 Order 拆为 N 个 SchedulingTask
-    ///                           + 批量 INSERT 到 [Task] 表（阶段4 回写需要真实 TaskId）
+    /// 子步骤（2号位端到端通路，**2026-10-13 按代码更正**）：
+    ///   1.1~1.3 订单 / BOM / 物料属性 —— **不在本方法内**：订单集由阶段2 直接 SQL 读取
+    ///                            （`SELECT Id FROM [Order] WHERE PlanVersionId=…`）；
+    ///                            `context.Orders` 全仓无赋值点；BOM 与物料属性由 Pegging 侧装载
+    ///   1.4 资源 + 日历        → context.Resources / context.ResourceCalendars
+    ///                            （⚠ 原注「日历 V1 默认 7x24」**已作废**，且与本文件下方 `:803-806` 自相矛盾：
+    ///                             现只加载 `ResourceCalendarSlot` 真实可用窗口，**无日历行＝该资源不可用**）
+    ///   1.5 库存装载           → context.InventorySupplies（InventoryBalance ＋ SupplyFact_Pipeline 双源）
+    ///   1.6 Task 拆批          → **已废弃、代码显式跳过**（`:759-761`）：不再预拆批，
+    ///                            改由 PeggingOrchestrator 在 1号位 求解后按 `solveResult.FinalTasks` 落库
+    ///                            （⚠ 原注「按 RoutingOperation 拆为 N 个 SchedulingTask ＋ 批量 INSERT 到 [Task] 表」
+    ///                             **与代码不符，已改**）
+    ///   1.7 MES 进度           → context.MESRemainingQty（按 ScheduleRunId 读 StageProgressSnapshot）
     /// 
-    /// V1 保守策略（5号位 Pegging 接入后可替换）：
-    ///   - 无真 Pegging：Order 数量直接分配到 Task（一 Order 一 Task 链）
-    ///   - 无 BOM 下钻：只处理订单物料自身的工艺路线
-    ///   - 无批量切分：整订单数量 × StandardDuration 作为 Task 工时
-    ///   - 资源指派：按 OperationResourceEligibility 取默认资源
+    /// 【历史块已删·2026-10-13】原「V1 保守策略（无真 Pegging／无 BOM 下钻／无批量切分／默认资源指派）」
+    ///   描述的是 Pegging 接入**之前**的过渡态；Pegging 已实装（`PeggingOrchestrator`），该块整体作废。
     /// </summary>
     private async Task<SchedulingContext> LoadSchedulingContextAsync(
         PlanVersionInfoDto planVersion,
@@ -799,9 +804,23 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
     /// <summary>
     /// 1.4 加载资源 + 日历
-    /// V1 日历策略：7x24 连续可用（计划期全覆盖）；待专门的 ResourceCalendar 装载服务落地后替换
+    ///
+    /// ⚠ 旧注释「V1 日历策略：7x24 连续可用（计划期全覆盖）」**已作废**，与下方实现直接矛盾：
+    ///   PM 0923 §九 已取消 730 天 7×24 合成，改为**只加载 `ResourceCalendarSlot` 真实可用窗口、无日历行=该资源不可用**。
+    ///   《APS V1｜2026-10-12 冻结文档修改指导 v1.1》§1.1.6 进一步**取消**「日历缺段一律按 8 小时工作日」的独立兜底：
+    ///   **不强制 8 小时、不猜 08:00—16:00、不按自然日一律 8 小时或 7×24 补产能**。
+    ///   目标形态（§1.1.5／§3.1）＝**三级继承：工厂实际工作日历 → 生产部门日历 → 设备资源／人工能力槽日历**；
+    ///   显式停机/禁用/休息/维修**不得**被上级继承复活；**三级均无可信来源 ⇒ 记录覆盖不足、不产生 Slot**。
+    ///   🔴 **三级继承尚未实现**（当前只读资源级窗口），属《指导v1.1》§3.3 要求 2号位 先行**盘点**的项（§七.5）。
     /// </summary>
-    private async Task LoadResourcesAndCalendarAsync(SchedulingContext context, CancellationToken ct)
+    /// <remarks>
+    /// 2026-10-13：由 `private` 改 **`internal`**，**仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）复用**。
+    ///   动机：`LoadToPosition1AuditTest` 自建 `SchedulingContext` 时只赋了 StrategyProfileVersionId/DataCutoffTime/PlanHorizon*，
+    ///   导致装给 1号位 的 `Resources`/`CalendarSlots` **恒为 0**（而生产非 0）⇒ 探针在资源轴上不具代表性。
+    ///   让探针**调用本方法（生产同一份代码）**而不是自己复刻一份查询，避免又造一个漂移源。
+    ///   **不改任何行为**：签名语义、SQL、日志逐字不变。
+    /// </remarks>
+    internal async Task LoadResourcesAndCalendarAsync(SchedulingContext context, CancellationToken ct)
     {
         var resources = await _connectionManager.QueryAsync<ResourceLoadDto>(
             @"SELECT
@@ -822,15 +841,57 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 AND r.Status = 'AVAILABLE'",
             db: DatabaseId.APS);
 
-        // PM 0923 §九：取消 730 天 7×24 合成；只加载 ResourceCalendarSlot 真实可用窗口，无日历行=该资源不可用。
+        // 1号位 回执 §四 提请：S4 取消 730 天合成后，真实日历覆盖 = 正排物理上限。
+        // 软边界（正排不受 PlanningEnd 约束）要求日历铺到「兜底日期 = PlanHorizonEnd + 180 天」。
+        const int softBoundaryCalendarBufferDays = 180;
+
+        // ── 三级日历·上两级（工厂 / 生产部门）—— 2026-10-13 接入；此前 `ProductionWorkCalendarSlot` 在 .cs 里**零引用** ──
+        // ⚠ 2026-10-13 实测更正：本表**已不是 0 行**。5号位 当日 13:48/13:52/13:58（本地）三批共落 47 行，
+        //   `SourceSystem='TEST'`：工厂 2/3/4/5/6 的「周一至周五 WORK 08:00–17:00 / 周六日 OFF」各 7 行、
+        //   部门 963 同型 7 行，另 5 行是按 `WorkDate` 的节假日/调休 fixture（含 `AllowLowerOverride`／`IsAuthorizedOverride`），
+        //   全部 `EffectiveFrom=2026-10-13`。
+        //   ⇒ `ResourceCalendarResolver` 的**等价快路径（`UpperLevelFactsPresent=false`）自即日起不再命中**，
+        //     三级继承在真实数据上**已生效**：生效日及以后资源日历被上级裁剪为周一至周五，生效日之前不裁剪。
+        //     量级对齐（PV2 探针 `CalendarSlots`=4,423,641）：按「生效日前全留 + 生效日起只留周一至周五」建模 = 4,422,856，
+        //     差 785 与上述 5 行按日 fixture（补一个周六、一个周日）同量级 ⇒ 数字可解释，非装载异常。
+        //   ⚠ 本表**直接喂给 1号位 的载荷**（`ResourceCalendars` → `CalendarSlots`），增删行会改变排程输入。
+        //     表主 = 5号位；我方只加载、不治理。
+        //   ⚠ 另注：该批行 `CreatedAt/UpdatedAt` 为 **UTC**（05:48/05:52/05:58，较本地早 8 小时），
+        //     与 APS「时间戳一律本地、禁 UTC」的约定不一致 —— 属 5号位 铺数侧口径，仅记录。
+        var upperCalendarRows = await _connectionManager.QueryAsync<ProductionWorkCalendarSlot>(
+            @"SELECT Id, ScopeType, FactoryId, ProductionDepartmentId, WorkDate, WeekdayIso,
+                     StartAt, EndAt, WorkState, AllowLowerOverride, IsAuthorizedOverride,
+                     SourceSystem, SourceReference, EffectiveFrom, EffectiveTo, IsActive
+                FROM ProductionWorkCalendarSlot
+               WHERE IsActive = 1",
+            db: DatabaseId.APS);
+
+        // PM 0923 §九：取消 730 天 7×24 合成；只加载真实窗口，无日历行=该资源不可用。
+        // ⚠ 2026-10-13 改：**不再只取 `AvailableFlag=1`**。`AvailableFlag=0` 是「资源级显式 OFF（停机/维修）」，
+        //   属 RC-006「资源自身明确 OFF 为硬排除」，必须交给解析器作**例外裁剪**，不能在这里静默丢掉。
+        //   （实测全表 `AvailableFlag=0` 为 0 行 ⇒ 本改动当前不改变任何结果，只把语义摆正。）
         var calendarRows = await _connectionManager.QueryAsync<ResourceCalendarSlotLoadDto>(
             @"SELECT ResourceId, StartTime, EndTime, AvailableFlag
-                FROM ResourceCalendarSlot
-               WHERE AvailableFlag = 1",
+                FROM ResourceCalendarSlot",
             db: DatabaseId.APS);
-        var realCalendars = calendarRows
+        var ownCalendars = calendarRows
             .GroupBy(c => c.ResourceId)
-            .ToDictionary(g => g.Key, g => g.Select(c => new TimeWindow(c.StartTime, c.EndTime)).ToList());
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(c => new ResourceCalendarResolver.LevelWindow
+                {
+                    Start = c.StartTime,
+                    End = c.EndTime,
+                    IsAvailable = c.AvailableFlag
+                }).ToList());
+
+        // 部门 → 工厂：人工能力槽主档只有 ProductionDepartmentId，要解析工厂级日历必须再上溯一层。
+        var departmentFactoryMap = (await _connectionManager.QueryAsync<DepartmentFactoryLoadDto>(
+            @"SELECT Id, FactoryId FROM ProductionDepartment",
+            db: DatabaseId.APS))
+            .ToDictionary(x => x.Id, x => x.FactoryId);
+
+        var calendarInputs = new List<ResourceCalendarResolver.ResourceCalendarInput>();
 
         foreach (var r in resources)
         {
@@ -850,11 +911,16 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             });
 
             // PM 0923 §九：无有效日历=不可用（设备+人工统一）；铺天数=5号位，2号位 只加载不合成。
-            // 有 ResourceCalendarSlot 真实可用窗口才写入；无日历行则该资源不产出日历（=不可用）。
-            if (realCalendars.TryGetValue(r.ResourceId, out var windows) && windows.Count > 0)
+            // 2026-10-13：本级窗口（含 OFF）交给三级解析器统一合成，不再在此直接写 ResourceCalendars。
+            calendarInputs.Add(new ResourceCalendarResolver.ResourceCalendarInput
             {
-                context.ResourceCalendars[resIdStr] = windows;
-            }
+                Key = resIdStr,
+                FactoryId = r.FactoryId,
+                DepartmentId = r.ProductionDepartmentId,
+                OwnWindows = ownCalendars.TryGetValue(r.ResourceId, out var windows)
+                    ? windows
+                    : Array.Empty<ResourceCalendarResolver.LevelWindow>()
+            });
         }
 
         // ── 人工能力槽装载 + 运行时投影（PM 0923 资源模型裁决）──
@@ -867,14 +933,21 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                WHERE IsActive = 1",
             db: DatabaseId.APS);
 
+        // 同上：人工槽 `AvailableFlag=0` 同样是「本级显式 OFF」，交给解析器裁剪，不在此丢弃。
         var manualSlotCalendarRows = await _connectionManager.QueryAsync<ManualCapacitySlotCalendarLoadDto>(
             @"SELECT ManualSlotId, StartTime, EndTime, AvailableFlag
-                FROM ManualCapacitySlotCalendar
-               WHERE AvailableFlag = 1",
+                FROM ManualCapacitySlotCalendar",
             db: DatabaseId.APS);
         var manualCalendars = manualSlotCalendarRows
             .GroupBy(c => c.ManualSlotId)
-            .ToDictionary(g => g.Key, g => g.Select(c => new TimeWindow(c.StartTime, c.EndTime)).ToList());
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(c => new ResourceCalendarResolver.LevelWindow
+                {
+                    Start = c.StartTime,
+                    End = c.EndTime,
+                    IsAvailable = c.AvailableFlag
+                }).ToList());
 
         foreach (var slot in manualSlots)
         {
@@ -893,17 +966,71 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             });
 
             // 无 ManualCapacitySlotCalendar 行 = 不可用（与设备同口径，PM §九）。
-            if (manualCalendars.TryGetValue(slot.ManualSlotId, out var windows) && windows.Count > 0)
+            // 2026-10-13：同上，改交三级解析器；人工槽的工厂由「部门→工厂」上溯得到。
+            calendarInputs.Add(new ResourceCalendarResolver.ResourceCalendarInput
             {
-                context.ResourceCalendars[syntheticIdStr] = windows;
-            }
+                Key = syntheticIdStr,
+                FactoryId = departmentFactoryMap.TryGetValue(slot.ProductionDepartmentId, out var deptFactoryId)
+                    ? deptFactoryId
+                    : (int?)null,
+                DepartmentId = slot.ProductionDepartmentId,
+                OwnWindows = manualCalendars.TryGetValue(slot.ManualSlotId, out var windows)
+                    ? windows
+                    : Array.Empty<ResourceCalendarResolver.LevelWindow>()
+            });
         }
+
+        // ── 三级继承合成（工厂 → 生产部门 → 设备/人工槽）：逐片「交集 / 例外裁剪」，绝不时段相加 ──
+        // 口径：规则清单 v1.7 RC-001/RC-002/RC-006/RC-007；日历专项 v1.4 §2/§4/§5；06 接口 §18。
+        var calendarResolution = ResourceCalendarResolver.Resolve(
+            upperCalendarRows.ToList(),
+            calendarInputs,
+            context.PlanHorizonStart,
+            context.PlanHorizonEnd.AddDays(softBoundaryCalendarBufferDays));
+
+        foreach (var (resourceKey, windows) in calendarResolution.Calendars)
+            context.ResourceCalendars[resourceKey] = windows.Select(w => new TimeWindow(w.Start, w.End)).ToList();
+
+        if (!calendarResolution.UpperLevelFactsPresent)
+        {
+            _logger.LogInformation(
+                "[ResourceCalendar] 上级日历（ProductionWorkCalendarSlot）无事实行 ⇒ 按资源级口径解析（等价于两级全 MISSING 的三级结果）。"
+                + "日历资源数={WithCalendar}，无窗口={Without}。工厂/部门 OFF 与继承将在 5号位 铺数后自动生效。",
+                calendarResolution.Calendars.Count, calendarResolution.ResourcesWithoutAnyWindow);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "[ResourceCalendar] 三级继承已生效：日历资源数={WithCalendar}（其中继承上级={Inherited}），无窗口={Without}；"
+                + "窗口来源片数 工厂={FromFactory}／部门={FromDept}／资源={FromResource}。",
+                calendarResolution.Calendars.Count, calendarResolution.ResourcesWithInheritedWindow,
+                calendarResolution.ResourcesWithoutAnyWindow,
+                calendarResolution.WindowCountFromFactory, calendarResolution.WindowCountFromDepartment,
+                calendarResolution.WindowCountFromResource);
+        }
+
+        if (calendarResolution.ConflictDayCount > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] 同层日历矛盾被整日拒绝 {Days} 个（资源×日）：WORK↔WORK 或 OFF↔OFF 部分重叠。"
+                + "按 RC-006 拒绝形成无证据窗口，不猜；请 3号位 治理侧核对发布校验。",
+                calendarResolution.ConflictDayCount);
+
+        if (calendarResolution.ResourcesWithUnreliableOwnership > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] {Count} 个资源的工厂/部门归属不可靠（缺 FactoryId 或 ProductionDepartmentId），"
+                + "其上级日历无法解析 —— 按专项 v1.4 §1「归属不可靠时拒绝形成无证据的合法窗口」只按本级口径处理，并留此诊断。",
+                calendarResolution.ResourcesWithUnreliableOwnership);
+
+        if (calendarResolution.ResourcesWithoutAnyWindow > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] {Count} 个资源三级均无合法可排窗口 ⇒ 不产生 Slot（RC-007：绝不补 8h / 7×24）。",
+                calendarResolution.ResourcesWithoutAnyWindow);
 
         // 1号位 回执 §四 提请：S4 取消 730 天合成后，真实日历覆盖 = 正排物理上限。
         // 软边界（正排不受 PlanningEnd 约束）要求日历铺到「兜底日期 = PlanHorizonEnd + 180 天」；
         // 覆盖不足则正排末端找不到槽 → 静默落 Unscheduled。此处只打诊断日志（非硬报错），
         // 铺天数属 5号位 数据维护（PM 0923 §九/§十），2号位 只加载 + 出证据。
-        const int softBoundaryCalendarBufferDays = 180;
+        // （常量 `softBoundaryCalendarBufferDays` 已上移到三级日历装载段，此处复用。）
         var horizonFloor = context.PlanHorizonEnd.AddDays(softBoundaryCalendarBufferDays);
         var allCalendarWindows = context.ResourceCalendars.Values.SelectMany(w => w).ToList();
         if (allCalendarWindows.Count == 0)
@@ -987,15 +1114,21 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // v5.1.2 架构变更说明：
-    // GenerateAndPersistTasksAsync 和 BulkInsertTasksAsync 方法已废弃
+    // v5.1.2 架构变更说明（**2026-10-13 按代码更正**）：
+    // `GenerateAndPersistTasksAsync` / `BulkInsertTasksAsync` **两个方法已从本文件删除**
+    //   （不是「保留待废弃」——全仓已无这两个标识符，仅本注释曾提及）。
     //
-    // 原因：Task 表的 INSERT 职责已转移至 PeggingOrchestrator（2号位）
-    //       - PeggingOrchestrator 在供需匹配阶段生成 TaskDraft 并落库
-    //       - SchedulingOrchestrator 只负责 UPDATE Task 表（填充时间/资源分配结果）
-    //       - 这样避免了重复落库，保证了 Task 与 PeggingSupplyAllocation 的事务一致性
+    // 原因：Task 表的写入职责已整体转移至 PeggingOrchestrator（2号位）
+    //       - PeggingOrchestrator 在 1号位 求解**之后**、按 `solveResult.FinalTasks` 落库；
+    //         Task 的时间 / 资源 / 数量随 INSERT **一次写入**（`PeggingOrchestrator.cs:677-683`）
+    //       - ⚠ 本文件对 `[Task]` **只有跑前幂等清理 DELETE（`:505-511`），没有任何 INSERT / UPDATE**。
+    //         原注「SchedulingOrchestrator 只负责 UPDATE Task 表（填充时间/资源分配结果）」
+    //         **与代码不符（全文件无 `UPDATE [Task]`），已删**。
+    //       - 这样避免了重复落库，保证 Task 与 PeggingSupplyAllocation 的事务一致性
     //
-    // 详见：PeggingOrchestrator.PersistDomainAndPeggingInTransactionAsync (line 238-280)
+    // 详见：`PeggingOrchestrator.PersistDomainAndPeggingInTransactionAsync`
+    //       （`LPS.APS.Application/Services/PeggingOrchestrator.cs:541`；
+    //         ⚠ 原注「line 238-280」为行号漂移，已改）
     // ═══════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1366,6 +1499,13 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         public DateTime StartTime { get; set; }
         public DateTime EndTime { get; set; }
         public bool AvailableFlag { get; set; }
+    }
+
+    /// <summary>部门 → 工厂 上溯（人工能力槽只有 ProductionDepartmentId，解析工厂级日历需再上一层）。</summary>
+    private class DepartmentFactoryLoadDto
+    {
+        public int Id { get; set; }
+        public int FactoryId { get; set; }
     }
 
     private class ManualCapacitySlotLoadDto

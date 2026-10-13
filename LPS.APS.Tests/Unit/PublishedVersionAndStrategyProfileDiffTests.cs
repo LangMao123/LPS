@@ -47,8 +47,8 @@ public class PublishedVersionAndStrategyProfileDiffTests
             {
                 Id = 1, RuleSetId = 10, VersionCode = "V1",
                 Status = GovernanceVersionStatus.Published,
-                EffectiveFrom = DateTime.UtcNow.AddDays(-1),
-                EffectiveTo = DateTime.UtcNow.AddDays(1),
+                EffectiveFrom = DateTime.Now.AddDays(-1),
+                EffectiveTo = DateTime.Now.AddDays(1),
                 ContentSnapshotJson = SnapshotWithDemandPriority()
             }
         };
@@ -110,14 +110,14 @@ public class PublishedVersionAndStrategyProfileDiffTests
             {
                 Id = 1, RuleSetId = 10, VersionCode = "V1",
                 Status = GovernanceVersionStatus.Published,
-                EffectiveTo = DateTime.UtcNow.AddDays(-1)     // 已过期
+                EffectiveTo = DateTime.Now.AddDays(-1)     // 已过期
             },
             new()
             {
                 Id = 2, RuleSetId = 10, VersionCode = "V2",
                 Status = GovernanceVersionStatus.Published,
-                EffectiveFrom = DateTime.UtcNow.AddDays(-1),
-                EffectiveTo = DateTime.UtcNow.AddDays(1)
+                EffectiveFrom = DateTime.Now.AddDays(-1),
+                EffectiveTo = DateTime.Now.AddDays(1)
             }
         };
         _ruleSetRepo.Setup(r => r.GetByRuleSetIdAsync(10, It.IsAny<CancellationToken>())).ReturnsAsync(versions);

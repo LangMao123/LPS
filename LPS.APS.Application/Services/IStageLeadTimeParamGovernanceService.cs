@@ -9,11 +9,14 @@ namespace LPS.APS.Application.Services;
 /// </summary>
 public interface IStageLeadTimeParamGovernanceService
 {
-    /// <summary>列出阶段提前期参数（可按工厂/阶段/生产部门/启用态过滤）。</summary>
+    /// <summary>列出阶段提前期参数（可按工厂/阶段/生产部门/启用态过滤）。
+    /// P0-03（0号位 审核 2026-10-09）：以受信主体 Business Scope 约束——非 Global 按 Factory/Department 授权集合过滤；
+    /// 无授权 → fail-closed 空列表。</summary>
     /// <param name="factoryCode">工厂编码（可选精确匹配）</param>
     /// <param name="stageCode">大工艺阶段码（可选精确匹配）</param>
     /// <param name="productionDeptCode">生产部门编码（可选精确匹配）</param>
     /// <param name="isActive">启用态过滤（null = 全部）</param>
+    /// <param name="actorUserId">登录用户 Id（受信主体，Scope 约束来源）</param>
     /// <param name="ct">取消令牌</param>
     /// <returns>参数列表（按 FactoryCode, StageCode, Priority, Id 排序）</returns>
     Task<IReadOnlyList<StageLeadTimeParamDto>> ListAsync(
@@ -21,6 +24,7 @@ public interface IStageLeadTimeParamGovernanceService
         string? stageCode,
         string? productionDeptCode,
         bool? isActive,
+        int actorUserId,
         CancellationToken ct = default);
 
     /// <summary>新增阶段提前期参数（治理侧直维护 + 审计）。业务键冲突 / 数值红线 → 数据红线异常。</summary>

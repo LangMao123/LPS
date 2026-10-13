@@ -271,7 +271,7 @@ public class FrozenStrategySnapshotProviderTests
         snapshot.StrategyProfileVersionId.Should().Be(strategyProfileVersionId);
         snapshot.RuleSetVersionId.Should().Be(ruleSetVersionId);
         snapshot.ParameterSetVersionId.Should().Be(parameterSetVersionId);
-        snapshot.FrozenAt.Should().BeCloseTo(DateTime.UtcNow, TimeSpan.FromSeconds(5));
+        snapshot.FrozenAt.Should().BeCloseTo(DateTime.Now, TimeSpan.FromSeconds(5));
 
         // 验证六块装配
         snapshot.DemandPriority.Should().NotBeNull();
@@ -796,7 +796,7 @@ public class FrozenStrategySnapshotProviderTests
                 ["CandidateGuardrail"] = new CandidateGuardrailBlock()
             }),
             Status = "PUBLISHED",
-            EffectiveTo = DateTime.UtcNow.AddHours(-1)   // 已失效（历史重放不应阻断）
+            EffectiveTo = DateTime.Now.AddHours(-1)   // 已失效（历史重放不应阻断）
         };
 
         _mockStrategyProfileRepo.Setup(r => r.GetByIdAsync(strategyProfileVersionId, It.IsAny<CancellationToken>())).ReturnsAsync(strategyProfileVersion);

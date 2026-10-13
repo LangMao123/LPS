@@ -73,7 +73,10 @@ internal class PhaseFiveCompression
             return new DomainSolveResult
             {
                 Success = false,
-                ErrorMessage = $"Phase5硬约束校验失败: {validationResult.ErrorMessage}",
+                // §2.3（2026-10-12，2号位《技术事项汇总回执》§五 / §九#2）：加**可解析前缀** `[Phase5]`，
+                //   并把 Batch Policy 硬失败明细一并并入（2号位 已确认接受语义变更、请求稳定前缀以便日后拆列）。
+                ErrorMessage = ComposeErrorMessage(
+                    $"[Phase5] 硬约束校验失败: {validationResult.ErrorMessage}", null, scheduleResult),
                 IsRoughCut = false,
                 FinalTasks = Array.Empty<FinalTaskDraft>(),
                 AllocationShares = Array.Empty<AllocationTaskShare>(),
@@ -170,6 +173,18 @@ internal class PhaseFiveCompression
         bool technicalFailure = scheduleResult.TechnicalFailure;
         string? errorMessage = technicalFailure ? scheduleResult.TechnicalFailureReason : null;
 
+        // ── §2.3（2026-10-12，2号位《技术事项汇总回执》§五 / §九#2）：批策略硬失败明细并入 `ErrorMessage` ──
+        //   2号位 已确认接受「`ErrorMessage` 语义由『Phase5 硬约束校验失败』扩为『多类原因公共兜底』」，
+        //   并要求**可解析前缀**（`[Phase5] … | [Technical] … | [BatchPolicy] …`）以便日后按类拆列。
+        //   ⚠ 本段**不改出口 ReasonCode 值域**（冻结 15 码）：被 PI 合法量门禁拦下的需求，出口仍报
+        //     `BATCH_POLICY_CONFLICT` / `BATCH_POLICY_MISSING`；本段只补**人可读明细**，使
+        //     `PI_LEGAL_QTY_CONTRACT_PENDING` 这类真实原因**不再只留在零读者的 `BatchPolicyConflicts` 里**。
+        //   ⚠ 本段在 `Success=true`（业务未排下）时**也可能非空** —— 这是 2号位 明确接受的口径变更。
+        var composedErrorMessage = ComposeErrorMessage(
+            null,
+            errorMessage is null ? null : $"[Technical] {errorMessage}",
+            scheduleResult);
+
         // P1-03修复：Phase4 可能改变 Resource/Start/End，Phase3 的旧诊断结果已过时。
         // 在最终任务集合上重跑 Phase3 诊断，保证 ExplanationFacts 与最终修复结果一致。
         var finalDiagnostics = new PhaseThreeDiagnostics().Diagnose(
@@ -180,7 +195,7 @@ internal class PhaseFiveCompression
         return new DomainSolveResult
         {
             Success = !technicalFailure,
-            ErrorMessage = errorMessage,
+            ErrorMessage = composedErrorMessage,
             IsRoughCut = false,
             FinalTasks = allScheduledTasks,
             AllocationShares = allocationShares,
@@ -203,6 +218,131 @@ internal class PhaseFiveCompression
                 UsedRoughCut = false
             }
         };
+    }
+
+    /// <summary>
+    /// §2.3（2026-10-12，2号位《技术事项汇总回执》§五 / §九#2）：把「Phase5 硬约束失败」/「技术失败」与
+    /// 「Batch Policy 硬失败明细」拼成**带可解析前缀**的单串，交 `DomainSolveResult.ErrorMessage` 承载。
+    ///
+    /// 格式：`[Phase5] … | [Technical] … | [BatchPolicy] …`（按此顺序；缺项不出现；全空 ⇒ `null`）。
+    ///   · **前缀稳定**是 2号位 的明确请求（其 §2.2：「我方建列时按你们 §2.3 的前缀拆列，请你们保持前缀稳定」）。
+    ///   · `[BatchPolicy]` 段**有界**：只给「总数 + 分类计数 + 前 N 条示例（截断）」，**不把成千上万条明细
+    ///     灌进单列** —— 2号位 全量 PV2 实测：21,787 条 C 桶需求中 **21,772 条**会被 PI 合法量门禁拦下
+    ///     ⇒ 无界拼接会写出**兆字节级**字符串（该列日后要进 DDL 列，必须有界）。
+    ///   · 明细正文取自分列表 <see cref="InitialScheduleResult.BatchPolicyConflicts"/> /
+    ///     <see cref="InitialScheduleResult.BatchPolicyMissingDemandKeys"/> /
+    ///     <see cref="InitialScheduleResult.BatchPolicyUnavailableDemandKeys"/>（元素前缀 = `[{LogicalDemandKey}] `）。
+    /// </summary>
+    internal static string? ComposeErrorMessage(
+        string? phase5Segment,
+        string? technicalSegment,
+        InitialScheduleResult scheduleResult)
+    {
+        var segments = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(phase5Segment))
+        {
+            segments.Add(phase5Segment!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(technicalSegment))
+        {
+            segments.Add(technicalSegment!);
+        }
+
+        var hardFailures = scheduleResult.BatchPolicyHardFailures;
+        if (hardFailures.Count > 0)
+        {
+            var missing = 0;
+            var conflict = 0;
+            var unavailable = 0;
+            foreach (var reason in hardFailures.Values)
+            {
+                if (string.Equals(reason, "BATCH_POLICY_MISSING", StringComparison.Ordinal))
+                {
+                    missing++;
+                }
+                else if (string.Equals(reason, "BATCH_POLICY_STATE_UNAVAILABLE", StringComparison.Ordinal))
+                {
+                    // 2026-10-13：状态不可获得（输入契约缺陷）单独计数 —— 不并入 `conflict`，
+                    //   否则「输入契约缺陷」会被读成「业务冲突」（0号位 §3.3 要求两类分列）。
+                    unavailable++;
+                }
+                else
+                {
+                    conflict++;
+                }
+            }
+
+            const int sampleLimit = 3;
+            const int sampleMaxChars = 200;
+            var samples = new List<string>();
+            foreach (var demandKey in hardFailures.Keys)
+            {
+                if (samples.Count >= sampleLimit)
+                {
+                    break;
+                }
+
+                var detail = FindBatchPolicyDetail(scheduleResult, demandKey);
+                if (detail is null)
+                {
+                    continue;
+                }
+
+                samples.Add(detail.Length > sampleMaxChars
+                    ? detail.Substring(0, sampleMaxChars) + "…"
+                    : detail);
+            }
+
+            var text = $"[BatchPolicy] 硬失败需求 {hardFailures.Count} 条"
+                     + $"（BATCH_POLICY_MISSING {missing} / BATCH_POLICY_CONFLICT {conflict}"
+                     + $" / BATCH_POLICY_STATE_UNAVAILABLE {unavailable}）";
+            if (samples.Count > 0)
+            {
+                text += "；示例：" + string.Join(" ; ", samples);
+            }
+
+            segments.Add(text);
+        }
+
+        return segments.Count == 0 ? null : string.Join(" | ", segments);
+    }
+
+    /// <summary>
+    /// 按需求键在 Batch Policy 分列表里取回**人可读明细**（元素形如 `[{LogicalDemandKey}] {ConflictReason}`）。
+    /// 找不到 ⇒ `null`（不伪造）。
+    /// </summary>
+    internal static string? FindBatchPolicyDetail(InitialScheduleResult scheduleResult, string logicalDemandKey)
+    {
+        var prefix = $"[{logicalDemandKey}] ";
+
+        foreach (var entry in scheduleResult.BatchPolicyConflicts)
+        {
+            if (entry.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return entry;
+            }
+        }
+
+        foreach (var entry in scheduleResult.BatchPolicyMissingDemandKeys)
+        {
+            if (entry.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return entry;
+            }
+        }
+
+        // 2026-10-13：第三类 —— 状态不可获得（输入契约缺陷）。
+        foreach (var entry in scheduleResult.BatchPolicyUnavailableDemandKeys)
+        {
+            if (entry.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return entry;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -353,6 +493,54 @@ internal class PhaseFiveCompression
     }
 
     /// <summary>
+    /// P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：本需求是否**按 FORWARD 处理**。
+    ///
+    /// 判据 = Phase2 登记于 <see cref="ConstraintContext.ResolvedDirections"/> 的**本需求自决方向**，
+    ///   **不是** Run 级原始策略值 —— 整改前 Phase5 直接比较 `SchedulingDirection == "FORWARD"`，
+    ///   Run 级为 `AUTO` 时恒为 false ⇒ 即使本需求自决为 FORWARD 也永不进入压实 / 序列优化。
+    ///
+    /// 零回归：Run 级 `FORWARD`/`BACKWARD` ⇒ Phase2 登记的即原值 ⇒ 本判据与整改前**逐字等价**。
+    /// 未登记（旁路 / 早期 `continue` 的需求）⇒ 回落 Run 级原值（保守，与整改前一致）。
+    /// </summary>
+    private static bool IsForwardDemand(string demandKey, DomainSolveRequest request, ConstraintContext constraints)
+    {
+        if (constraints.ResolvedDirections.TryGetValue(demandKey, out var resolved))
+        {
+            return string.Equals(resolved, "FORWARD", StringComparison.Ordinal);
+        }
+
+        return string.Equals(
+            request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// NEW-P1-01（0号位 2026-10-09《APS_V1_3_20261009.md》§三 / §六.2）：本 **Task** 是否**按 FORWARD 处理**。
+    ///
+    /// 复审判词：「`RunBatchPlan` 循环结束仅返回**一个** `Direction`（= 最后一个落定Batch的方向），
+    ///   不能代表前面的Batch」；「Phase5 `IsForwardDemand()` 仅按**需求Key**读取方向」⇒ 同一需求多批不同方向时
+    ///   Phase5 会用**错批的方向**决定**所有** Task 的可移动性（应保护的 JIT 片段可能被前推 / Setup 重排）。
+    ///
+    /// 消费身份**优先 `ExecutionBatchDraftKey`**（冻结模型：**每个执行批独立**做 Direction + Routing +
+    ///   Resource + Calendar + Setup 联合求解 ⇒ 方向是**批级**属性）；消费顺序：
+    ///     ① <c>task.ExecutionBatchDraftKey</c> 命中 <see cref="ConstraintContext.ResolvedBatchDirections"/> ⇒ 用该值；
+    ///     ② 回落到需求级 <see cref="ConstraintContext.ResolvedDirections"/>（= 既有 <see cref="IsForwardDemand"/> 口径）；
+    ///     ③ 再回落 Run 级原始策略值。
+    ///
+    /// 零回归：单批需求 ⇒ 批键方向 == 需求级方向 ⇒ 与整改前**逐字等价**；
+    ///   `ExecutionBatchDraftKey == null`（V1 常态旁路 / 未归批 Task）⇒ 直接走 ②③，与整改前完全一致。
+    /// </summary>
+    private static bool IsForwardTask(FinalTaskDraft task, DomainSolveRequest request, ConstraintContext constraints)
+    {
+        if (!string.IsNullOrEmpty(task.ExecutionBatchDraftKey)
+            && constraints.ResolvedBatchDirections.TryGetValue(task.ExecutionBatchDraftKey!, out var batchDirection))
+        {
+            return string.Equals(batchDirection, "FORWARD", StringComparison.Ordinal);
+        }
+
+        return IsForwardDemand(task.SourceDraftId, request, constraints);
+    }
+
+    /// <summary>
     /// P1-05：Gap Compaction —— 保序前向压实（V1 最小实现，Level 3 次级优化）。
     /// 仅 FORWARD 方向执行；把 Task 拉进更早的日历可用空档，全程满足：
     /// - Level 0 硬约束：Calendar/占用含 Setup（复用 Phase4.FindForwardSlot 唯一实现）/不换资源（Eligibility 不变）/
@@ -369,15 +557,40 @@ internal class PhaseFiveCompression
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
-        // 避免过早生产：BACKWARD/MIXED 的 JIT 倒排锚点不前拉（V1 最小口径，只做 FORWARD 压实）
-        if (!string.Equals(request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal))
+        // 避免过早生产：BACKWARD/MIXED 的 JIT 倒排锚点不前拉（V1 最小口径，只做 FORWARD 压实）。
+        // P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：判据由 **Run 级原始策略值**
+        //   改为 **本需求自决方向**（Phase2 登记于 `constraints.ResolvedDirections`）。
+        //   Run 级 FORWARD/BACKWARD ⇒ 全量同向 ⇒ 与整改前逐字一致；Run 级 AUTO ⇒ 逐需求判定 ——
+        //   自决为 FORWARD 的需求参与压实，自决为 BACKWARD/MIXED 的（JIT 倒排锚点）仍整体跳过、绝不前拉。
+        // NEW-P1-01（0号位 2026-10-09《APS_V1_3_20261009.md》§六.2）：门控**必须批级可见** ——
+        //   同一需求多执行批可有不同方向；若只按**需求级**单值判，则「最后落定批为 BACKWARD」会把
+        //   该需求**全部** Task（含 FORWARD 批）挡在压实之外 ⇒ 与「优化FORWARD批」要求不符。
+        //   故本门控 = 需求级原有条件 **或** 任一 Task 按批级判定为 FORWARD（**并集**）：
+        //   需求级为真时必然放行（对既有单批/无批键输入 ⇒ 与整改前逐字一致，零回归）。
+        if (!request.LogicalProductionDemands.Any(d => IsForwardDemand(d.LogicalDemandKey, request, constraints))
+            && !tasks.Any(t => IsForwardTask(t, request, constraints)))
         {
             return;
         }
+        SolverDiagnostics.CountPhase5CompactionRun();
 
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
         var immovable = PhaseFourLocalRepair.IdentifyImmovableTasks(request, tasks);
         var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
+
+        // P1 整改：非 FORWARD 需求（BACKWARD/MIXED 的 JIT 倒排锚点）**整体按不可移动处理** ⇒
+        //   只作同资源序界，绝不前拉（避免过早生产）。这正是既有注释「BACKWARD/MIXED 锚点整体跳过」的
+        //   落实处：整改前靠「整 Run 门控」达成，整改后靠「逐需求门控」达成
+        //   ⇒ AUTO 下自决为 FORWARD 的需求得以压实，而非 FORWARD 需求仍被完整保护。
+        foreach (var t in tasks)
+        {
+            // NEW-P1-01：**逐 Task** 按批级方向判定（`ExecutionBatchDraftKey` → 需求级 → Run 级）。
+            //   ⇒ 同一需求下 BACKWARD 批的 JIT 锚点被完整保护，FORWARD 批仍可参与优化。
+            if (!IsForwardTask(t, request, constraints))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
 
         // P1-02 性能加固：三重索引消除每 Task 全表扫描（O(n²)→O(n·k)），10万 Task 标定前置。
         var index = TaskIndex.Build(tasks, demandByKey);
@@ -610,9 +823,16 @@ internal class PhaseFiveCompression
     {
         // §17：白天 Candidate 局部优先，不做全天序列重排
         if (request.CandidateContext != null) return;
-        // V1 口径：仅 FORWARD（BACKWARD JIT 锚点需倒排模拟器，待 0号位 背书后扩展——与 CompactGaps 门控一致）
-        if (!string.Equals(request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal)) return;
+        // ── P1-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：**撤销「全 Run 一票否决」** ──
+        //   复审判词：Setup V1 要求在「**资源 × 连续生产窗口 × 固定锚点间可移动段**」做**有界局部**优化；
+        //   别的资源上的倒排锚点**不应当然剥夺本资源独立 FORWARD 段**的优化机会；未排下、无 Task 的需求
+        //   也不应禁止所有可行资源段优化。此前「任一非 FORWARD 需求 ⇒ 整 Run 返回」**超出冻结资源窗口范围**。
+        //   整改：改**分段保护** —— 非 FORWARD 需求（JIT 倒排锚点）的 Task 一律并入 `immovable`
+        //   ⇒ 它们成为**段边界锚点**（下方 `OptimizeSegment` 不跨锚点重排、锚点本身不动），
+        //     本资源上的独立 FORWARD 段照常参与有界局部优化。判据与 `CompactGaps` 同源（`IsForwardDemand`）。
+        // 计数口径 = **实际进入优化体**（有 ≥2 个 Task 可重排）；< 2 时无序列可优化 ⇒ 不计（不是「进入优化体」）。
         if (tasks.Count < 2) return;
+        SolverDiagnostics.CountPhase5SetupOptimizationRun();
 
         // CompactGaps 可能已移动 Task（压实只维护自身占用图、未同步产品时间线）→
         // 从当前任务集合重建时间线，保证段首前产品查询基于最新位置。
@@ -627,6 +847,19 @@ internal class PhaseFiveCompression
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         var immovable = PhaseFourLocalRepair.IdentifyImmovableTasks(request, tasks);
+
+        // P1-02：非 FORWARD 需求（JIT 倒排锚点）整体登记为不可移动 ⇒ 作**段边界锚点**，绝不跨段重排 / 不前拉。
+        //   （撤销全 Run 一票否决后，局部保护改由本行 + 既有「段按锚点切分」共同达成。）
+        foreach (var t in tasks)
+        {
+            // NEW-P1-01：**逐 Task** 按批级方向判定（`ExecutionBatchDraftKey` → 需求级 → Run 级）。
+            //   ⇒ 同一需求下 BACKWARD 批的 JIT 锚点被完整保护，FORWARD 批仍可参与优化。
+            if (!IsForwardTask(t, request, constraints))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
+
         var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
         // P1-02 性能加固：段预计算的 deadline/floor 查询走三重索引（消除每 Task 全表扫描）
@@ -719,6 +952,11 @@ internal class PhaseFiveCompression
         System.Diagnostics.Stopwatch stopwatch)
     {
         var segmentIds = segment.Select(t => t.FinalDraftId).ToHashSet();
+
+        // P1-02 验收观测（0号位 2026-10-09《APS_V1_2_20261009.md》§五.5）：本段**确实进入**有界局部优化体。
+        //   段由调用方保证「≥2 个 Task 且全部可移动（不含锚点）」⇒ 混合方向下 FORWARD 独立段可达此处；
+        //   BACKWARD/MIXED 需求整体在 `immovable` 内 ⇒ 只会作**锚点**切分，不会形成本调用。纯观测，不参与判定。
+        SolverDiagnostics.CountPhase5SetupSegmentOptimized();
         var segmentLowerBound = prevAnchor != null ? prevAnchor.PlannedEndTime : window.Start;
 
         // ── 预计算段内 Task 的 floor/deadline（全部冻结为原计划口径）──
@@ -1265,6 +1503,21 @@ internal class PhaseFiveCompression
             .ToDictionary(g => g.Key, g => g.Sum(d => d.NetOutputQty));
 
         // P0-05修复：展开每个末端Task的真实 (Demand, Qty) 构成（含 merge 血缘），按 Allocation 归并贡献
+        // ── 2026-10-08 可重放性修复：**确定性任务排序键** ──
+        //   背景（实测发现，非推测）：`FinalDraftId = Guid.NewGuid().ToString()`（Phase2/Phase4 共 5 处）
+        //   ⇒ **每次运行都不同**。而下方份额分摊用 `OrderBy(x => x.TaskId)`（TaskId = FinalDraftId）
+        //   决定「**哪一个 Task 吸收 3 位小数残差**」⇒ **同输入跑两次，份额落到的 Task 不同**。
+        //   实测：同参两次求解，`T/S/U` 与 `ΣShare/ΣQty` 全部相同，但逐任务份额与业务签名 hash 不同。
+        //   这与既有冻结预期冲突：`DeterministicRandom` 明示「同一 Run 重放 → 同一结果」；
+        //   且 0号位 §十五 第 7 项要求「优化前后同输入、同输出业务结果一致性对照」——
+        //   **不确定就无从对照**。故此处改用稳定业务复合键排序（**不改分摊公式、不改数量、不改 ΣShare**）。
+        //   注：本修复只改变「残差归属哪个 Task」（量级 ≤ 0.001），不改变任何数量的总和。
+        var taskSortKeys = tasks.ToDictionary(
+            t => t.FinalDraftId,
+            t => $"{t.SourceDraftId}|{t.StageCode}|{t.OperationCode}|{t.RouteCode}|{t.PathId}"
+               + $"|{t.ExecutionBatchDraftKey}|{t.PlannedStartTime:O}|{t.PlannedEndTime:O}",
+            StringComparer.Ordinal);
+
         var contributions = tasks
             .Where(t => !downstreamTasks.Contains(t.FinalDraftId))
             .SelectMany(t => GetTaskDemandComposition(t, demandByKey, mergeLineage)
@@ -1282,23 +1535,29 @@ internal class PhaseFiveCompression
             var taskQtys = allocGroup
                 .GroupBy(c => c.TaskId)
                 .Select(g => new { TaskId = g.Key, ContributionQty = g.Sum(c => c.Qty) })
-                .OrderBy(x => x.TaskId)
+                // 可重放性修复：按**稳定业务键**排序（原为随机 Guid 的 `TaskId`）。键缺失时回落 TaskId。
+                .OrderBy(x => taskSortKeys.TryGetValue(x.TaskId, out var sortKey) ? sortKey : x.TaskId,
+                         StringComparer.Ordinal)
                 .ToList();
 
             if (taskQtys.Count == 0) continue;
 
             decimal totalContribution = taskQtys.Sum(x => x.ContributionQty);
 
-            // ── P0-03（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六）：份额闭合目标 = **实际落定数量** ──
-            //   `AllocationTaskShare` 承载的是「**已落定 Task** 上的份额」，故其闭合目标只能是落定数量。
-            //   需求只要有一个执行批没排下（`§六` 的「Batch-001 成功 / Batch-002 失败」），其落定数量就
-            //   **小于**声明数量；此时若仍按声明数量补差，会把**整份需求数量**压到仅存的那个批的 Task 上
-            //   ⇒ `ΣShare > Task.Quantity` ⇒ Phase5 硬校验（第 3 项）判失败 ⇒ **整个求解被中断**
-            //     （实测：`Task ... 的 ΣShare=10 超过 Quantity=5`）。
-            //   需求是否被完整满足由**出口 `UnscheduledTasks`（需求级）** + 下方**第 8 项逐需求逐工序数量闭合**保证，
-            //   不由 Allocation 级份额承担。
-            //   正常（全部落定）时 `totalContribution == expectedQty` ⇒ 逐字等价，零回归。
-            var closureTarget = Math.Min(expectedQty, totalContribution);
+            // ── 2026-10-08 复审 NEW-P0-01 整改：**撤销**「份额闭合目标 = `min(声明量, 落定量)`」──
+            //   0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§二 / §十二 + 冻结基线原文：
+            //     · `APS_有限产能排产…v1.7_20261005_Batch_Direction_AB_多Routing冻结回写版.md:1052`
+            //       `AllocationQty = Σ AllocationTaskShare中的预计合格产出份额`
+            //     · 同文 `:1026-1034`「有限产能硬错误，例如…**TaskShare数量不闭合**…必须使Domain失败」；
+            //       `APS_Pegging…v1.6_20261005…md:748/:759/:790` 同义（「必须使Domain失败，不能Warning后发布」）。
+            //   ⇒ **`AllocationQty`（声明数量）是权威**，份额的职责是「把该 Allocation 的数量**分摊**到已落定 Task 上」，
+            //     故闭合目标**恒为 `expectedQty`**，**不随落定量变化**（改成 `min(声明, 落定)` 等于把 AllocationQty
+            //     偷偷重定义成「已排出的数量」⇒ 冻结等式被架空 ⇒ 0号位 §二 判 NEW-P0-01）。
+            //   这正是 0号位 §二 要的失败出口：**部分落定**时把整份声明数量分摊到仅存 Task 上
+            //     ⇒ `ΣShare > Task.Quantity` ⇒ 下方 `ValidateHardResult` **第 3 项**判失败
+            //     （实测报文：`Task … 的 ΣShare=10 超过 Quantity=5`）⇒ **Domain 失败**。
+            //   绝不：把落定量当新目标 / 静默跳过该 Allocation（§二.4 明列禁止项）。
+            var closureTarget = expectedQty;
 
             for (int i = 0; i < taskQtys.Count; i++)
             {
@@ -1307,7 +1566,7 @@ internal class PhaseFiveCompression
 
                 if (i == taskQtys.Count - 1)
                 {
-                    // 最后一个：补差闭合（闭合到**落定数量**，见上 `closureTarget`）
+                    // 最后一个：补差，使 Σ 恰等于 `closureTarget`（消除 3 位小数舍入漂移）
                     var alreadyAllocated = shares
                         .Where(s => s.AllocationSequence == allocationSeq)
                         .Sum(s => s.ComponentQty);
@@ -1315,6 +1574,7 @@ internal class PhaseFiveCompression
                 }
                 else if (totalContribution > 0)
                 {
+                    // 按**真实贡献占比**分摊 `closureTarget`（= 声明数量），与旧实现逐字一致
                     shareQty = Math.Round(closureTarget * c.ContributionQty / totalContribution, 3);
                 }
                 else
@@ -1684,26 +1944,18 @@ internal class PhaseFiveCompression
             .GroupBy(s => s.AllocationSequence)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        // ── P0-03（0号位 2026-10-08 §六）：含**未排定需求**的 Allocation 不参与 Allocation 级闭合 ──
-        //   需求若有执行批没排下，它就在出口被报 Unscheduled（§六），其 `AllocationTaskShare` 只承载
-        //   **已落定批**的份额（见 `GenerateAllocationShares` 的 `closureTarget`）⇒
-        //   对它强制「ΣShare == 声明 NetOutputQty」是无意义的，会误判为失败。
-        //   该需求的数量正确性由下方**第 8 项（逐需求逐工序数量闭合：未排定 ⇒ 允许小于、绝不允许放大）**保证；
-        //   同 Allocation 内**已排定**需求的数量正确性同样由第 8 项**严格**保证 ⇒ 不因本跳过而放松。
-        var allocationsWithUnscheduledDemand = new HashSet<long>(
-            request.LogicalProductionDemands
-                .Where(d => unscheduledDemandKeys.Contains(d.LogicalDemandKey))
-                .Select(d => d.AllocationSequence));
-
+        // ── 2026-10-08 复审 NEW-P0-01 整改：**撤销**「含未排定需求的 Allocation 跳过本项闭合」的改法 ──
+        //   0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§二.4 明列禁止项：「**静默跳过该Allocation**」；
+        //   §十二 并指出「无法按客户DueDate完成不是Solver失败」与「Allocation只排出一部分数量且TaskShare不闭合
+        //   也可以正式成功」**不是一个概念**（v1.7:1052 + :1026-1034 要求 `TaskShare数量不闭合` 必须使 Domain 失败）。
+        //   ⇒ 本项**无条件**对所有**已产出份额**的 Allocation 执行。
+        //   注：整条 Allocation 的所有需求都未排定时，它不产出任何 Task ⇒ 不产生份额行 ⇒ 不出现在 `sharesByAllocation`
+        //   ⇒ 本项**天然不适用**（这不是跳过，而是「无份额可闭合」）⇒ 「产能不足 ⇒ Success=true + Unscheduled」的
+        //   冻结口径（v1.7 §41）**不受影响**；只有「**部分**落定」（ΣShare < 声明 AllocationQty）才判失败。
         foreach (var allocKvp in sharesByAllocation)
         {
             var allocationSeq = allocKvp.Key;
             var shares = allocKvp.Value;
-
-            if (allocationsWithUnscheduledDemand.Contains(allocationSeq))
-            {
-                continue;   // 见上：改由第 8 项逐需求逐工序闭合保证
-            }
 
             if (!allocationTotalNetOutput.TryGetValue(allocationSeq, out var expectedQty))
             {

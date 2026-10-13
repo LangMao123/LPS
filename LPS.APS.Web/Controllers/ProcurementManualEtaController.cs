@@ -254,7 +254,7 @@ ORDER BY processcode";
                     MaterialId = request.MaterialId,
                     ReceivingWarehouse = request.ReceivingWarehouse,
                     AlreadyCanceled = false,
-                    CanceledAt = DateTime.UtcNow
+                    CanceledAt = DateTime.Now
                 },
                 "Manual ETA canceled successfully");
         }

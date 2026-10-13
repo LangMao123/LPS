@@ -161,19 +161,19 @@ public class AuthDbContext : DbContext
             {
                 if (entry.Entity is User user)
                 {
-                    user.CreatedAt = DateTime.UtcNow;
-                    user.UpdatedAt = DateTime.UtcNow;
+                    user.CreatedAt = DateTime.Now;
+                    user.UpdatedAt = DateTime.Now;
                 }
                 else if (entry.Entity is AuditLog log)
                 {
-                    log.OccurredAt = DateTime.UtcNow;
+                    log.OccurredAt = DateTime.Now;
                 }
             }
             else if (entry.State == EntityState.Modified)
             {
                 if (entry.Entity is User user)
                 {
-                    user.UpdatedAt = DateTime.UtcNow;
+                    user.UpdatedAt = DateTime.Now;
                 }
             }
         }

@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Exceptions;
 using LPS.APS.Application.Services;
@@ -46,25 +47,34 @@ public class TaskSplitRuleConfigController : ControllerBase
         return ex switch
         {
             SetupRuleDataRedLineException data => UnprocessableEntity(ApiResponse.Fail(422, data.Message)),
+            ScopeViolationException scope => StatusCode(403, ApiResponse.Fail(403, scope.Message)),
             ResourceNotFoundException missing => NotFound(ApiResponse.Fail(404, missing.Message)),
             ArgumentException argument => BadRequest(ApiResponse.Fail(400, argument.Message)),
             _ => throw ex,
         };
     }
 
-    /// <summary>列出执行批拆分规则（可按物料/生产部门/启用态过滤），供 4号位 配置页面。</summary>
+    /// <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请，方案 A）。</summary>
+    /// <param name="materialId">物料 Id（可选精确匹配）</param>
+    /// <param name="productionDepartmentId">生产部门 Id（可选精确匹配）</param>
+    /// <param name="isActive">启用态过滤（null = 全部）</param>
+    /// <param name="pageIndex">页码（1 基，&lt; 1 归 1）</param>
+    /// <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
+    /// <param name="ct">取消令牌</param>
     [Authorize(Policy = PermissionCodes.RuleView)]
     [HttpGet("task-split-rule-configs")]
     public async Task<IActionResult> List(
         [FromQuery] int? materialId,
         [FromQuery] int? productionDepartmentId,
         [FromQuery] bool? isActive,
-        CancellationToken ct)
+        [FromQuery] int pageIndex = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
     {
         try
         {
-            var data = await _service.ListAsync(materialId, productionDepartmentId, isActive, ct);
-            return Ok(ApiResponse<IReadOnlyList<TaskSplitRuleConfigDto>>.Success(data));
+            var data = await _service.ListAsync(materialId, productionDepartmentId, isActive, GetCurrentUserId(), pageIndex, pageSize, ct);
+            return Ok(ApiResponse<PageResult<TaskSplitRuleConfigDto>>.Success(data));
         }
         catch (Exception ex)
         {

@@ -85,12 +85,20 @@ public class ContinuityShareTests
             allowMerge: true,
             allowSplit: true);
 
+        using var scope = SolverDiagnostics.BeginScope();
         var result = await _solver.SolveAsync(request);
 
         Assert.True(result.Success, result.ErrorMessage);
         var contTasks = result.FinalTasks.Where(t => t.SourceDraftId == "CONT").ToList();
         Assert.Single(contTasks);
         Assert.Equal(10m, contTasks[0].Quantity);
+
+        // ── 2026-10-12 门禁通电：A/B（连续份额）**豁免** ⇒ 三档**都不计** ──
+        //   这不是「放行」，是「门禁不适用」（`ApplyPiLegalQuantityGate` 首行 `IsContinuation || NoSplitMerge` 豁免）。
+        //   若此处计进「放行」，2号位 §四 的「放行 = Passed + PassedViaB010Fallback」会被 A/B 桶灌水。
+        Assert.Equal(0, scope.Counters.PiLegalQuantityGatePassed);
+        Assert.Equal(0, scope.Counters.PiLegalQuantityGateBlocked);
+        Assert.Equal(0, scope.Counters.PiLegalQuantityGateUnevaluated);
     }
 
     [Fact]
@@ -209,6 +217,7 @@ public class ContinuityShareTests
             DemandKey = d.Key,
             MaterialId = d.MaterialId,
             FactoryId = 1,
+            StartStageCode = stage,
             NetOutputQty = d.Qty,
             PlannedProcessQty = d.Qty,
             RequiredAvailableTime = d.RequiredAvailableTime,
@@ -274,6 +283,38 @@ public class ContinuityShareTests
             IsAvailable = true
         }).ToList();
 
+        // ── 2026-10-12 门禁通电：PI 权威事实 / Stage 合法自由量 **投影** ──
+        //   生产入口已接线（`PhaseTwoInitialScheduler` 现传 `piFacts: request.PiRemainingFacts`），
+        //   而 `DomainSolveRequest.PiRemainingFacts` 的 Core 默认值是 **空列表（非 null）**
+        //   ⇒ 带 PI 的自由需求若本夹具不投影事实，门禁会以「找不到 PI 权威行」显式未满足（Fail Closed）。
+        //   本夹具验证的是**连续份额与自由份额的时序**，与数量闸门无关 ⇒ 按 (PI × 物料) 投影**足量**事实，
+        //   使门禁落在「放行」档，不干扰被测语义。**这不是放宽判据** —— 门禁本身仍逐条真实评估
+        //   （对照：`PiGateWiringTests` 专测「超 Stage 合法自由量 ⇒ 零 Task」）。
+        var piGroups = logicalDemands
+            .Where(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo))
+            .GroupBy(d => (Pi: d.ProductionInstructionNo!, d.MaterialId))
+            .ToList();
+
+        var piRemainingFacts = piGroups.Select(g => new PiRemainingFact
+        {
+            ProductionInstructionNo = g.Key.Pi,
+            MaterialId = g.Key.MaterialId,
+            FactoryId = 1,
+            OrderType = string.Empty,
+            PiQuantity = g.Sum(d => d.PlannedProcessQty),
+            PiReceivedQty = 0m,
+            PiRemainingQty = g.Sum(d => d.PlannedProcessQty)
+        }).ToList();
+
+        var piStageBaselines = piGroups.Select(g => new PiStageQuantityBaseline
+        {
+            ProductionInstructionNo = g.Key.Pi,
+            MaterialId = g.Key.MaterialId,
+            StageCode = stage,
+            StageFreeEligibleQty = g.Sum(d => d.PlannedProcessQty),
+            AlreadyCommittedQty = 0m
+        }).ToList();
+
         return new DomainSolveRequest
         {
             PlanVersionId = 1,
@@ -281,6 +322,8 @@ public class ContinuityShareTests
             PlanningStart = PlanningStart,
             PlanningEnd = PlanningEnd,
             LogicalProductionDemands = logicalDemands,
+            PiRemainingFacts = piRemainingFacts,
+            PiStageQuantityBaselines = piStageBaselines,
             RoutingOperations = routingOps,
             OperationResourceEligibility = eligibilities,
             MaterialStageDepartmentContexts = deptContexts,
@@ -296,7 +339,7 @@ public class ContinuityShareTests
                 },
                 // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
                 //   本夹具验证的是连续份额（A/B 恒 1 批）与自由需求共存 ⇒ Material 级宽松策略。
-                BatchPolicies = TestBatchPolicy.Permissive(logicalDemands.Select(d => d.MaterialId))
+                BatchPolicies = TestBatchPolicy.Permissive(logicalDemands.Select(d => d.MaterialId), deptId)
             }
         };
     }

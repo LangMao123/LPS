@@ -307,6 +307,21 @@ public class SyntheticSchedulingIntegrationTest
             new { VersionCode = versionCode, BatchNo = TEST_BATCH_NO, SourceScheduleRunId = scheduleRunId },
             db: DatabaseId.APS);
 
+        // ── 三类 MES 快照的 **Run 级成功证据**（2026-10-12 必需，PM `回复1010.md` §四/§五.2 fail-closed）──
+        //   合成 PlanVersion **无 Base** ⇒ `SnapshotRunResolver.ResolveCoreAsync` 走「无 Base」分支，
+        //   要求本 Run **自证**「三个快照 Step 各自最新一条终态记录 = SUCCESS」；缺证据 ⇒ 抛
+        //   `SnapshotRunResolutionException`（**不得把空快照当零在制继续排**）。
+        //   故合成夹具必须与三个 MES 快照 SP 写同款证据（Step 名取 `SnapshotStepNames` 单一来源、
+        //   `BatchNo` 取 Run 号的字符串形态，与 SP 的 `CAST(@ScheduleRunId AS NVARCHAR(50))` 一致）。
+        //   `Id`/`CreatedAt` 由表默认值提供；`APS_ETL_Log` 无对 Run/PV 的外键，故不参与下方的业务键清理。
+        foreach (var step in SnapshotRunResolver.SnapshotStepNames.Names)
+        {
+            await _connectionManager.ExecuteAsync(
+                @"INSERT INTO dbo.APS_ETL_Log (BatchNo, Step, Message, Status)
+                  VALUES (@BatchNo, @Step, 'TEST_SYN 合成夹具：Run 级快照同步成功证据', 'SUCCESS')",
+                new { BatchNo = scheduleRunId.ToString(), Step = step }, db: DatabaseId.APS);
+        }
+
         // ── 订单（合成，SALES_ORDER，交期在 7x24 合成日历窗内）──
         await _connectionManager.ExecuteAsync(
             @"INSERT INTO [Order]

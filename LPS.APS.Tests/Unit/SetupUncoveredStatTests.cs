@@ -28,7 +28,8 @@ public class SetupUncoveredStatTests
             Mock.Of<IMasterDataLookupRepository>(),
             Mock.Of<IAuditLogRepository>(),
             Mock.Of<IGovernanceVersionService>(),
-            _repo.Object);
+            _repo.Object,
+            Mock.Of<IDataScopeService>());
     }
 
     [Fact]

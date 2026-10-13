@@ -32,6 +32,43 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<AllocationLineage> AllocationLineage { get; init; }
         = Array.Empty<AllocationLineage>();
 
+    /// <summary>
+    /// PI 级 ERP 权威剩余事实（AUD-1-D04 / 1号位 §1.3，2026-10-12 投影）。
+    ///
+    /// 语义：<c>PiRemainingQty = max(PiQuantity − ISNULL(PiReceivedQty,0), 0)</c> —— **全链唯一总量根**
+    /// （用户 2026-10-09 定盘；大工艺/MES 工序各层只回答「剩余现在在哪」，任何层不得突破它）。
+    /// 2号位 装载层在 <c>LoadPiRemainingFactsAsync</c> 已产出事实集（B-01 身份闸门已剔全部客户订单行），
+    /// 此处按 (PI号 × 物料 × 工厂) 全量投影给 1号位，供 B-009/B-010 数量门禁与 V1_4 NEW-04 运行累计账评估。
+    /// **一个 PI 一条**，不在此层做「取剩余最大」聚合（那是 1号位 索引口径，且同一 PI 跨物料须按三元组区分）。
+    /// ⚠ 不得以本字段冒充 <c>StageFreeEligibleQty</c>（F-02 红线：二者是两个量，混用会静默放大可用量）。
+    /// </summary>
+    public IReadOnlyList<PiRemainingFact> PiRemainingFacts { get; init; }
+        = Array.Empty<PiRemainingFact>();
+
+    /// <summary>
+    /// (PI × 物料 × Stage) 级 **Stage 入口基线自由量**（1号位 §1.4(a)／06 接口 §257-262，2026-10-12 投影）。
+    ///
+    /// 【为什么需要】1号位 B-009 合法量门禁 = <c>min(配置 Max, PI Original, PI Remaining, StageFreeEligibleQty − 同PI同Stage已占)</c>。
+    ///   前两项已由 <see cref="PiRemainingFacts"/> 承载；**后两项只有上游（2号位 装载）能给**。
+    ///   1号位 侧消费形状 = 其自有记录 <c>PiStageQuantityContext</c>（不入 Core 契约，见其类注释）；
+    ///   本列表即该形状的 **Core 入参 1:1 对应**（字段名逐字对齐，见 <see cref="PiStageQuantityBaseline"/>）。
+    ///
+    /// 【分工切分（1号位 2026-10-10 §1.4(a)）】2号位 认领「入口基线」、1号位 认领「本轮增量累计」
+    ///   （<c>PiStageCommitLedger</c>，同 Run 内逐批按身份累加后并入 <c>AlreadyCommittedQty</c>）。
+    ///   ⇒ 本列表是**进入本轮求解那一刻**的基线，**不含**本轮新形成的批。
+    ///
+    /// 【口径出处】1号位 §1.4(a) 两问（是否含 A/B 已执行 / 是否按 NextOperationContext 限定）**已由冻结口径作答**：
+    ///   业务基线 v1.10 §1231（同句重复于 03 v1.8 §43／06 v1.35 §257／07 v5.1.10 §4590／10 v1.7 §48／11 v2.1 §50）逐字：
+    ///   「<c>StageFreeEligibleQty</c>（PI Position/NextOperationContext、A/B已执行、Q→A/B/C 及已被新增批占用事实限定的
+    ///   当前Stage自由可新成批量）」⇒ **是／是**。上界公式本身＝2号位 数量真相域（5号位 2026-10-10 五轮回执 §三@1 交还）。
+    ///
+    /// 【硬约束】仅对 **C 桶（非连续份额）＋ 有真实 MTS PI ＋ 非 UNLOCATED** 的需求产出；
+    ///   缺位置事实或该 Stage 自由量为 0 ⇒ **不产行**（1号位 记「缺 Stage 合法自由量上下文」显式未满足）；
+    ///   **绝不以 <c>PiRemainingFact.PiRemainingQty</c> 冒充**（F-02 红线：二者是两个量，混用会静默放大可用量）。
+    /// </summary>
+    public IReadOnlyList<PiStageQuantityBaseline> PiStageQuantityBaselines { get; init; }
+        = Array.Empty<PiStageQuantityBaseline>();
+
     public IReadOnlyList<RoutingOperation> RoutingOperations { get; init; }
         = Array.Empty<RoutingOperation>();
 
@@ -103,6 +140,24 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<ExecutionConstraint> ExecutionConstraints { get; init; }
         = Array.Empty<ExecutionConstraint>();
 
+    /// <summary>
+    /// **契约②：订单保护事实**（2号位 → 1号位）。
+    ///
+    /// 与 <see cref="ExecutionConstraints"/> **两条不同的契约**（冻结规则清单 §十四 L-001「语义不得混同」）：
+    ///   · <see cref="ExecutionConstraints"/> = **硬锚点，锁物理位置** —— 收 Frozen（窗口层＋执行层）与执行事实；
+    ///   · **本字段** = **订单级保护事实，不锁位置** —— 收 **Firm**（`PM回复0923-1` §三.2「Firm 不是锁」）。
+    ///
+    /// 【投结论、不投判据】键用 `OrderId`（1号位 内存键），**不投** `OrderCanonicalId`/`TaskId`
+    ///   —— 既有红线：`RunScope` 注明「`OrderCanonicalId`/`TaskId` 已转 1号位 内存键，long 官方 Id 不进 Solver 契约」
+    ///   （`APS_V1_白天候选各号位配合事项_1号位致2号位_回执_v1.0_20260924` §三 预提1）。
+    ///   窗口内/外判定同样由 2号位 算完（同件 §三 预提2：1号位 纯内存、不持有 Base 旧计划 ⇒ 结构上做不了）。
+    ///
+    /// 【V1 实产范围】键 `OrderId` 非空且**有保护**的订单才投影；`ProtectionType = None` 不投影
+    ///   （`APS_V1_订单保护事实载体_2号位致1号位_收敛回执_v1.0_20260923` §五）。
+    /// </summary>
+    public IReadOnlyList<OrderProtection> OrderProtections { get; init; }
+        = Array.Empty<OrderProtection>();
+
     public SolverStrategySnapshot StrategySnapshot { get; init; } = new();
 
     public CandidateContext? CandidateContext { get; init; }
@@ -158,6 +213,48 @@ public sealed class MaterialAvailabilitySlice
 }
 
 /// <summary>
+/// (PI × 物料 × Stage) 级 **Stage 入口基线自由量**（2号位 装载 → 1号位 数量门禁；1号位 §1.4(a)，2026-10-12）。
+///
+/// **与 1号位 <c>PhaseTwoInitialScheduler.PiStageQuantityContext</c> 逐字段 1:1 对应（同名同序）**：
+///   1号位 按 (PI 号, 物料ID, StageCode) 索引 <see cref="DomainSolveRequest.PiStageQuantityBaselines"/> 即可
+///   直接构造其消费形状，**无需任何换算**（唯一差异：1号位 侧 <c>AlreadyCommittedQty</c> 有默认值 0m，本侧必填）。
+///
+/// ⚠ 本类型是**运行时入参**：不落任何物理列／表、不入冻结 DDL，也不改 <c>[Order]</c>／TaskSplitRuleConfig 等实体
+///   （与冻结 DDL 08 §2.14 同向——该处明示此类「保守批目标／上限**只在 Run 内使用，不落入本表**」）。
+/// </summary>
+public sealed class PiStageQuantityBaseline
+{
+    /// <summary>生产指示号（= 需求 <c>LogicalProductionDemand.ProductionInstructionNo</c>）。</summary>
+    public string ProductionInstructionNo { get; init; } = string.Empty;
+
+    /// <summary>物料ID（= 需求 <c>LogicalProductionDemand.MaterialId</c>）。</summary>
+    public int MaterialId { get; init; }
+
+    /// <summary>目标 Stage（= 需求 <c>LogicalProductionDemand.StartStageCode</c>；批形成先于 Routing 展开，故取需求级起点）。</summary>
+    public string StageCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 该 (PI × 物料 × Stage) 的 **Stage 合法自由可用量（毛量口径，未扣已占）**。
+    ///
+    /// 取值 = <c>min(该 Stage 待加工位置量, NextOperationContext 归于该 Stage 的位置量)</c>——
+    ///   二者是**同一物理池的两个视图**（5号位 2026-10-10 五轮回执 §三@1：位置量与工单执行剩余量「可能重叠」），
+    ///   故取小保守，不做加法。
+    /// 位置量只取 <c>FIRST_STAGE_PENDING</c> / <c>STAGE_WAITING</c> 两类；
+    ///   <c>XC</c> / <c>INTERPLANT_TRANSIT</c> / <c>UNLOCATED</c> 不在任何 Stage 上 ⇒ **不计入**。
+    /// </summary>
+    public decimal StageFreeEligibleQty { get; init; }
+
+    /// <summary>
+    /// 该 (PI × 物料 × Stage) 在**入口**已被占用的量 = 既有 MES 执行连续份额（A/B）在该 Stage 的执行剩余量。
+    ///
+    /// 门禁实际可用 = <see cref="StageFreeEligibleQty"/> − 本值 − 1号位 本轮增量（<c>PiStageCommitLedger</c>）。
+    /// 已 clamp 到 <c>[0, StageFreeEligibleQty]</c>：位置量与执行量可能重叠，且已占大于毛量时门禁会出负
+    ///   （= 位置不可信），按保守取毛量为上限并留痕，**不产负值**。
+    /// </summary>
+    public decimal AlreadyCommittedQty { get; init; }
+}
+
+/// <summary>
 /// 一次ScheduleRun冻结给1号位使用的Solver参数包（接口冻结§2.3第7类）
 /// 1号位不需要Demand排序、库存规则等，那些已由2号位执行完成
 /// </summary>
@@ -187,12 +284,54 @@ public sealed class SolverStrategySnapshot
         = Array.Empty<SetupTransitionRuleSnapshot>();
 
     /// <summary>⑧ 批量策略（Batch Policy）规则（0号位 2026-10-07《未命名的Markdown文件 (7).md》§四/§十/§十一）。
-    /// 粒度 = <c>Material + ProductionDepartment</c>（冻结 B-001；<c>ProductionDepartmentId</c> 可空 = Material 级默认）。
-    /// 2号位 按本 Run 从 `TaskSplitRuleConfig` 装载并投影；1号位 `PhaseOneConstraintBuilder` 收进
-    /// <c>ConstraintContext.ExecutionBatchPolicies</c>，由 <c>PhaseTwoInitialScheduler</c> 做 C 桶 Batch Decision。
-    /// 空 ⇒ 每需求恒 1 批（不拆）；**1号位 不得自造全局默认策略**（§十一 第 3 条）。</summary>
+    /// 粒度 = <c>Material + ProductionDepartment</c>（冻结 B-001）。**正式命中必须是明确部门**：
+    /// <c>ProductionDepartmentId == null</c> 仅历史兼容，**不得**当 Material 级默认（AUD-1-004 已删除该兜底）。
+    /// 2号位 数据源 = **本 Run 冻结策略包的 ⑧ 块**（<c>ParameterSetVersion.ContentSnapshotJson.BatchPolicy</c>，
+    /// 经 <c>FrozenStrategySnapshotProvider.DeserializeBatchPolicy</c> 反序列化）；
+    /// **装载时不回读 <c>TaskSplitRuleConfig</c> 物理表**（该表只在策略包「发布」那一刻被读一次）。
+    /// ⚠ 2026-10-13 更正：本注释原写「**整块透传、不裁剪**」，**已失效** —— 2026-10-12 起装载期按域裁剪
+    /// （<c>PeggingOrchestrator.BatchPolicies = TaskSplitRuleConfigProjector.CropToDomain(...)</c>，
+    /// 按 <c>demandMaterialIds</c> 单轴裁，保留全部部门变体，≈85×）。⇒ **列表里看不到某物料 = 域裁剪结果，不是装载缺失。**
+    /// ⚠ 本属性**只承载「已生效规则行」**，**无状态位** ⇒ 单看它无法区分 MISSING 与 INVALID
+    /// （冻结 06 v1.37 <c>:25</c>／规则清单 B-013 要求 <c>VALID/MISSING/INVALID</c> 三态）。
+    /// **三态＋不可用载体已于 2026-10-13 落码 = <see cref="BatchPolicyStates"/>（同层，本 Run 逐业务键）**
+    /// ⇒ 消费侧**不得**再把「本列表为空／查不到行」一律读作 MISSING（06 <c>:17</c> 逐字已判违规）。
+    /// 本列表仍为 **Valid 行的规则参数来源**（载体只给状态，不给参数）。
+    /// 1号位 <c>PhaseOneConstraintBuilder</c> 收进 <c>ConstraintContext.ExecutionBatchPolicies</c>，
+    /// 由 <c>PhaseTwoInitialScheduler</c> 做 C 桶 Batch Decision。
+    /// 空 ⇒ **C 桶（新增需求）缺策略 fail-closed**（<c>BATCH_POLICY_MISSING</c>，P0-01 / svn r13558）；
+    /// A/B 既存执行批不受本判据管辖（恒 1 批）。**1号位 不得自造全局默认策略**（§十一 第 3 条）。</summary>
     public IReadOnlyList<BatchPolicyRuleSnapshot> BatchPolicies { get; init; }
         = Array.Empty<BatchPolicyRuleSnapshot>();
+
+    /// <summary>⑧块**三态＋不可用**最小载体（2→1 最小技术合同，2026-10-13；2号位 择定形态）。
+    ///
+    /// **语义**：非 <c>null</c> ⇒ 2号位 已按本 Run 业务键（<c>MaterialId + ProductionDepartmentId</c>，
+    /// 覆盖本域需求物料含下阶 BOM）**逐键**给出状态与真实匹配来源；**键未被覆盖 ⇒ 按「状态不可获得」处置**
+    /// （不得推断）。
+    /// <c>null</c> ⇒ **接口未传递状态**（旧载荷／未适配的生产者）⇒ 消费侧**保持现行口径**
+    /// （精确命中 ⇒ <c>Valid</c>；其余 ⇒ 状态不可获得／<c>Unknown</c>）。现行口径**从不产出 <c>Missing</c>**
+    /// ⇒ **不会误启 <c>Q_C</c>**，故 <c>null</c> 路径**合规且零回归**，但**不得据以取 <c>Q_C</c> 兜底**。
+    ///
+    /// **与 1号位 侧类型的映射**（<c>LPS.APS.Scheduling/Solvers/PhaseTwoInitialScheduler.cs</c>，
+    /// <c>internal enum BatchPolicyMatchState</c>）：<c>Valid→Valid</c>、<c>Missing→Missing</c>、
+    /// <c>Invalid→Invalid</c>、<c>Unavailable→Unknown</c>（出口码 <c>BATCH_POLICY_STATE_UNAVAILABLE</c>）。
+    /// 1号位 的 <c>Missing</c> 分支**已落码但今日不可达** —— 其注释逐字：「<c>Missing</c> 分支**保留**
+    /// （**载体到位后由 2号位 可信状态激活**）—— 今日不可达」⇒ **本属性即该「可信状态」**。
+    ///
+    /// **为什么与 <see cref="BatchPolicies"/> 并存而不是替换它**：06 v1.37 <c>:25</c> 只允许「**最小 DTO**」，
+    /// 且要求「**不得**把所有物料规则发送 Solver」。本载体只增加 <c>(键, 状态, 来源)</c> 三元组
+    /// （**不含规则参数**），规则参数继续由 <see cref="BatchPolicies"/> 承载 ⇒ **纯增量、向后兼容**：
+    /// 未适配的消费侧忽略本属性即回到旧行为，**零回归**。
+    ///
+    /// **判定口径**（<c>TaskSplitRuleConfigProjector.BuildStates</c>）：VALID = 精确键命中且在**本 Run 生效时点**
+    /// 的生效窗口 <c>[EffectiveFrom, EffectiveTo)</c> 内；INVALID = 本键有规则但不在窗口内（发布后失效、未治理隔离）；
+    /// MISSING = 经完整核对确无匹配规则（含 ⑧块整体为空、本部门无命中而别的部门有记录）；
+    /// UNAVAILABLE = 装载失败／未传递状态。
+    ///
+    /// ⚠ 消费侧口径**变更点**：旧口径「<c>BatchPolicies</c> 为空或查不到行 ⇒ 一律 MISSING」已判违规
+    /// （06 <c>:17</c> 逐字「不能仅凭旧 <c>BatchPolicies</c> 规则行集合为空或查不到行就无差别返回 NULL」）。</summary>
+    public IReadOnlyList<BatchPolicyStateSnapshot>? BatchPolicyStates { get; init; }
 }
 
 /// <summary>
@@ -292,6 +431,29 @@ public sealed class ExecutionConstraint
 
     // 第4轮Anchor补充：稳定TaskKey，用于跨轮次识别同一Task
     public string? TaskKey { get; init; }
+}
+
+/// <summary>
+/// **订单保护事实**（契约②，`DomainSolveRequest.OrderProtections` 的元素）。
+///
+/// 语义见 <see cref="OrderProtectionType"/> / <see cref="OrderProtectionReason"/> 的文档注释。
+/// **只通报、不约束**：1号位 不得据此禁止移动任何 Task（`PM回复0923-1` §三.2/§四/§八）。
+/// 需要"锁物理位置"的（Frozen / 执行事实）走 `ExecutionConstraints`。
+/// </summary>
+public sealed class OrderProtection
+{
+    /// <summary>
+    /// 订单 Id（= `LogicalProductionDemand.OrderId` 同一内存键；1号位 侧唯一可用键）。
+    /// 依 `APS_V1_订单保护事实载体_1号位致2号位_认收回执_v1.0_20260923` §二「键须改 `OrderId`」，
+    /// 取代 PM 草案的 `OrderCanonicalId`。**恒非空**（为空则该订单不可作键 ⇒ 2号位 不投影）。
+    /// </summary>
+    public long? OrderId { get; init; }
+
+    /// <summary>保护类型（Firm / Frozen；`None` 不投影）。</summary>
+    public OrderProtectionType ProtectionType { get; init; } = OrderProtectionType.None;
+
+    /// <summary>保护原因（窗口层 / 执行事实层，见 <see cref="OrderProtectionReason"/>）。</summary>
+    public OrderProtectionReason ProtectionReason { get; init; } = OrderProtectionReason.None;
 }
 
 public sealed class FiniteCapacityParameters

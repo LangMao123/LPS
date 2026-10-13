@@ -82,8 +82,11 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ContentSnapshotJson = BuildRuleSetContentSnapshot(version);
 
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
 
@@ -98,7 +101,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "规则集版本发布" : changeReason
         }, ct);
     }
@@ -126,8 +129,11 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ContentSnapshotJson = await InjectBatchPolicyAsync(version.ContentSnapshotJson, ct);
 
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
 
@@ -142,7 +148,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "参数集版本发布" : changeReason
         }, ct);
     }
@@ -199,6 +205,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
 
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录停用操作
@@ -212,7 +221,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -227,6 +236,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
 
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录停用操作
@@ -240,7 +252,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -251,6 +263,9 @@ public class GovernanceVersionService : IGovernanceVersionService
             ?? throw new InvalidOperationException($"策略包版本不存在：{strategyProfileVersionId}");
 
         EnsureDisableable(version.Status, strategyProfileVersionId);
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         // IsDefault=1 停用：需清默认标志（避免 DISABLED 默认版本残留于 ResolveDefault 查询范围）
         if (version.IsDefault)
@@ -274,7 +289,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -318,7 +333,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "RuleSetVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -369,7 +384,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "ParameterSetVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -409,7 +424,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "StrategyProfileVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -432,7 +447,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct);
@@ -580,7 +595,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct);
@@ -1160,7 +1175,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct);
@@ -1280,6 +1295,9 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         EnsurePublishable(version.Status, strategyProfileVersionId);
 
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         // IsDefault=1：先清同 Profile 其他默认再置位，避免 UQ_StrategyProfileVersion_DefaultPublished 冲突
         if (version.IsDefault)
         {
@@ -1288,7 +1306,7 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
 
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
@@ -1304,7 +1322,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "策略包版本发布" : changeReason
         }, ct);
     }
@@ -1318,7 +1336,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         }
 
         var candidates = await _strategyProfileVersionRepository.GetDefaultByRunTypeAsync(runType, ct);
-        var effective = asOf ?? DateTime.UtcNow;
+        var effective = asOf ?? DateTime.Now;
 
         // 过滤生效窗口：EffectiveFrom <= now（有值才校验）、EffectiveTo >= now（有值才校验）
         var inWindow = candidates
@@ -1407,7 +1425,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         string displayName)
         where T : class
     {
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         // 物化一次可空生效窗口，避免同一 getter 两次调用导致 CS8629 流分析告警
         var inWindow = versions
             .Where(v => statusGetter(v) == GovernanceVersionStatus.Published)
@@ -1461,11 +1479,12 @@ public class GovernanceVersionService : IGovernanceVersionService
     /// 创建规则集版本（P0-02：强制 DRAFT——入参 Status 一律忽略覆盖，状态只能经 Submit/Approve/Publish 流转，Create 不可直提 PUBLISHED；
     /// 治理字段一律置空，由后续流转写入）。
     /// P0-01：DRAFT 编辑的 DemandPriorityJson（内存/API 字段）归一化写入 ContentSnapshotJson 后持久化。
+    /// P1-04：Create 审计（ActionCode=Create）+ 审计前置预检（fail-before-write，跨库无 2PC）。
     /// </summary>
-    public async Task<RuleSetVersion> CreateRuleSetVersionAsync(RuleSetVersion version, string? createdBy, CancellationToken ct = default)
+    public async Task<RuleSetVersion> CreateRuleSetVersionAsync(RuleSetVersion version, string? createdBy, int actorUserId, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;
@@ -1474,14 +1493,35 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         EnsureRuleSetNormalized(version);
 
-        return await _ruleSetVersionRepository.AddAsync(version, ct);
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var created = await _ruleSetVersionRepository.AddAsync(version, ct);
+
+        // P1-04 审计日志：记录创建操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Create",
+            EntityType = "RuleSetVersion",
+            EntityId = created.Id.ToString(),
+            VersionCode = created.VersionCode,
+            OldValue = null,
+            NewValue = created.VersionCode,
+            UserId = actorUserId,
+            UserCode = createdBy,
+            OccurredAt = DateTime.Now,
+            Remark = "规则集版本创建"
+        }, ct);
+
+        return created;
     }
 
     /// <summary>
     /// 更新规则集版本（P0-02：已发布不可原地修改、失效/归档不可改；入参 Status/治理字段/主键一律以现有记录为准，禁止越权改状态）。
     /// P0-01：DRAFT 编辑内容归一化到 ContentSnapshotJson 后持久化（任一主题 JSON 非空则重建，全空保持现有快照）。
+    /// P1-04：Update 审计（ActionCode=Update）+ 审计前置预检（fail-before-write，跨库无 2PC）。
     /// </summary>
-    public async Task UpdateRuleSetVersionAsync(long ruleSetVersionId, RuleSetVersion version, CancellationToken ct = default)
+    public async Task UpdateRuleSetVersionAsync(long ruleSetVersionId, RuleSetVersion version, int actorUserId, CancellationToken ct = default)
     {
         var existing = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct)
             ?? throw new InvalidOperationException($"规则集版本不存在：{ruleSetVersionId}");
@@ -1500,7 +1540,27 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         EnsureRuleSetNormalized(version);
 
+        var beforeVersionCode = existing.VersionCode;
+
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
+
+        // P1-04 审计日志：记录更新操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Update",
+            EntityType = "RuleSetVersion",
+            EntityId = version.Id.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = beforeVersionCode,
+            NewValue = version.VersionCode,
+            UserId = actorUserId,
+            UserCode = existing.CreatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "规则集版本更新"
+        }, ct);
     }
 
     /// <summary>获取规则集版本详情（P0-01：ContentSnapshotJson → DemandPriorityJson 投影，前端 API 兼容）</summary>
@@ -1514,11 +1574,11 @@ public class GovernanceVersionService : IGovernanceVersionService
         return version;
     }
 
-    /// <summary>创建参数集版本（P0-02：强制 DRAFT；治理字段置空；P0-01：五主题 JSON 归一化到 ContentSnapshotJson 持久化）</summary>
-    public async Task<ParameterSetVersion> CreateParameterSetVersionAsync(ParameterSetVersion version, string? createdBy, CancellationToken ct = default)
+    /// <summary>创建参数集版本（P0-02：强制 DRAFT；治理字段置空；P0-01：五主题 JSON 归一化到 ContentSnapshotJson 持久化；P1-04：Create 审计+预检）</summary>
+    public async Task<ParameterSetVersion> CreateParameterSetVersionAsync(ParameterSetVersion version, string? createdBy, int actorUserId, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;
@@ -1527,11 +1587,31 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         EnsureParameterSetNormalized(version);
 
-        return await _parameterSetVersionRepository.AddAsync(version, ct);
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var created = await _parameterSetVersionRepository.AddAsync(version, ct);
+
+        // P1-04 审计日志：记录创建操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Create",
+            EntityType = "ParameterSetVersion",
+            EntityId = created.Id.ToString(),
+            VersionCode = created.VersionCode,
+            OldValue = null,
+            NewValue = created.VersionCode,
+            UserId = actorUserId,
+            UserCode = createdBy,
+            OccurredAt = DateTime.Now,
+            Remark = "参数集版本创建"
+        }, ct);
+
+        return created;
     }
 
-    /// <summary>更新参数集版本（P0-02：已发布/失效/归档不可改；Status/治理字段冻结；P0-01：内容归一化到快照）</summary>
-    public async Task UpdateParameterSetVersionAsync(long parameterSetVersionId, ParameterSetVersion version, CancellationToken ct = default)
+    /// <summary>更新参数集版本（P0-02：已发布/失效/归档不可改；Status/治理字段冻结；P0-01：内容归一化到快照；P1-04：Update 审计+预检）</summary>
+    public async Task UpdateParameterSetVersionAsync(long parameterSetVersionId, ParameterSetVersion version, int actorUserId, CancellationToken ct = default)
     {
         var existing = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct)
             ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
@@ -1550,7 +1630,27 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         EnsureParameterSetNormalized(version);
 
+        var beforeVersionCode = existing.VersionCode;
+
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
+
+        // P1-04 审计日志：记录更新操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Update",
+            EntityType = "ParameterSetVersion",
+            EntityId = version.Id.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = beforeVersionCode,
+            NewValue = version.VersionCode,
+            UserId = actorUserId,
+            UserCode = existing.CreatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "参数集版本更新"
+        }, ct);
     }
 
     /// <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块 → 五主题 JSON 投影，前端 API 兼容）</summary>
@@ -1564,22 +1664,42 @@ public class GovernanceVersionService : IGovernanceVersionService
         return version;
     }
 
-    /// <summary>创建策略包版本（P0-02：强制 DRAFT；治理字段置空）</summary>
-    public async Task<StrategyProfileVersion> CreateStrategyProfileVersionAsync(StrategyProfileVersion version, string? createdBy, CancellationToken ct = default)
+    /// <summary>创建策略包版本（P0-02：强制 DRAFT；治理字段置空；P1-04：Create 审计+预检）</summary>
+    public async Task<StrategyProfileVersion> CreateStrategyProfileVersionAsync(StrategyProfileVersion version, string? createdBy, int actorUserId, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;
         version.ApprovedAt = null;
         version.ApprovedBy = null;
 
-        return await _strategyProfileVersionRepository.AddAsync(version, ct);
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var created = await _strategyProfileVersionRepository.AddAsync(version, ct);
+
+        // P1-04 审计日志：记录创建操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Create",
+            EntityType = "StrategyProfileVersion",
+            EntityId = created.Id.ToString(),
+            VersionCode = created.VersionCode,
+            OldValue = null,
+            NewValue = created.VersionCode,
+            UserId = actorUserId,
+            UserCode = createdBy,
+            OccurredAt = DateTime.Now,
+            Remark = "策略包版本创建"
+        }, ct);
+
+        return created;
     }
 
-    /// <summary>更新策略包版本（P0-02：已发布/失效/归档不可改；Status/治理字段/引用字段冻结）</summary>
-    public async Task UpdateStrategyProfileVersionAsync(long strategyProfileVersionId, StrategyProfileVersion version, CancellationToken ct = default)
+    /// <summary>更新策略包版本（P0-02：已发布/失效/归档不可改；Status/治理字段/引用字段冻结；P1-04：Update 审计+预检）</summary>
+    public async Task UpdateStrategyProfileVersionAsync(long strategyProfileVersionId, StrategyProfileVersion version, int actorUserId, CancellationToken ct = default)
     {
         var existing = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct)
             ?? throw new InvalidOperationException($"策略包版本不存在：{strategyProfileVersionId}");
@@ -1599,6 +1719,26 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
 
+        var beforeVersionCode = existing.VersionCode;
+
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
+
+        // P1-04 审计日志：记录更新操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Update",
+            EntityType = "StrategyProfileVersion",
+            EntityId = version.Id.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = beforeVersionCode,
+            NewValue = version.VersionCode,
+            UserId = actorUserId,
+            UserCode = existing.CreatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "策略包版本更新"
+        }, ct);
     }
 }

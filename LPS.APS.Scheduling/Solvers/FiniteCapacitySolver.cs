@@ -31,37 +31,114 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         DomainSolveRequest request,
         CancellationToken cancellationToken = default)
     {
+        // ── V1_4 NEW-06：**未开计数作用域时自动建立** ──
+        //   复审 NEW-06 判词（本号位核对：**成立**）：V1_3 的预算快照只写 `SolverDiagnostics.Current`
+        //   （`AsyncLocal`），而正常生产 Run **从未** `BeginScope()` ⇒ 全部记录静默丢弃 ⇒
+        //   预算诊断**不是**生产 Run 的正式快照。
+        //   ⇒ 入口自动建作用域（调用方**已开**则沿用其作用域，压测工装读计数的语义不变），
+        //     使 Phase 计时 / 计数器 / 预算快照在**任何** Run 下都被记录（作用域在本方法返回前释放）。
+        //   成本：每次 Run 一个小对象 + 5 个 Phase 计时器（相对一次完整排程可忽略）；
+        //     另有一条**与作用域无关**的进程级可检索快照（`SolverDiagnostics.LastRunBudgetSnapshot`）。
+        if (SolverDiagnostics.HasScope)
+        {
+            return await SolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+
+        using var autoScope = SolverDiagnostics.BeginScope();
+        return await SolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 五阶段排程主体（V1_4 NEW-06 起由 <see cref="SolveAsync"/> 包裹一层诊断作用域后调用）。
+    /// </summary>
+    private async Task<DomainSolveResult> SolveCoreAsync(
+        DomainSolveRequest request,
+        CancellationToken cancellationToken = default)
+    {
         var startTime = DateTime.UtcNow;
+
+        // ── Phase 边界计时（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九 / §十四 第三优先级）──
+        //   V1_4 NEW-06 起：`SolveAsync` 入口已保证作用域存在（自动或调用方显式）⇒ `StartPhase()` 恒非 null；
+        //   直调本方法（仅测试/内部）时仍按旧口径「无作用域 ⇒ 零开销、零行为影响」。
+        //   压测工装在调用 `SolveAsync` 前开 scope 即可拿到 Phase1Ms..Phase5Ms（不触碰 Core 契约 DTO）。
 
         // ═══════════════════════════════════════════════
         // Phase 1: 硬约束构建
         // ═══════════════════════════════════════════════
         var phase1 = new PhaseOneConstraintBuilder();
-        var constraints = phase1.BuildConstraints(request);
+        var p1 = SolverDiagnostics.StartPhase();
+        ConstraintContext constraints;
+        try
+        {
+            constraints = phase1.BuildConstraints(request);
+        }
+        catch (SolverInputContractException ex)
+        {
+            // P0-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：输入无法满足冻结契约的唯一标识要求
+            //   ⇒ **受控 Fail Closed**（不向外抛未处理异常、**不静默抹除锚点**）。
+            SolverDiagnostics.EndPhase(p1, 1);
+            return await Task.FromResult(new DomainSolveResult
+            {
+                Success = false,
+                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                Summary = new SolveSummary
+                {
+                    ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
+                }
+            });
+        }
+        SolverDiagnostics.EndPhase(p1, 1);
 
         // ═══════════════════════════════════════════════
         // Phase 2: 初始有限产能排程
         // ═══════════════════════════════════════════════
         var phase2 = new PhaseTwoInitialScheduler();
-        var scheduleResult = phase2.Schedule(request, constraints);
+        var p2 = SolverDiagnostics.StartPhase();
+        InitialScheduleResult scheduleResult;
+        try
+        {
+            scheduleResult = phase2.Schedule(request, constraints);
+        }
+        catch (SolverInputContractException ex)
+        {
+            // P0-03（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：Phase2 发现**锁定数量闭合不自洽**
+            //   （锁定覆盖量超出需求总量）时同样走**受控 Fail Closed**，不带着负的剩余数量继续排程。
+            SolverDiagnostics.EndPhase(p2, 2);
+            return await Task.FromResult(new DomainSolveResult
+            {
+                Success = false,
+                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                Summary = new SolveSummary
+                {
+                    ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
+                }
+            });
+        }
+        SolverDiagnostics.EndPhase(p2, 2);
 
         // ═══════════════════════════════════════════════
         // Phase 3: 可行性与延期诊断
         // ═══════════════════════════════════════════════
         var phase3 = new PhaseThreeDiagnostics();
+        var p3 = SolverDiagnostics.StartPhase();
         var diagnostics = phase3.Diagnose(request, scheduleResult, constraints);
+        SolverDiagnostics.EndPhase(p3, 3);
 
         // ═══════════════════════════════════════════════
         // Phase 4: 有界局部修复
         // ═══════════════════════════════════════════════
         var phase4 = new PhaseFourLocalRepair();
+        var p4 = SolverDiagnostics.StartPhase();
         var repairResult = phase4.Repair(request, scheduleResult, diagnostics, constraints);
+        SolverDiagnostics.EndPhase(p4, 4);
 
         // ═══════════════════════════════════════════════
         // Phase 5: 压缩空隙与最终评价
         // ═══════════════════════════════════════════════
         var phase5 = new PhaseFiveCompression();
+        var p5 = SolverDiagnostics.StartPhase();
         var finalResult = phase5.Compress(request, scheduleResult, repairResult, diagnostics, constraints);
+        SolverDiagnostics.EndPhase(p5, 5);
 
         // 补充耗时统计
         var elapsed = (long)(DateTime.UtcNow - startTime).TotalMilliseconds;

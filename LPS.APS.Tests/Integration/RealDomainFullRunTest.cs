@@ -373,7 +373,7 @@ public class RealDomainFullRunTest
             return (existingRunId.Value, existing.Value, true);
         }
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var expectedDomainKeysJson = System.Text.Json.JsonSerializer.Serialize(new[] { DomainKey });
 
         var runId = await _connectionManager.QueryFirstOrDefaultAsync<int>(

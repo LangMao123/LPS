@@ -505,6 +505,10 @@ internal class PhaseThreeDiagnostics
     /// <summary>
     /// 计算资源利用率
     /// </summary>
+    /// <remarks>
+    /// OWN-P0-01（2026-10-10）：<paramref name="planningEnd"/> **不再单独决定分母**（90 天非资源时间终点）；
+    /// 形参保留为**统计窗的默认上界**（见下方 AUD-1-R03），调用点不变。
+    /// </remarks>
     private Dictionary<int, decimal> CalculateResourceUtilization(
         List<FinalTaskDraft> tasks,
         ConstraintContext constraints,
@@ -514,6 +518,21 @@ internal class PhaseThreeDiagnostics
         var utilization = new Dictionary<int, decimal>();
 
         var tasksByResource = tasks.GroupBy(t => t.ResourceId);
+
+        // ── AUD-1-R03（0号位 2026-10-10《APS_V1_2_20261010.md》§4，RISK_UNVERIFIED）：**合理统计区间** ──
+        //   复审疑点（本号位核对：**成立**）：OWN-P0-01 把分母从 `[planningStart, planningEnd]` 扩到
+        //     「全部未来日历窗」（上界 = ∞）后，若维护日历延伸到数年之后，分母被**无限放大** ⇒ 利用率被
+        //     **稀释**到近 0 ⇒ Auto 瓶颈识别（`> BottleneckUtilizationThreshold`）失效、产能短缺根因失真。
+        //   修法 = 统计窗 **下界不变**（`planningStart`）、**上界 = max(planningEnd, 本轮全部任务的最晚完成)**：
+        //     · 全部任务落在 `[planningStart, planningEnd]` 内（既有测试与常见几何）⇒ 与**整改前逐字相同**（零回归）；
+        //     · 任务合法落到 90 天之后（P0-01 修复后的新几何）⇒ 窗口随真实负荷延长，**既不高估（不 >1）也不稀释**；
+        //     · **不**把 90 天重新当作排程硬截止 —— 这里只是**诊断统计窗**，不参与任何
+        //       可行性 / 搜索 / Merge / Repair / Unscheduled 判定（与 `FindForwardSlot` 的时间口径不冲突）。
+        var horizonEnd = planningEnd;
+        foreach (var t in tasks)
+        {
+            if (t.PlannedEndTime > horizonEnd) horizonEnd = t.PlannedEndTime;
+        }
 
         foreach (var group in tasksByResource)
         {
@@ -528,9 +547,16 @@ internal class PhaseThreeDiagnostics
             var availableMinutes = 0.0;
             if (constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar))
             {
-                availableMinutes = calendar
-                    .Where(c => c.Start >= planningStart && c.End <= planningEnd)
-                    .Sum(c => (c.End - c.Start).TotalMinutes);
+                foreach (var window in calendar)
+                {
+                    // 与统计窗 `[planningStart, horizonEnd]` 求交后累加（空交 ⇒ 不计）。
+                    var start = window.Start > planningStart ? window.Start : planningStart;
+                    var end = window.End < horizonEnd ? window.End : horizonEnd;
+                    if (end > start)
+                    {
+                        availableMinutes += (end - start).TotalMinutes;
+                    }
+                }
             }
 
             if (availableMinutes > 0)
