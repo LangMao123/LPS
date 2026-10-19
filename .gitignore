@@ -41,6 +41,10 @@ settings.json.claude
 .env.*.local
 
 # ===== 你要求的 SQL、MD、DOC 文档（留在 SVN，不上传 GitHub）=====
+# Database/ 整目录（脚本＋收据＋附件）一律不进 GitHub：按扩展名挡不住 .diff/.txt 等，
+# 会让 Git 面板把回执件列成「未跟踪」，故按目录整体忽略。
+Database/
+*.diff
 *.sql
 *.doc
 *.docx
