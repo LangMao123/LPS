@@ -64,13 +64,15 @@ public class OrderLoadingService : IOrderLoadingService
     public async Task<int> LoadOrdersToActivePlanVersionsAsync(CancellationToken cancellationToken = default)
     {
         // 白天候选的订单池 = 当前 ACTIVE PlanVersion（用户从这里选单做插单试排）。
+        // 口径回退（2026-10-15，B）：正式采用记在 **Status='ACTIVE'** ——
+        // 冻结 DDL 08:8723 逐字「正式采用直接通过 PlanVersion.Status = ACTIVE 表示」＋ 08:4057 唯一索引谓词同列。
         var activeIds = (await _connectionManager.QueryAsync<int>(
             "SELECT Id FROM PlanVersion WHERE Status = 'ACTIVE'",
             db: DatabaseId.APS)).ToList();
 
         if (activeIds.Count == 0)
         {
-            _logger.LogWarning("白天订单装载：无 ACTIVE PlanVersion，跳过（候选插单依赖 ACTIVE 作为订单池；请先完成一次夜间 FULL 并激活）");
+            _logger.LogWarning("白天订单装载：无 ACTIVE PlanVersion（Status='ACTIVE'），跳过（候选插单依赖 ACTIVE 作为订单池；请先完成一次夜间 FULL 并激活）");
             return 0;
         }
 
@@ -105,7 +107,7 @@ public class OrderLoadingService : IOrderLoadingService
             @"SELECT oc.OrderNo, oc.MaterialCode, oc.FactoryCode, m.ProductFamilyId
               FROM Order_Canonical oc
               LEFT JOIN Material m ON oc.MaterialCode = m.MaterialCode
-              WHERE oc.Status IN ('Open', 'Released')
+              WHERE oc.Status = N'OPEN'
                 AND oc.DueDate BETWEEN GETDATE() AND DATEADD(DAY, 90, GETDATE())
                 AND NOT EXISTS (
                     SELECT 1 FROM [Order] o

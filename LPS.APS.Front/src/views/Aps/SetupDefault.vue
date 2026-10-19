@@ -1,26 +1,26 @@
 <!--
-  APS V1 4号位 — 默认（DEFAULT）Setup 规则维护（v1.5 Setup 专项 §4，页面 2.2）
+  APS V1 4号位 — 默认换型（DEFAULT）规则维护
+  依据：frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
+   - §四 正式默认规则粒度：生产部门 + 大工艺 + 当前工序 + 设备 → DefaultSetupMinutes
+   - §五 第二优先：明确产品对规则不存在时命中本规则
+   - §19.2 4号位「默认规则维护」
 
-  职责：DEFAULT 规则 CRUD（5 元组：Department/Stage/Operation/Resource + RuleSetVersionId）
-  命中语义（§9）：EXACT > DEFAULT > 0 分钟兜底 —— DEFAULT 是"该工序 + 设备下任意产品转换"的兜底规则
-  入口联动（§5.4）：从页面 2.3 "去补 DEFAULT" 跳转带入 query 预填 4 字段，自动打开新增 Dialog
+  职责：DEFAULT 规则 CRUD（5 元组：部门/大工艺/工序/设备 + RuleSetVersionId）
+  入口联动：从「缺失规则查询」跳转带入 query 预填 4 字段，自动打开新增 Dialog
 
-  红线（§7.1 + §7.2）：
-   - DEFAULT 必须 FromMaterial/ToMaterial 都空（表单不渲染产品字段，与 EXACT 互斥）
-   - SetupMinutes > 0（Dialog 内拦截）
-   - 仅 DRAFT 状态的 RuleSetVersion 可编辑（PUBLISHED/ACTIVE → 按钮 disabled + Tooltip）
+  页面内已落实的校验：
+   - DEFAULT 不带前后产品（表单不渲染产品字段，与 EXACT 互斥）
+   - 换型分钟 > 0（Dialog 内拦截）
+   - 仅 DRAFT 状态的规则集版本可编辑（其余状态 → 按钮 disabled + Tooltip 说明原因）
    - 同 5 元组重复（EXACT+DEFAULT / DEFAULT+DEFAULT）→ 后端 422 原文透传
 
   权限：aps.setup.view（查看）+ aps.setup.edit（CRUD）
-
-  架构：复用 StrategyProfiles.vue 五段式（加载 / 过滤 / 表格 / Dialog / 二次确认 / 红线注释）
 -->
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import dayjs from 'dayjs'
 import {
   ElAlert,
   ElButton,
@@ -46,14 +46,16 @@ import {
   type SetupDialogPrefill,
   type SetupRuleDto
 } from '@/api/aps-v1'
-import SetupRedlineAlert from './components/SetupRedlineAlert.vue'
+import { formatUtcDateTimeSec } from '@/utils/datetime'
 import SetupDefaultDialog from './components/SetupDefaultDialog.vue'
+import { useSetupMasterData } from './composables/useSetupMasterData'
 
 defineOptions({ name: 'ApsSetupDefault' })
 
 const route = useRoute()
 const defaultStore = useSetupDefaultStore()
 const apsAuth = useApsAuthStore()
+const masterData = useSetupMasterData()
 
 const {
   rules,
@@ -69,9 +71,28 @@ const {
   ruleCount
 } = storeToRefs(defaultStore)
 
-// ===== 过滤（部门/大工艺 客户端过滤，规则量级 < 1000，§13 性能允许） =====
+// ===== 过滤 =====
+// 10-15 4号位：同 SetupExact —— 部门/大工艺选项改取「当前版本规则里真实出现过」的，
+// 不再列 lookups 全量主数据（否则选一个没有规则的部门必然 0 条且无从预判）。
 const filterDepartment = ref<string>('')
 const filterStage = ref<string>('')
+
+const departmentOptions = computed(() => {
+  const used = new Set(rules.value.map((r) => r.departmentCode).filter(Boolean))
+  return masterData.departments.value.filter((d) => used.has(d.value))
+})
+
+/** 大工艺选项随部门级联收窄 */
+const stageOptions = computed(() => {
+  const dept = filterDepartment.value
+  const used = new Set(
+    rules.value
+      .filter((r) => !dept || r.departmentCode === dept)
+      .map((r) => r.stageCode)
+      .filter(Boolean)
+  )
+  return masterData.stages.value.filter((s) => used.has(s.value))
+})
 
 const filteredRules = computed<SetupRuleDto[]>(() => {
   return rules.value.filter((r) => {
@@ -79,6 +100,17 @@ const filteredRules = computed<SetupRuleDto[]>(() => {
     if (filterStage.value && r.stageCode !== filterStage.value) return false
     return true
   })
+})
+
+watch(filterDepartment, () => {
+  if (filterStage.value && !stageOptions.value.some((s) => s.value === filterStage.value)) {
+    filterStage.value = ''
+  }
+})
+
+watch(selectedRuleSetVersionId, () => {
+  filterDepartment.value = ''
+  filterStage.value = ''
 })
 
 // ===== Dialog 状态 =====
@@ -100,8 +132,9 @@ async function loadAll() {
 }
 
 onMounted(async () => {
+  void masterData.loadAll()
   await loadAll()
-  // 页面 2.3 "去补 DEFAULT" 跳转预填（§5.4：4 字段）
+  // 「缺失规则查询」跳转预填（4 字段）
   const q = route.query
   if (q.operationCode && canWrite.value && canEdit.value) {
     dialogPrefill.value = {
@@ -121,7 +154,7 @@ async function handleVersionChange(versionId: number | null) {
   }
 }
 
-// ===== CRUD 操作（§7.2：仅 DRAFT 可编辑，按钮 disabled + store 双保险） =====
+// ===== CRUD 操作（仅 DRAFT 可编辑，按钮 disabled + store 双保险） =====
 function openCreateDialog() {
   if (!canWrite.value) {
     ElMessage.warning('当前操作者无编辑权限，请联系系统管理员授予')
@@ -149,7 +182,7 @@ async function handleDelete(rule: SetupRuleDto) {
   let confirmed = false
   try {
     await ElMessageBox.confirm(
-      `即将删除默认换型规则（DEFAULT）：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode}（${rule.setupMinutes} 分钟）。删除后该 5 元组的转换将回退 0 分钟兜底。是否继续？`,
+      `即将删除默认换型规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode}（${rule.setupMinutes} 分钟）。删除后该 5 元组的转换将回退 0 分钟兜底。是否继续？`,
       '删除确认',
       {
         type: 'warning',
@@ -166,7 +199,7 @@ async function handleDelete(rule: SetupRuleDto) {
 
   const ok = await defaultStore.deleteRule(rule.id)
   if (ok) {
-    ElMessage.success('默认换型规则（DEFAULT）删除成功')
+    ElMessage.success('默认换型规则删除成功')
   } else if (defaultStore.error) {
     ElMessage.error(defaultStore.error)
   }
@@ -177,10 +210,6 @@ function handleSaved() {
 }
 
 // ===== 格式化 =====
-function formatDateTime(iso?: string | null) {
-  return iso ? dayjs(iso).format('YYYY-MM-DD HH:mm:ss') : '—'
-}
-
 function getStatusTag(status: string) {
   // 版本选择器传治理六态、规则行传派生三态；两表 DRAFT 同义，其余键不重叠，合并回退安全
   const meta =
@@ -202,9 +231,9 @@ const editDisabledReason = computed<string>(() => {
     <!-- 页面头部 -->
     <div class="page-header">
       <div class="header-left">
-        <h2>默认换型规则（DEFAULT）</h2>
+        <h2>默认换型规则</h2>
         <p class="subtitle"
-          >无前后产品的兜底换型规则；命中优先级：明确转换规则 &gt; 默认换型规则 &gt; 0 分钟</p
+          >无前后产品的兜底换型规则；命中优先级：明确产品转换规则 &gt; 默认换型规则 &gt; 0 分钟</p
         >
       </div>
       <div class="header-right">
@@ -215,9 +244,6 @@ const editDisabledReason = computed<string>(() => {
         </ElTooltip>
       </div>
     </div>
-
-    <!-- 红线 Alert（§7.1 + §7.2） -->
-    <SetupRedlineAlert page-type="default" />
 
     <!-- 错误提示 -->
     <ElAlert
@@ -256,16 +282,38 @@ const editDisabledReason = computed<string>(() => {
         </ElCol>
         <ElCol :span="5">
           <div class="selector-label">部门筛选</div>
-          <ElSelect v-model="filterDepartment" placeholder="全部" clearable style="width: 100%">
-            <ElOption label="DEPT_A（注塑车间）" value="DEPT_A" />
-            <ElOption label="DEPT_B（装配车间）" value="DEPT_B" />
+          <ElSelect
+            v-model="filterDepartment"
+            placeholder="全部"
+            no-data-text="当前版本没有配规则的部门"
+            clearable
+            filterable
+            :loading="masterData.loading.value"
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in departmentOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
           </ElSelect>
         </ElCol>
         <ElCol :span="5">
           <div class="selector-label">大工艺筛选</div>
-          <ElSelect v-model="filterStage" placeholder="全部" clearable style="width: 100%">
-            <ElOption label="STAGE_1（注塑工艺）" value="STAGE_1" />
-            <ElOption label="STAGE_2（装配工艺）" value="STAGE_2" />
+          <ElSelect
+            v-model="filterStage"
+            placeholder="全部"
+            no-data-text="该部门下没有配规则的大工艺"
+            clearable
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in stageOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
           </ElSelect>
         </ElCol>
         <ElCol :span="6">
@@ -274,7 +322,7 @@ const editDisabledReason = computed<string>(() => {
             <span>
               <ElButton type="primary" :disabled="!!editDisabledReason" @click="openCreateDialog">
                 <Icon icon="vi-ep:plus" class="mr-4" />
-                新增默认换型规则（DEFAULT）
+                新增默认换型规则
               </ElButton>
             </span>
           </ElTooltip>
@@ -310,7 +358,7 @@ const editDisabledReason = computed<string>(() => {
         :data="filteredRules"
         border
         stripe
-        empty-text="该版本下暂无默认换型规则（未命中明确转换规则的转换将回退 0 分钟兜底）"
+        empty-text="该版本下暂无默认换型规则（未命中明确产品转换规则的转换将回退 0 分钟兜底）"
       >
         <ElTableColumn type="index" label="#" width="50" />
         <ElTableColumn prop="departmentCode" label="部门" width="110" />
@@ -339,7 +387,7 @@ const editDisabledReason = computed<string>(() => {
         <!-- 09-20 交付回执偏差 #1：remark 字段撤除（备注列移除） -->
         <ElTableColumn prop="updatedAt" label="更新时间" width="170">
           <template #default="{ row }">
-            {{ formatDateTime(row.updatedAt ?? row.createdAt) }}
+            {{ formatUtcDateTimeSec(row.updatedAt ?? row.createdAt) }}
           </template>
         </ElTableColumn>
         <ElTableColumn label="操作" width="140" fixed="right">

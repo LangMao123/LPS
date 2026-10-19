@@ -153,7 +153,7 @@ export interface GanttTaskDto {
   /** Section 11：上游 Stage 名称 */
   upstreamStageCode?: string
   /**
-   * v1.5 §9/§10 SetupSource：Setup 规则命中优先级（5 号位 R3 联调知会 2026-09-21 确认）
+   * SetupSource 5 值：Setup 规则命中优先级（Setup 专项指导 v1.2 §五；5 号位 R3 联调知会 2026-09-21 确认）
    *   - EXACT / DEFAULT / SAME_PRODUCT / NONE / INITIAL（大写字符串，与后端 [Task].[SetupSource] NVARCHAR(50) 严格对齐）
    *   - nullable：1 号位 数据未填充前为 undefined；UI 渲染按 SETUP_SOURCE_META 查表
    *   - 0 号位 Q4 裁决：INITIAL 与 NONE 严格分开，UI 不得合并

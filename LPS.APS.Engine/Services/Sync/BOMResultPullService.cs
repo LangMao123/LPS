@@ -68,16 +68,21 @@ public class BOMResultPullService : IBOMResultPullService
     }
 
     /// <inheritdoc />
-    public async Task<string?> FindReadyBatchAsync(CancellationToken cancellationToken = default)
+    public async Task<string?> FindReadyBatchAsync(string expectedBatchNo, CancellationToken cancellationToken = default)
     {
-        var sql = @"
-            SELECT TOP 1 BatchNo
-            FROM MES_API_BOM_Request
-            WHERE Status = 'READY'
-              AND ExpandedRowCount > 0
-            ORDER BY CompletedAt DESC";
+        // 必传批号；空/空白 **不回落**到「任意最新 READY」（0号位 2026-10-17 §三.C）。
+        if (string.IsNullOrWhiteSpace(expectedBatchNo))
+            return null;
 
-        return await _connectionManager.QueryFirstOrDefaultAsync<string>(sql, db: DatabaseId.ODS);
+        var sql = @"
+            SELECT BatchNo
+            FROM MES_API_BOM_Request
+            WHERE BatchNo = @BatchNo
+              AND Status = 'READY'
+              AND ExpandedRowCount > 0";
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            sql, new { BatchNo = expectedBatchNo.Trim() }, db: DatabaseId.ODS);
     }
 
     /// <inheritdoc />
@@ -219,13 +224,29 @@ public class BOMResultPullService : IBOMResultPullService
     }
 
     /// <inheritdoc />
-    public async Task<BOMIntakeResult> IntakeLatestReadyBatchAsync(IReadOnlyList<int> planVersionIds, CancellationToken cancellationToken = default)
+    public async Task<BOMIntakeResult> IntakeNightBatchAsync(
+        IReadOnlyList<int> planVersionIds,
+        string? expectedBatchNo = null,
+        CancellationToken cancellationToken = default)
     {
-        var batchNo = await FindReadyBatchAsync(cancellationToken);
+        if (string.IsNullOrWhiteSpace(expectedBatchNo))
+        {
+            var night = await BomNightBatchResolver.ResolveAsync(_connectionManager, DateTime.Now, cancellationToken);
+            if (!night.IsUnique)
+            {
+                _logger.LogWarning("独立接货：{Reason}，跳过接货（不回落任意最新 READY）", night.Reason);
+                return new BOMIntakeResult { BatchNo = null, PulledCount = 0 };
+            }
+
+            expectedBatchNo = night.BatchNo;
+        }
+
+        var batchNo = await FindReadyBatchAsync(expectedBatchNo!, cancellationToken);
 
         if (batchNo == null)
         {
-            _logger.LogWarning("独立接货：未找到 READY 状态的 BOM 批次，跳过接货");
+            _logger.LogWarning(
+                "独立接货：指定批次 {BatchNo} 未达到 READY（或展开行数为 0），跳过接货", expectedBatchNo);
             return new BOMIntakeResult { BatchNo = null, PulledCount = 0 };
         }
 
@@ -247,9 +268,14 @@ public class BOMResultPullService : IBOMResultPullService
         // 清空全表（与 APS_BOM_RAW 同策略，只保留最新批次；事务内可回滚）
         await connection.ExecuteAsync("TRUNCATE TABLE APS_BOM_STAGE_PATH_RAW", transaction: transaction);
 
+        // ⚠【部署顺序】本 SELECT 起会写 `WorksetId` ⇒ **目标表必须先补上该列**：
+        //   `Database/Scripts/APS/03_SQL脚本/APS_BOM_STAGE_PATH_RAW_add_WorksetId_col_20261016.sql`
+        //   若先上新二进制、后跑脚本，BulkCopy 会因「目标表无此列」直接抛错、**整条夜间链断在这一步**。
+        //   该列是冻结 DDL 本就要求的（`08 v5.1.8.7 :2008`），本处只是把漏搬的那一列搬回来。
         var sourceSql = @"
             SELECT
                 BatchNo,
+                WorksetId,
                 BOMNO,
                 StageScopeType,
                 ParentMaterialCode,
@@ -264,6 +290,7 @@ public class BOMResultPullService : IBOMResultPullService
         var columnMappings = new Dictionary<string, string>
         {
             ["BatchNo"] = "BatchNo",
+            ["WorksetId"] = "WorksetId",
             ["BOMNO"] = "BOMNO",
             ["StageScopeType"] = "StageScopeType",
             ["ParentMaterialCode"] = "ParentMaterialCode",

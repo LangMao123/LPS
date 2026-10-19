@@ -6,13 +6,17 @@
  *  - 5号位 2026-09-24《ResourceCalendar与ManualCapacity接口对接函》
  *
  * 结构（单页 3 Tab）：
- *  - Tab1 设备资源日历：resourceCandidates → 选中 resourceId → deviceWindows
+ *  - Tab1 设备资源日历：resources（资源主表 /api/resource） → 选中 resourceId → deviceWindows
  *  - Tab2 人工能力槽  ：slots（部门/工序过滤 + 含软删开关）
  *  - Tab3 人工槽日历  ：由 Tab2 选中行驱动 slotWindows
  *
+ * 10-12 RC23：撤过渡实现，资源主表切正式端点 G1（ResourceController.cs:34 GET /api/resource）
+ *  - 旧：listResourceCandidates 从 gantt.resources 派生 + closure 缓存；遗失未排资源
+ *  - 新：listResources 直接查 dbo.Resource 镜像；含 hasCalendar（列表级判日历状态）
+ *
  * 窗口按 id 缓存（`deviceWindowCache` / `slotWindowCache`）：
  *  - 命中缓存 = 已查证 → 可判"已配/未配"（v1.3 §九：无有效日历 = 不可用）
- *  - 未命中 = 未查证（G4：后端无 hasCalendar 字段，列表级无法批量判定）
+ *  - 未命中 = 未查证（G4 已闭环：后端 ResourceListItemDto.hasCalendar 列表级即可判定）
  *
  * 权限（按钮显隐，对齐后端 PermissionCodes.cs:82-96 六码）：
  *  - 设备：aps.resource_calendar.{view,edit,delete}
@@ -32,9 +36,9 @@ import {
   type ManualSlotCalendarBulkRequest,
   type ManualSlotCalendarDto,
   type ManualSlotQuery,
+  type Resource,
   type ResourceCalendarBulkRequest,
-  type ResourceCalendarEntryDto,
-  type ResourceCandidate
+  type ResourceCalendarEntryDto
 } from '@/api/aps-v1'
 import { useApsAuthStore } from './auth'
 
@@ -50,16 +54,22 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
   const apsAuth = useApsAuthStore()
 
   /* ===== Tab1：设备资源日历 ===== */
-  const resourceCandidates = ref<ResourceCandidate[]>([])
-  const candidateNote = ref<string>('')
-  const candidateIsFallback = ref<boolean>(true)
-  const candidateLoading = ref(false)
+  // 10-12 RC23 收：资源主表走正式端点 GET /api/resource（@see resourceCalendarApi.listResources）
+  //  - 旧过渡实现（listResourceCandidates）从 gantt.resources 派生 → 已撤
+  //  - 旧 candidateNote / candidateIsFallback 标记源提示 → 已撤（不再有"过渡/兜底"概念）
+  const resources = ref<Resource[]>([])
+  const resourcesLoading = ref(false)
   const currentResourceId = ref<number | null>(null)
   const deviceWindowCache = ref<Record<number, ResourceCalendarEntryDto[]>>({})
 
   /* ===== Tab2/3：人工能力槽 + 人工槽日历 ===== */
+  // 10-12 RC22 收：人工槽 Tab2 接入分页（5号位 落地 PageResult，dev 15360 records）
+  //  - 5 ref + 1 action 范式（@see taskSplitRuleConfig.ts:92-128）：list/total/page/pageSize/loading + loadSlots options
   const slots = ref<ManualCapacitySlotDto[]>([])
   const slotQuery = ref<ManualSlotQuery>({})
+  const slotTotal = ref<number>(0)
+  const slotPage = ref<number>(1)
+  const slotPageSize = ref<number>(20)
   const slotsLoading = ref(false)
   const departmentCandidates = ref<DepartmentCandidate[]>([])
   const currentSlotId = ref<number | null>(null)
@@ -80,11 +90,33 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
 
   /* ===== getters：数据 ===== */
 
-  /** 当前设备的窗口（未选/未查证 → 空数组） */
+  /** 当前设备的窗口（未选/未查证 → 空数组）—— **全量**，空态判断与状态徽标依赖它 */
   const deviceWindows = computed<ResourceCalendarEntryDto[]>(() => {
     const id = currentResourceId.value
     if (id == null) return []
     return deviceWindowCache.value[id] ?? []
+  })
+
+  /* 10-14 RC26 收：设备窗口列表分页（过渡期前端切片）
+   *  - 后端 GET /api/resource-calendar/{id} 仍返裸数组（已发函 5号位 改 PageResult）；
+   *    单资源上限 370 行（BulkCreate Days 1..370），前端切片完全撑得住，故先落地不等后端
+   *  - 5号位 落地后仅需把「切片」换成「取 res.items + res.total」，view 与分页组件不动
+   */
+  const deviceWindowPage = ref(1)
+  const deviceWindowPageSize = ref(20)
+
+  /** 当前设备窗口总条数（= 分页 total） */
+  const deviceWindowTotal = computed<number>(() => deviceWindows.value.length)
+
+  /** 当前页应渲染的行；越界时回落到最后一页，避免"删完最后一页"后空表 */
+  const deviceWindowPageRows = computed<ResourceCalendarEntryDto[]>(() => {
+    const all = deviceWindows.value
+    if (all.length === 0) return []
+    const size = deviceWindowPageSize.value
+    const maxPage = Math.max(1, Math.ceil(all.length / size))
+    if (deviceWindowPage.value > maxPage) deviceWindowPage.value = maxPage
+    const start = (deviceWindowPage.value - 1) * size
+    return all.slice(start, start + size)
   })
 
   /** 当前设备窗口是否已查证 */
@@ -131,20 +163,19 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
 
   /* ===== actions：Tab1 ===== */
 
-  /** 加载资源候选（过渡数据源；G1 正式端点缺失） */
-  async function loadResourceCandidates(): Promise<void> {
-    loading.value = true
+  /** 加载资源主表（GET /api/resource，10-12 RC23：撤过渡实现切正式端点） */
+  async function loadResources(
+    opts: { departmentId?: number; includeInactive?: boolean } = {}
+  ): Promise<void> {
+    resourcesLoading.value = true
     error.value = null
     try {
-      const res = await resourceCalendarApi.listResourceCandidates()
-      resourceCandidates.value = res.list
-      candidateNote.value = res.note
-      candidateIsFallback.value = res.isFallback
+      resources.value = await resourceCalendarApi.listResources(opts)
     } catch (err) {
       handleError(err)
-      resourceCandidates.value = []
+      resources.value = []
     } finally {
-      loading.value = false
+      resourcesLoading.value = false
     }
   }
 
@@ -166,6 +197,7 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     }
     loading.value = true
     error.value = null
+    if (currentResourceId.value !== resourceId) deviceWindowPage.value = 1
     currentResourceId.value = resourceId
     try {
       const rows = await resourceCalendarApi.getWindows(resourceId)
@@ -222,14 +254,28 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
 
   /* ===== actions：Tab2 / Tab3 ===== */
 
-  /** 查询人工槽主档（默认不含软删） */
-  async function loadSlots(query?: ManualSlotQuery): Promise<void> {
+  /** 查询人工槽主档（默认不含软删，10-12 RC22 收：接 pageIndex/pageSize + 后端回传覆盖） */
+  async function loadSlots(
+    query?: ManualSlotQuery,
+    options: { resetPage?: boolean; nextPageIndex?: number; nextPageSize?: number } = {}
+  ): Promise<void> {
     if (query) slotQuery.value = query
-    loading.value = true
+    if (options.resetPage) slotPage.value = 1
+    if (options.nextPageIndex != null) slotPage.value = options.nextPageIndex
+    if (options.nextPageSize != null) slotPageSize.value = options.nextPageSize
+    slotsLoading.value = true
     error.value = null
     try {
-      slots.value = await resourceCalendarApi.getSlots(slotQuery.value)
-      // 当前选中槽若已不在列表（被软删 / 被过滤）→ 清空 Tab3
+      const res = await resourceCalendarApi.getSlots({
+        ...slotQuery.value,
+        pageIndex: slotPage.value,
+        pageSize: slotPageSize.value
+      })
+      slots.value = res.items
+      slotTotal.value = res.total
+      slotPage.value = res.page
+      slotPageSize.value = res.pageSize
+      // 当前选中槽若已不在列表（被软删 / 被过滤 / 翻页不见）→ 清空 Tab3
       const id = currentSlotId.value
       if (id != null && !slots.value.some((s) => s.manualSlotId === id)) {
         const next = { ...slotWindowCache.value }
@@ -240,8 +286,9 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     } catch (err) {
       handleError(err)
       slots.value = []
+      slotTotal.value = 0
     } finally {
-      loading.value = false
+      slotsLoading.value = false
     }
   }
 
@@ -377,14 +424,17 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
 
   return {
     // state
-    resourceCandidates,
-    candidateNote,
-    candidateIsFallback,
-    candidateLoading,
+    resources,
+    resourcesLoading,
     currentResourceId,
     deviceWindowCache,
+    deviceWindowPage,
+    deviceWindowPageSize,
     slots,
     slotQuery,
+    slotTotal,
+    slotPage,
+    slotPageSize,
     slotsLoading,
     departmentCandidates,
     currentSlotId,
@@ -402,13 +452,15 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     // getters：数据
     deviceWindows,
     deviceWindowsLoaded,
+    deviceWindowTotal,
+    deviceWindowPageRows,
     deviceCalendarStatus,
     deviceStatusCount,
     slotCalendarStatus,
     slotWindows,
     currentSlot,
     // actions
-    loadResourceCandidates,
+    loadResources,
     loadDepartmentCandidates,
     loadDeviceWindows,
     createDeviceWindows,

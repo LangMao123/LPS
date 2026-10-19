@@ -1,27 +1,28 @@
 <!--
-  APS V1 4号位 — 明确产品转换（EXACT）Setup 规则维护（v1.5 Setup 专项 §3，页面 2.1）
+  APS V1 4号位 — 明确产品转换（EXACT）规则维护
+  依据：frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
+   - §五 第一优先：部门+大工艺+当前工序+设备+前产品+后产品 → 该 SetupMinutes
+   - §19.2 4号位「明确产品转换维护」：共同合法设备来自 OperationResourceEligibility
 
-  职责：EXACT 规则 CRUD（7 元组：Department/Stage/Operation/Resource/FromMaterial/ToMaterial + RuleSetVersionId）
-  核心流程（§3.3）：新增时选定 Operation + From/To Material → 调共同合法设备推荐端点 → 设备下拉只展示交集
-  入口联动（§5.4）：从页面 2.3 "去补 EXACT" 跳转带入 query 预填 6 字段，自动打开新增 Dialog
+  职责：EXACT 规则 CRUD（7 元组：部门/大工艺/工序/设备/前产品/后产品 + RuleSetVersionId）
+  命中语义（§五）：明确产品转换 > 默认换型 > 0 分钟兜底 —— EXACT 是"指定前后产品"的精确换型
+  核心流程：新增时选定工序 + 前/后产品 → 调共同合法设备推荐端点 → 设备下拉只展示交集
+  入口联动：从「缺失规则查询」跳转带入 query 预填 6 字段，自动打开新增 Dialog
 
-  红线（§7.1 + §7.2）：
-   - 仅 DRAFT 状态的 RuleSetVersion 可编辑（PUBLISHED/ACTIVE → 新增/编辑/删除按钮 disabled + Tooltip）
-   - FromMaterial != ToMaterial（Dialog 内拦截）
-   - SetupMinutes > 0（Dialog 内拦截）
-   - 共同合法设备外不允许保存（Dialog 内拦截）
+  页面内已落实的校验：
+   - 仅 DRAFT 状态的规则集版本可编辑（其余状态 → 新增/编辑/删除按钮 disabled + Tooltip 说明原因）
+   - 前产品 != 后产品（Dialog 内拦截）
+   - 换型分钟 > 0（Dialog 内拦截）
+   - 共同合法设备之外不允许保存（Dialog 内拦截）
    - 同 7 元组重复 → 后端 422 原文透传
 
   权限：aps.setup.view（查看）+ aps.setup.edit（CRUD）
-
-  架构：复用 StrategyProfiles.vue 五段式（加载 / 过滤 / 表格 / Dialog / 二次确认 / 红线注释）
 -->
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import dayjs from 'dayjs'
 import {
   ElAlert,
   ElButton,
@@ -47,14 +48,16 @@ import {
   type SetupDialogPrefill,
   type SetupRuleDto
 } from '@/api/aps-v1'
-import SetupRedlineAlert from './components/SetupRedlineAlert.vue'
+import { formatUtcDateTimeSec } from '@/utils/datetime'
 import SetupExactDialog from './components/SetupExactDialog.vue'
+import { useSetupMasterData } from './composables/useSetupMasterData'
 
 defineOptions({ name: 'ApsSetupExact' })
 
 const route = useRoute()
 const exactStore = useSetupExactStore()
 const apsAuth = useApsAuthStore()
+const masterData = useSetupMasterData()
 
 const {
   rules,
@@ -70,9 +73,30 @@ const {
   ruleCount
 } = storeToRefs(exactStore)
 
-// ===== 过滤（部门/大工艺 客户端过滤，规则量级 < 1000，§13 性能允许） =====
+// ===== 过滤 =====
+// 10-15 4号位：部门/大工艺选项不再取「全量主数据」，改取「当前版本规则里真实出现过」的
+// 部门/大工艺。原来下拉列的是 lookups 的全部部门，用户选一个当前版本根本没有规则的部门 →
+// 列表必然 0 条且无从预判（与策略包版本页 698 条里 695 条是空选项同款问题）。
+// 过滤本身仍在客户端做（数据是后端真返回的整表，规则量级 < 1000），不是假数据。
 const filterDepartment = ref<string>('')
 const filterStage = ref<string>('')
+
+const departmentOptions = computed(() => {
+  const used = new Set(rules.value.map((r) => r.departmentCode).filter(Boolean))
+  return masterData.departments.value.filter((d) => used.has(d.value))
+})
+
+/** 大工艺选项随部门级联收窄：选了部门就只列该部门下真实出现过大工艺 */
+const stageOptions = computed(() => {
+  const dept = filterDepartment.value
+  const used = new Set(
+    rules.value
+      .filter((r) => !dept || r.departmentCode === dept)
+      .map((r) => r.stageCode)
+      .filter(Boolean)
+  )
+  return masterData.stages.value.filter((s) => used.has(s.value))
+})
 
 const filteredRules = computed<SetupRuleDto[]>(() => {
   return rules.value.filter((r) => {
@@ -80,6 +104,19 @@ const filteredRules = computed<SetupRuleDto[]>(() => {
     if (filterStage.value && r.stageCode !== filterStage.value) return false
     return true
   })
+})
+
+/** 换部门后，若原大工艺已不在收窄后的选项里则清空，避免留下一个必然 0 条的组合 */
+watch(filterDepartment, () => {
+  if (filterStage.value && !stageOptions.value.some((s) => s.value === filterStage.value)) {
+    filterStage.value = ''
+  }
+})
+
+/** 换规则集版本后原筛选值可能在新版本里不存在 → 两者都清空 */
+watch(selectedRuleSetVersionId, () => {
+  filterDepartment.value = ''
+  filterStage.value = ''
 })
 
 // ===== Dialog 状态 =====
@@ -101,8 +138,9 @@ async function loadAll() {
 }
 
 onMounted(async () => {
+  void masterData.loadAll()
   await loadAll()
-  // 页面 2.3 "去补 EXACT" 跳转预填（§5.4：6 字段）
+  // 「缺失规则查询」跳转预填（6 字段）
   const q = route.query
   if (q.fromMaterialCode && q.toMaterialCode && canWrite.value && canEdit.value) {
     dialogPrefill.value = {
@@ -124,7 +162,7 @@ async function handleVersionChange(versionId: number | null) {
   }
 }
 
-// ===== CRUD 操作（§7.2：仅 DRAFT 可编辑，按钮 disabled + store 双保险） =====
+// ===== CRUD 操作（仅 DRAFT 可编辑，按钮 disabled + store 双保险） =====
 function openCreateDialog() {
   if (!canWrite.value) {
     ElMessage.warning('当前操作者无编辑权限，请联系系统管理员授予')
@@ -152,7 +190,7 @@ async function handleDelete(rule: SetupRuleDto) {
   let confirmed = false
   try {
     await ElMessageBox.confirm(
-      `即将删除明确产品转换规则（EXACT）：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode} / ${rule.fromMaterialCode} → ${rule.toMaterialCode}（${rule.setupMinutes} 分钟）。删除后需重新发布版本才生效。是否继续？`,
+      `即将删除明确产品转换规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode} / ${rule.fromMaterialCode} → ${rule.toMaterialCode}（${rule.setupMinutes} 分钟）。删除后需重新发布版本才生效。是否继续？`,
       '删除确认',
       {
         type: 'warning',
@@ -169,7 +207,7 @@ async function handleDelete(rule: SetupRuleDto) {
 
   const ok = await exactStore.deleteRule(rule.id)
   if (ok) {
-    ElMessage.success('明确产品转换规则（EXACT）删除成功')
+    ElMessage.success('明确产品转换规则删除成功')
   } else if (exactStore.error) {
     ElMessage.error(exactStore.error)
   }
@@ -180,10 +218,6 @@ function handleSaved() {
 }
 
 // ===== 格式化 =====
-function formatDateTime(iso?: string | null) {
-  return iso ? dayjs(iso).format('YYYY-MM-DD HH:mm:ss') : '—'
-}
-
 function getStatusTag(status: string) {
   // 版本选择器传治理六态、规则行传派生三态；两表 DRAFT 同义，其余键不重叠，合并回退安全
   const meta =
@@ -205,8 +239,20 @@ const editDisabledReason = computed<string>(() => {
     <!-- 页面头部 -->
     <div class="page-header">
       <div class="header-left">
-        <h2>明确产品转换规则（EXACT）</h2>
-        <p class="subtitle">按工序维护"前产品 → 后产品"的换型分钟数，并推荐共同合法设备</p>
+        <h2>
+          明确产品转换
+          <ElTooltip placement="top" :width="340">
+            <template #content>
+              <div class="setup-hint">
+                <div>① 填了「前产品 → 后产品」的规则最准，排产时优先用它；</div>
+                <div>② 这一对没填，就用「默认换型规则」里同一个工序 + 设备的时间；</div>
+                <div>③ 两样都没填就按 0 分钟算——等于告诉系统「不用换」，交期风险由车间自己担。</div>
+              </div>
+            </template>
+            <Icon icon="vi-ep:question-filled" class="hint-icon" />
+          </ElTooltip>
+        </h2>
+        <p class="subtitle">填「什么产品换成什么产品、要多久」，排产时按这张表算设备换型时间</p>
       </div>
       <div class="header-right">
         <ElTooltip
@@ -216,9 +262,6 @@ const editDisabledReason = computed<string>(() => {
         </ElTooltip>
       </div>
     </div>
-
-    <!-- 红线 Alert（§7.1 + §7.2） -->
-    <SetupRedlineAlert page-type="exact" />
 
     <!-- 错误提示 -->
     <ElAlert
@@ -257,16 +300,38 @@ const editDisabledReason = computed<string>(() => {
         </ElCol>
         <ElCol :span="5">
           <div class="selector-label">部门筛选</div>
-          <ElSelect v-model="filterDepartment" placeholder="全部" clearable style="width: 100%">
-            <ElOption label="DEPT_A（注塑车间）" value="DEPT_A" />
-            <ElOption label="DEPT_B（装配车间）" value="DEPT_B" />
+          <ElSelect
+            v-model="filterDepartment"
+            placeholder="全部"
+            no-data-text="当前版本没有配规则的部门"
+            clearable
+            filterable
+            :loading="masterData.loading.value"
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in departmentOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
           </ElSelect>
         </ElCol>
         <ElCol :span="5">
           <div class="selector-label">大工艺筛选</div>
-          <ElSelect v-model="filterStage" placeholder="全部" clearable style="width: 100%">
-            <ElOption label="STAGE_1（注塑工艺）" value="STAGE_1" />
-            <ElOption label="STAGE_2（装配工艺）" value="STAGE_2" />
+          <ElSelect
+            v-model="filterStage"
+            placeholder="全部"
+            no-data-text="该部门下没有配规则的大工艺"
+            clearable
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in stageOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
           </ElSelect>
         </ElCol>
         <ElCol :span="6">
@@ -275,7 +340,7 @@ const editDisabledReason = computed<string>(() => {
             <span>
               <ElButton type="primary" :disabled="!!editDisabledReason" @click="openCreateDialog">
                 <Icon icon="vi-ep:plus" class="mr-4" />
-                新增明确产品转换规则（EXACT）
+                新增明确产品转换规则
               </ElButton>
             </span>
           </ElTooltip>
@@ -311,7 +376,7 @@ const editDisabledReason = computed<string>(() => {
         :data="filteredRules"
         border
         stripe
-        empty-text="该版本下暂无明确产品转换规则（可在「未维护查询」中筛选后补录）"
+        empty-text="该版本下暂无明确产品转换规则（可在「缺失规则查询」中筛选后补录）"
       >
         <ElTableColumn type="index" label="#" width="50" />
         <ElTableColumn prop="departmentCode" label="部门" width="100" />
@@ -342,7 +407,7 @@ const editDisabledReason = computed<string>(() => {
         <!-- 09-20 交付回执偏差 #1：remark 字段撤除（备注列移除） -->
         <ElTableColumn prop="updatedAt" label="更新时间" width="170">
           <template #default="{ row }">
-            {{ formatDateTime(row.updatedAt ?? row.createdAt) }}
+            {{ formatUtcDateTimeSec(row.updatedAt ?? row.createdAt) }}
           </template>
         </ElTableColumn>
         <ElTableColumn label="操作" width="140" fixed="right">
@@ -411,6 +476,18 @@ const editDisabledReason = computed<string>(() => {
   font-size: 20px;
   font-weight: 600;
   color: var(--el-text-color-primary);
+}
+
+.hint-icon {
+  margin-left: 4px;
+  font-size: 15px;
+  vertical-align: 2px;
+  cursor: help;
+  color: var(--el-text-color-secondary);
+}
+
+.setup-hint {
+  line-height: 1.7;
 }
 
 .header-left .subtitle {

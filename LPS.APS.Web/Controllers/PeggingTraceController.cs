@@ -45,7 +45,9 @@ public class PeggingTraceController : ControllerBase
         => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
-    /// 查询Pegging分配列表
+    /// 查询Pegging分配列表。
+    /// commitmentStatus 支持 'UNKNOWN'（=未标注，匹配 NULL，与汇总同口径）；
+    /// ⚠️ orderNo 依赖 RootOrderNo/CurrentOrderNo——dev 现全 NULL（写入侧归 2号位），实际筛选用 <c>rootOrderId</c>（100% 非空）。
     /// </summary>
     [HttpGet]
     public async Task<ApiResponse<List<PeggingTraceDto>>> Query(
@@ -55,6 +57,7 @@ public class PeggingTraceController : ControllerBase
         [FromQuery] string? commitmentStatus = null,
         [FromQuery] string? orderNo = null,
         [FromQuery] string? supplyDocumentNo = null,
+        [FromQuery] long? rootOrderId = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 100,
         CancellationToken cancellationToken = default)
@@ -69,7 +72,7 @@ public class PeggingTraceController : ControllerBase
 
             var result = await _service.QueryAsync(
                 planVersionId, materialCode, supplyType, commitmentStatus,
-                orderNo, supplyDocumentNo, skip, take, cancellationToken,
+                orderNo, supplyDocumentNo, rootOrderId, skip, take, cancellationToken,
                 allowedFactories);
 
             return ApiResponse<List<PeggingTraceDto>>.Success(result);

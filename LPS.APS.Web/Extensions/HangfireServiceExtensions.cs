@@ -72,11 +72,24 @@ public static class HangfireServiceExtensions
 
         // BOM展开请求推送（生产：每日00:00）
         // 从 Order_Canonical 划定活跃根集合，推送 BOMNO 到 ODS 库
-        // 后续：SQL Agent Job 00:05 执行 sp_ExpandBOMBatch 展开
+        // 后续：由下方 bom-batch-expand（00:05）调用 sp_ExpandBOMBatch_vNext 展开
         RecurringJob.AddOrUpdate<IBOMRequestService>(
             "bom-request-push",
             service => service.PushBOMRequestToODSAsync(CancellationToken.None),
             isDev ? NeverFireCron : "0 0 * * *",
+            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
+
+        // BOM批展开（生产：每日00:05）—— 调用 ODS 的 sp_ExpandBOMBatch_vNext，
+        // 展开**本次夜间**的推送批次（批号取自 APS_ETL_Log 的 BomRequestPush SUCCESS 记录，
+        // 恰好一条才算本次；0 条或多条一律 SKIPPED，不再扫描「最新 PENDING」猜选），供夜间链接货
+        // ⚠️ 排在 bom-request-push（00:00）之后、nightly-batch（00:30）之前 —— 接货依赖本步产出的 READY
+        // ⚠️ 调用具破坏性：该 SP 先清空四表再重建（2026-10-17 5号位 已将四条 TRUNCATE 移入 BEGIN TRAN）；
+        //    我方在调用前另查明细行数，0 条则拒绝调用（否则会清空四表）。失败转 Issue，不硬断。
+        // ⚠️ 该 SP 属 5号位 辖区，调用契约已于 2026-10-17 经其书面确认
+        RecurringJob.AddOrUpdate<IBomBatchExpandService>(
+            "bom-batch-expand",
+            service => service.ExpandNightBatchAsync(CancellationToken.None),
+            isDev ? NeverFireCron : "5 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 主数据同步-ERP（生产：每日00:10）— §2.4.3
@@ -161,7 +174,7 @@ public static class HangfireServiceExtensions
         // 管道供给同步（生产：每日00:55）— §6.6 SupplyFact_Pipeline
         // ⚠️ 排在 inventory-sync（00:35）之后，确保 MaterialMapping 已就绪供 MaterialCode 映射
         // ⚠️ 排在 domain-dependency-scan（01:50）和 scheduling（02:00）之前
-        // sp_SyncPipelineSupply → SupplyFact_Pipeline（V1 空跑；V1.1 起全量装载真实数据）
+        // sp_SyncPipelineSupply → SupplyFact_Pipeline（全量装载真实采购在途 ＋ 已到未入库）
         RecurringJob.AddOrUpdate<IPipelineSupplySyncService>(
             "pipeline-supply-sync",
             service => service.SyncAsync(CancellationToken.None),

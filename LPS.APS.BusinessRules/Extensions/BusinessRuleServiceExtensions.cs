@@ -1,4 +1,5 @@
 using System.Reflection;
+using LPS.APS.Core.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace LPS.APS.BusinessRules.Extensions;
@@ -24,7 +25,12 @@ public static class BusinessRuleServiceExtensions
                      t.Namespace.StartsWith("LPS.APS.BusinessRules.Services") ||
                      t.Namespace.StartsWith("LPS.APS.BusinessRules.Repositories") ||
                      t.Namespace.StartsWith("LPS.APS.BusinessRules.Loaders") ||
-                     t.Namespace.StartsWith("LPS.APS.BusinessRules.Converters"))))
+                     t.Namespace.StartsWith("LPS.APS.BusinessRules.Converters")) &&
+                    // 嵌套／异常／record 排除（谓词与 Application、Engine 侧扫描共用同一份）：
+                    // record 天生实现 IEquatable<T>，被 AsSelfWithInterfaces/AsImplementedInterfaces 当服务注册后
+                    // ValidateOnBuild 因构造参数无法解析而「启动即崩」——2026-10-13／10-17 两次实例见 ServiceScanFilters 注释。
+                    // 2026-10-17 2号位 指出本处缺此守卫；当时五个命名空间 record 数为 0，属潜在风险。
+                    ServiceScanFilters.IsServiceCandidate(t)))
                 .AsSelfWithInterfaces()
                 .WithScopedLifetime()
         );

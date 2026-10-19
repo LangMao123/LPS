@@ -1,7 +1,7 @@
 namespace LPS.APS.Core.Dto;
 
 /// <summary>
-/// Overview - 当前ACTIVE计划版本信息
+/// Overview - 当前ACTIVE计划版本信息（按 Domain 一行；R1-a：列表元素）
 /// </summary>
 public sealed class OverviewActivePlanDto
 {
@@ -13,6 +13,13 @@ public sealed class OverviewActivePlanDto
 
     /// <summary>DomainKey</summary>
     public string? DomainKey { get; init; }
+
+    /// <summary>
+    /// 版本生命周期状态（R1-a 补充字段）
+    /// 词表以冻结文档为准：BUILDING / CANDIDATE / ACTIVE / ARCHIVED / FAILED（+ 实现子状态 Computing）
+    /// 本端点只返 Status='ACTIVE' 的行，该字段供前端徽章渲染（ACTIVE = 已生效/已采用）
+    /// </summary>
+    public string Status { get; init; } = string.Empty;
 
     /// <summary>计划范围开始</summary>
     public DateTime PlanHorizonStart { get; init; }
@@ -34,36 +41,6 @@ public sealed class OverviewActivePlanDto
 
     /// <summary>创建时间</summary>
     public DateTime CreatedAt { get; init; }
-}
-
-/// <summary>
-/// Overview - 任务状态摘要
-/// </summary>
-public sealed class OverviewTaskSummaryDto
-{
-    /// <summary>PlanVersionId</summary>
-    public int PlanVersionId { get; init; }
-
-    /// <summary>总任务数</summary>
-    public int TotalTasks { get; init; }
-
-    /// <summary>On-time（按时完成）</summary>
-    public int OnTimeCount { get; init; }
-
-    /// <summary>Delayed（延期）</summary>
-    public int DelayedCount { get; init; }
-
-    /// <summary>Risk（风险）</summary>
-    public int RiskCount { get; init; }
-
-    /// <summary>Unscheduled（未排程）</summary>
-    public int UnscheduledCount { get; init; }
-
-    /// <summary>Estimated-only（仅估算，非正式承诺）</summary>
-    public int EstimatedOnlyCount { get; init; }
-
-    /// <summary>其他状态</summary>
-    public int OtherCount { get; init; }
 }
 
 /// <summary>
@@ -92,8 +69,38 @@ public sealed class OverviewResourceBottleneckDto
     /// <summary>负荷率（实际工时/可用工时，>1为过载）</summary>
     public decimal? UtilizationRate { get; init; }
 
-    /// <summary>是否Bottleneck</summary>
-    public bool IsBottleneck { get; init; }
+    /// <summary>
+    /// 是否瓶颈。<c>true</c>=判定为瓶颈；<c>false</c>=判定为非瓶颈；<c>null</c>=未判定。
+    /// ⚠️ Bottleneck 判定应由 2号位 正式 Query 提供，5号位不做二次计算；当前无数据源 ⇒
+    /// SQL 返回 <c>CAST(NULL AS BIT)</c>，叠加 WhenWritingNull ⇒ **键不出现**（与 UtilizationRate 同型，诚实表达"未判定"）。
+    /// 原 `bool` + `0 AS IsBottleneck` 会把"未判定"谎报成"判定为否"（4号位 10-19 C2-a，同 MesEligible 修法）。
+    /// C2-b（availableHours/plannedHours/loadRate 完整负荷率契约）待 Calendar 事实源排期。JSON: isBottleneck
+    /// </summary>
+    public bool? IsBottleneck { get; init; }
+
+    /// <summary>
+    /// 不可用窗口（R6，2026-10-16 定：口径 = **本级 OFF**）
+    /// 来源：资源级日历 `ResourceCalendarSlot.AvailableFlag = 0`（该设备明确停机时段），
+    /// 限定在该 PlanVersion 的计划范围内。无 OFF 行时为空数组（非 null）。
+    /// 注意：**不含**部门级/工厂级的继承 OFF（"三级合并 OFF"口径另议）。
+    /// </summary>
+    public List<OverviewUnavailableWindowDto> UnavailableWindows { get; init; } = new();
+}
+
+/// <summary>
+/// Overview - 资源不可用窗口（R6）
+/// 形状对齐 4号位 `ResourceSummaryItem.unavailableWindows`（from/to），并附 reason（原窗口 Remark）
+/// </summary>
+public sealed class OverviewUnavailableWindowDto
+{
+    /// <summary>窗口开始（含）</summary>
+    public DateTime From { get; init; }
+
+    /// <summary>窗口结束（不含）</summary>
+    public DateTime To { get; init; }
+
+    /// <summary>不可用原因（ResourceCalendarSlot.Remark，可空）</summary>
+    public string? Reason { get; init; }
 }
 
 /// <summary>

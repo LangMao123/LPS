@@ -150,7 +150,12 @@ export function applyEdit(
  *  - 治理字段：spread governance（不变）
  *  - 显式置 status='DRAFT'（B 设计稿 §2.1 Round 1：代码自证 + 防后端改动连锁）
  *  - 5 JSON 字段：序列化 workingBlocks 各块（空块 → undefined 不报错）
- *  - contentSnapshotJson 不传（后端 service 自行序列化）
+ *  - contentSnapshotJson：**不主动删、不主动改**。10-15 Q2 落地后后端
+ *    `UpdateRuleSetVersionAsync` / `UpdateParameterSetVersionAsync` 已把这列纳入既有回填清单
+ *    （`version.ContentSnapshotJson = existing.ContentSnapshotJson;`），请求体带不带都安全；
+ *    而 ⑦ 换型规则子块（SetupTransitionRules）**只存在这一列里**，若前端把它删掉又碰上后端
+ *    回退到「读路径置空 + 写路径全量采纳」的旧实现，用户保存一次就会清空 DRAFT 上的全部换型规则。
+ *    所以这里保持 spread 原样回传，是当前唯一正确的行为。
  *  - 泛型：G 继承 GovernanceVersionBase（RuleSetVersionGovernance / ParameterSetVersionGovernance 各自适用）
  */
 export function buildPutBody<G extends GovernanceVersionBase>(

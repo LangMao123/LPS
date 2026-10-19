@@ -1,9 +1,11 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using FluentAssertions;
 using LPS.APS.Application.Models;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Entities.APS;
+using LPS.APS.Core.Exceptions;
 using Xunit;
 
 namespace LPS.APS.Tests.Unit;
@@ -116,9 +118,30 @@ public class SetupTransitionRuleProjectionTests
     }
 
     [Fact]
+    public void ExtractRules_三态_缺失与空配置返回空列表_损坏抛红线异常()
+    {
+        // 2026-10-14 与 ⑧ 块同轨（1号位 2026-10-13《BatchPolicy三态载体择定…回执》§五「应同轨」，
+        // 边界照该件 §5.3「仅 JSON 损坏抛异常；缺子块／null／显式 [] 仍空列表」）：
+        // ① 缺子块 / null / 空串 → 空列表（该版本未配置换型规则，合法未配置，非装载失败）；
+        // ② 显式空配置 "SetupTransitionRules":[] → 空列表（明确空配置，合法）；
+        // ③ JSON 结构损坏 → 抛 SetupRuleDataRedLineException（显式失败，不再静默空列表）。
+        SetupTransitionRuleProjector.ExtractRules(null).Should().BeEmpty();
+        SetupTransitionRuleProjector.ExtractRules(string.Empty).Should().BeEmpty();
+        SetupTransitionRuleProjector.ExtractRules("{\"DemandPriority\":{}}").Should().BeEmpty();
+        SetupTransitionRuleProjector.ExtractRules("{\"SetupTransitionRules\":null}").Should().BeEmpty();
+        SetupTransitionRuleProjector.ExtractRules("{\"SetupTransitionRules\":[]}").Should().BeEmpty();
+
+        Action outer = () => SetupTransitionRuleProjector.ExtractRules("{ not-valid-json");
+        outer.Should().Throw<SetupRuleDataRedLineException>();
+
+        Action inner = () => SetupTransitionRuleProjector.ExtractRules("{\"SetupTransitionRules\": [broken}");
+        inner.Should().Throw<SetupRuleDataRedLineException>();
+    }
+
+    [Fact]
     public void ProjectFromSnapshot_子块缺失或为空_返回空列表()
     {
-        // S-9：fail-open——缺失子块 / null / 空字符串 → 空列表（无规则 DEFAULT 兜底）
+        // 合法缺配——缺失子块 / null 子块 / 空字符串 → 空列表（无规则 DEFAULT 兜底，0 分钟口径不变）
         var noBlock = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
         {
             ["DemandPriority"] = new { }
@@ -130,11 +153,16 @@ public class SetupTransitionRuleProjectionTests
     }
 
     [Fact]
-    public void ProjectFromSnapshot_损坏JSON_返回空列表_failOpen()
+    public void ProjectFromSnapshot_损坏JSON_抛红线异常_failFast()
     {
-        // S-9：fail-open——损坏子块不抛异常，空列表（区别于六块 fail-closed）
-        SetupTransitionRuleProjector.ProjectFromSnapshot("{ not-valid-json").Should().BeEmpty();
-        SetupTransitionRuleProjector.ProjectFromSnapshot("{\"SetupTransitionRules\": [broken}").Should().BeEmpty();
+        // 装载链入口（FrozenStrategySnapshotProvider.DeserializeSetupTransitionRules → 第⑦块载荷）
+        // 2026-10-14 由 fail-open 改 fail-fast：损坏版本**不得**再静默降级成「无规则」，
+        // 否则 1号位 消费侧按 0 分钟排出看似成立、实则丢失换型时间的计划且全链无告警位。
+        Action outer = () => SetupTransitionRuleProjector.ProjectFromSnapshot("{ not-valid-json");
+        outer.Should().Throw<SetupRuleDataRedLineException>();
+
+        Action inner = () => SetupTransitionRuleProjector.ProjectFromSnapshot("{\"SetupTransitionRules\": [broken}");
+        inner.Should().Throw<SetupRuleDataRedLineException>();
     }
 
     [Fact]

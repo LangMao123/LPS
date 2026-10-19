@@ -1,3 +1,4 @@
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.APS;
 
 namespace LPS.APS.Core.Interfaces;
@@ -19,6 +20,26 @@ public interface IParameterSetRepository
     /// <param name="take">返回行数（分页 size；null=不分页）</param>
     /// <param name="ct">取消令牌</param>
     Task<IReadOnlyList<ParameterSet>> GetListAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 参数集列表查询（含最新版本摘要，Q1 对齐 rule-sets，2026-10-15）
+    /// 与 <see cref="GetListAsync"/> 同过滤/分页语义，另 LEFT JOIN 最新版本
+    /// （CurrentVersionId/CurrentVersionCode、DraftVersionId/DraftVersionCode、
+    ///  Status/LastChangeReason/PublishedAt）。
+    /// 注：CurrentVersionId/DraftVersionId 为 C-4 身份补全（准确 VersionId，2026-10-17 落码）。
+    /// 真源：版本摘要取自 ParameterSetVersion（VersionCode 字符串；无版本行则版本摘要为 null）。
+    /// </summary>
+    /// <param name="activeOnly">true=仅启用（IsActive=1）；null=不区分</param>
+    /// <param name="keyword">模糊关键字，匹配 ParameterSetCode 或 ParameterSetName（null=不过滤）</param>
+    /// <param name="skip">跳过行数（分页 offset；null=不分页）</param>
+    /// <param name="take">返回行数（分页 size；null=不分页）</param>
+    /// <param name="ct">取消令牌</param>
+    Task<IReadOnlyList<ParameterSetListItemDto>> GetListWithVersionAsync(
         bool? activeOnly = null,
         string? keyword = null,
         int? skip = null,

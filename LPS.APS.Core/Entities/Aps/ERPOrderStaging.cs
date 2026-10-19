@@ -24,7 +24,7 @@ public class ERPOrderStaging
     public DateTime DueDate { get; set; }
     public int Priority { get; set; } = 50;
     public string BOMNO { get; set; } = string.Empty;
-    public string Status { get; set; } = "Open";
+    public string Status { get; set; } = "OPEN";
     // v5.0.3 源事实字段（来自 ERP v_APS_SalesOrder 视图）
     public string? TransportMode { get; set; }
     public string? CustomerName { get; set; }

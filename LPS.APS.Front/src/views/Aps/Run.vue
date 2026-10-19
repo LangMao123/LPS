@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — 运行/版本/MES（页面 9 / U01 / U02 / U19 / U16-U18）
+ * APS V1 4号位 — 运行与下发（页面 9 / U01 / U02 / U19 / U16-U18）
  *
  * 4号位文档第 15-16 节约束：
  *  - 当前 ACTIVE 版本按 Domain 分组展示（U01）
@@ -364,8 +364,8 @@ async function handleRecoverFailedRun(row: {
     <!-- ===== 顶部 ===== -->
     <div class="page-header">
       <div>
-        <h2 class="page-title">运行 / 版本 / MES</h2>
-        <p class="page-sub"> 排产运行 / 版本 / MES 下发状态总览 </p>
+        <h2 class="page-title">运行与下发</h2>
+        <p class="page-sub"> 排产运行、计划版本与 MES 下发状态 </p>
       </div>
       <ElButton :loading="loading" @click="refresh"> <Icon icon="vi-ep:refresh" /> 刷新 </ElButton>
     </div>

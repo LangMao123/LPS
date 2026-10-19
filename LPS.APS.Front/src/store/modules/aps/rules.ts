@@ -6,12 +6,12 @@
  *  - currentDetail：当前选中 RuleSet 的完整详情（向后兼容；UI 重设计后逐步废弃）
  *  - ruleSetBuffer：双轨 RuleSet 缓冲（三态：governance/originalBlocks/workingBlocks + dirty 标志）
  *  - parameterSetBuffer：双轨 ParameterSet 缓冲（与 RuleSet 1:1 关联）
- *  - lastPublish / lastRetire：上一次写入结果（U22 可追溯）
+ *  - lastPublish / lastDisable：上一次写入结果（U22 可追溯）
  *  - statusFilter：列表过滤
  *  - loading / error：UI 态
  *
  * 写接口（v1.4 §二十 写维护 + B 设计稿 Step 1 7 函数）：
- *  - 旧：validateDraft / publish / retire（向后兼容；走 publishRuleSet）
+ *  - 旧：validateDraft / publish / disable（向后兼容；走 publishRuleSet）
  *  - 新：createRuleSetDraft / updateRuleSetDraft / createParameterSetDraft / updateParameterSetDraft
  *  - 新：forkDraft（入口 B — 建草稿）/ onCellEdit / onSaveDraft / onCancelDirty
  *
@@ -32,7 +32,7 @@ import {
   type RuleSetDetailDto,
   type RuleDiffDto,
   type PublishRuleResult,
-  type RetireRuleResult,
+  type DisableRuleResult,
   type RuleStatus,
   type RoleKey,
   type RuleSetVersion,
@@ -41,7 +41,8 @@ import {
   type ForkDraftResult,
   type ParameterSetBlocks,
   type BlockKey,
-  BLOCK_KEYS
+  BLOCK_KEYS,
+  NO_VERSION
 } from '@/api/aps-v1'
 import {
   flattenBlocks,
@@ -103,8 +104,8 @@ export const useRulesStore = defineStore('aps.rules', () => {
   const currentDetail = ref<RuleSetDetailDto | null>(null)
   const currentDiff = ref<RuleDiffDto | null>(null)
   const lastPublish = ref<PublishRuleResult | null>(null)
-  const lastRetire = ref<RetireRuleResult | null>(null)
-  const statusFilter = ref<RuleStatus | 'ALL'>('ALL')
+  const lastDisable = ref<DisableRuleResult | null>(null)
+  const statusFilter = ref<RuleStatus | typeof NO_VERSION | 'ALL'>('ALL')
   const loading = ref(false)
   const listLoading = ref(false)
   const actionRunning = ref(false)
@@ -137,7 +138,9 @@ export const useRulesStore = defineStore('aps.rules', () => {
    */
   const filteredRuleSets = computed(() => {
     let arr = ruleSets.value
-    if (statusFilter.value !== 'ALL') {
+    if (statusFilter.value === NO_VERSION) {
+      arr = arr.filter((r) => !r.hasVersion)
+    } else if (statusFilter.value !== 'ALL') {
       arr = arr.filter((r) => r.status === statusFilter.value)
     }
     return filterByScope(arr, apsAuth.dataScope, (r) =>
@@ -161,6 +164,15 @@ export const useRulesStore = defineStore('aps.rules', () => {
     return c
   })
 
+  /**
+   * 无任何版本的规则集数量（10-14 增）
+   *
+   * dev 实测 698 个里 695 个属于此类 —— 它们点开必然 404（published-version 无行 → versions 空数组），
+   * 所以必须单独成列，否则「已发布」KPI 会把 695 个点不开的条目算成已发布（用户 10-14 截图即此症状）。
+   * 这是**正交于 6 态的计数**，不并进 statusCounts，避免污染 v1.4 §二十 的冻结状态语义。
+   */
+  const noVersionCount = computed(() => ruleSets.value.filter((r) => !r.hasVersion).length)
+
   /** 当前选中 RuleSet 的 status */
   const currentStatus = computed(() => currentDetail.value?.summary.status ?? null)
 
@@ -171,7 +183,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
   })
 
   /** 是否有 PUBLISHED 可退役 */
-  const canRetire = computed(() => currentStatus.value === 'PUBLISHED')
+  const canDisable = computed(() => currentStatus.value === 'PUBLISHED')
 
   /** 是否有写权限（任意） — v1.2 §23.1 权限码门控
    *  - aps.rule.edit：aps.admin.aps + aps.admin.system 持有
@@ -203,8 +215,8 @@ export const useRulesStore = defineStore('aps.rules', () => {
       canValidate: s === 'DRAFT' && pub,
       /** [发布]：仅 DRAFT + 有发布权限 */
       canPublish: s === 'DRAFT' && pub,
-      /** [退役 / disable]：仅 PUBLISHED + 有发布权限 */
-      canRetire: s === 'PUBLISHED' && pub
+      /** [停用 / disable]：仅 PUBLISHED + 有发布权限 */
+      canDisable: s === 'PUBLISHED' && pub
     }
   })
 
@@ -283,11 +295,20 @@ export const useRulesStore = defineStore('aps.rules', () => {
         }
       }
       // 选中后默认载入 base/target diff
-      await loadDiff(
-        ruleSetId,
-        currentDetail.value.summary.currentVersion,
-        currentDetail.value.summary.draftVersion ?? currentDetail.value.summary.currentVersion
-      )
+      // versionId 是 RuleSetVersion 数据库主键（不是业务版本号）；后端 /version/diff 端点要的就是它。
+      // history=[] 时（优先路径 published-version 端点未返回 history）静默空态，避免 400 错误暴露。
+      const detail = currentDetail.value
+      const history = detail?.history ?? []
+      const baseVer =
+        history.find((h) => h.status === 'PUBLISHED' && h.isCurrent)?.versionId ??
+        history.find((h) => h.status === 'PUBLISHED')?.versionId ??
+        history[history.length - 1]?.versionId
+      const targetVer = history.find((h) => h.status === 'DRAFT')?.versionId ?? baseVer
+      if (baseVer && targetVer && baseVer !== targetVer) {
+        await loadDiff(ruleSetId, baseVer, targetVer)
+      } else {
+        currentDiff.value = null
+      }
       // mock 模式：从 currentDetail.parameterSet.parameters 派生 buffer（B 设计稿 §1.2）
       // 真实模式：loadDualTrackBuffers 由 forkDraft 触发（或后续 Step D 校准后改为自动）
       if (import.meta.env.VITE_USE_MOCK === 'true' && currentDetail.value) {
@@ -443,12 +464,12 @@ export const useRulesStore = defineStore('aps.rules', () => {
     }
   }
 
-  /** 退役 / 禁用（v1.4 后端语义改 disable；前端 UI 沿用"退役"文案）
+  /** 停用（v1.4 后端语义改 disable；前端 UI 与端点对齐）
    *  v1.4 §二十：后端走 versionId
    */
-  async function retire(ruleSetId: number, reason: string): Promise<void> {
+  async function disable(ruleSetId: number, reason: string): Promise<void> {
     if (!canPublishAction.value) {
-      error.value = '当前操作者无退役权限（需权限码 aps.rule.publish）'
+      error.value = '当前操作者无停用权限（需权限码 aps.rule.publish）'
       return
     }
     const detail = currentDetail.value
@@ -473,7 +494,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     actionRunning.value = true
     error.value = null
     try {
-      lastRetire.value = await ruleApi.retire({
+      lastDisable.value = await ruleApi.disable({
         ruleSetId,
         version: detail.summary.currentVersion,
         reason,
@@ -490,7 +511,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     }
   }
 
-  function setStatusFilter(filter: RuleStatus | 'ALL'): void {
+  function setStatusFilter(filter: RuleStatus | typeof NO_VERSION | 'ALL'): void {
     statusFilter.value = filter
   }
 
@@ -507,7 +528,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     currentDetail.value = null
     currentDiff.value = null
     lastPublish.value = null
-    lastRetire.value = null
+    lastDisable.value = null
     error.value = null
     // 同时清空双轨 buffer（路由切换时使用）
     ruleSetBuffer.value = emptyBufferState()
@@ -537,7 +558,6 @@ export const useRulesStore = defineStore('aps.rules', () => {
     parameterSetBuffer.value = { ...parameterSetBuffer.value, loading: true }
     error.value = null
     try {
-      // 这里直接用 fetchVersion（按 versionId 拉 RS+PS）；如需联调可改 ruleApi 调用
       const [rsVer, psVer] = await Promise.all([
         fetchRuleSetVersion(ruleSetVersionId),
         fetchParameterSetVersion(parameterSetVersionId)
@@ -573,34 +593,17 @@ export const useRulesStore = defineStore('aps.rules', () => {
     }
   }
 
-  /** 取 RuleSetVersion（mock 模式构造，真实模式调后端） */
+  /** 取 RuleSetVersion（GET /api/governance/rule-set/version/{versionId}）
+   *  10-15 4号位：原来这里是 `if ((ruleApi as any).getRuleSetVersion)` feature-detect 落空后的
+   *  手写桩（versionCode `v-{id}` / ruleSetId 0 / status DRAFT），方法其实一直存在，
+   *  已补到 ruleApi 上。见 rule.ts getRuleSetVersion 的注释。 */
   async function fetchRuleSetVersion(versionId: number): Promise<RuleSetVersion> {
-    // 通过现有 getPublishedVersion（mock 支持）；如需 DRAFT 详情另开 GET 端点（联调 Step C）
-    // 此处复用 mock 路径作为占位
-    if ((ruleApi as any).getRuleSetVersion) {
-      return await (ruleApi as any).getRuleSetVersion(versionId)
-    }
-    // 兜底：返回空 governance（避免 mock 模式崩溃）
-    return {
-      id: versionId,
-      ruleSetId: 0,
-      parameterSetVersionId: 0,
-      versionCode: `v-${versionId}`,
-      status: 'DRAFT'
-    }
+    return ruleApi.getRuleSetVersion(versionId)
   }
 
-  /** 取 ParameterSetVersion */
+  /** 取 ParameterSetVersion（GET /api/governance/parameter-set/version/{versionId}） */
   async function fetchParameterSetVersion(versionId: number): Promise<ParameterSetVersion> {
-    if ((ruleApi as any).getParameterSetVersion) {
-      return await (ruleApi as any).getParameterSetVersion(versionId)
-    }
-    return {
-      id: versionId,
-      parameterSetId: 0,
-      versionCode: `v-${versionId}`,
-      status: 'DRAFT'
-    }
+    return ruleApi.getParameterSetVersion(versionId)
   }
 
   /**
@@ -834,7 +837,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     currentDetail,
     currentDiff,
     lastPublish,
-    lastRetire,
+    lastDisable,
     statusFilter,
     loading,
     listLoading,
@@ -851,9 +854,10 @@ export const useRulesStore = defineStore('aps.rules', () => {
     // getters
     filteredRuleSets,
     statusCounts,
+    noVersionCount,
     currentStatus,
     canPublish,
-    canRetire,
+    canDisable,
     canWrite,
     canPublishAction,
     // 双轨 + 6 态 getters
@@ -871,7 +875,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     loadDiff,
     validateDraft,
     publish,
-    retire,
+    disable,
     setStatusFilter,
     reset,
     handleError,

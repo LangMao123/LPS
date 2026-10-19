@@ -122,6 +122,9 @@
  *  - DemandProtection 冻结一致性段：GROUP=dp-freeze node scripts/verify-acceptance.mjs（DP01-DP05 静态，R1 stale 注释 + §2.3/§2.4 文案）
  *  - DemandProtection lps/ 联调段：GROUP=dplive node scripts/verify-acceptance.mjs（DPL01-DPL10 静态，per-lock 列表 + /summary KPI + 前端聚合）
  *  - Explanation 冻结一致性段：GROUP=e-freeze node scripts/verify-acceptance.mjs（E01-E10 + E13-E22 静态 + E21 动态 + E11/E12 skip，R1 15 码字典 + R3 撤 ScheduleFailureInfo + 可选链漏写探针 + 版本不重复展示探针 + PlanVersionStatus 7 码探针 + 业务优先级渲染探针 + 首次 mount 联动探针 + selectVersion 并发去重探针 + loadCurrent allSettled 容错探针 + 10-10 option A 收口探针（撤 重排建议 + 设备故障 + /api/business-fact-issues 聚合）+ 10-10 business-fact-issues 端点 DDL 落地探针 + 10-10 样式简洁整齐探针；R2/R3 跨号位等回执）
+ *  - 菜单分组段：GROUP=menu node scripts/verify-acceptance.mjs（M01-M19 静态，不登录）：顶级「策略配置」「角色与权限」两个分组 +
+ *              「需求与供给」「排产执行」「基础数据与日历」三个顶级分组（apsV1Routes 共 6 个顶级节点）；
+ *              所有分组叶子页用绝对路径（URL 不变）；页面改名「策略包版本」
  *  - 接受类（脏数据风险）：VERIFY_ALLOW_WRITE=1 GROUP=j-10a node scripts/verify-acceptance.mjs
  *  - Windows Git Bash：env 前缀可用；或直接改脚本末尾 GROUP 默认值
  */
@@ -135,7 +138,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const API_BASE = process.env.API_BASE || 'https://localhost:7044'
-const GROUP = process.env.GROUP || 'all' // all | interfaces | rbac-negate | current-user | static | business-rules | j-10a | m-10a1 | v14-additions | parameter-set-drafts | o-opm | r-resource-calendar | d-domain | a-ctp-domainkey | me-eta | t-tsrc | dp-freeze | dplive | e-freeze
+const GROUP = process.env.GROUP || 'all' // all | interfaces | rbac-negate | current-user | static | business-rules | j-10a | m-10a1 | v14-additions | parameter-set-drafts | o-opm | r-resource-calendar | d-domain | a-ctp-domainkey | me-eta | t-tsrc | dp-freeze | dplive | e-freeze | setup | pwc | menu
 const ADMIN_CODE = 'admin'
 const ADMIN_PWD = 'Admin@123456'
 
@@ -271,11 +274,14 @@ async function verifyInterfaces(token) {
   )
 
   // U27 Manual ETA 查询
+  //   5号位 10-08 落地分页：返 { items, total, page, pageSize }（PageResult）；probe 不约束具体形态
   r = await call('GET', '/api/procurement-manual-eta', { token })
+  const u27IsPaged = r.json?.data && typeof r.json.data === 'object' && 'items' in r.json.data
+  const u27IsArray = Array.isArray(r.json?.data)
   assert(
     'U27 GET /api/procurement-manual-eta 走 5号位',
-    r.ok && Array.isArray(r.json?.data),
-    `code=${r.code}, count=${r.json?.data?.length ?? 0}`
+    r.ok && (u27IsPaged || u27IsArray),
+    `code=${r.code}, shape=${u27IsPaged ? 'PageResult' : u27IsArray ? 'Array' : 'unknown'}, total=${r.json?.data?.total ?? r.json?.data?.length ?? 0}`
   )
 
   // U28 静态：DTO 不含前端计算的 availableTime / effectiveEta 字段（§17 撤销 — 4号位 不计算）
@@ -341,7 +347,14 @@ async function verifyRbacNegate(adminToken) {
 
   // 1. 找 VIEWER 角色
   let r = await call('GET', '/api/rbac/roles', { token: adminToken })
-  const viewerRole = (r.json?.data || []).find(
+  // 兼容 PageResult / Array 两种形态
+  const rolesData = r.json?.data
+  const rolesList = Array.isArray(rolesData)
+    ? rolesData
+    : Array.isArray(rolesData?.items)
+      ? rolesData.items
+      : []
+  const viewerRole = rolesList.find(
     (rl) => /viewer/i.test(rl.roleCode) || /viewer/i.test(rl.roleName)
   )
   if (!viewerRole) {
@@ -581,7 +594,11 @@ function verifyStaticScan() {
     'views/Aps/RbacUsers.vue',
     'views/Aps/Candidate.vue',
     'views/Aps/components/StrategyDiffPanel.vue',
-    'views/Aps/TaskSplitRuleConfig.vue'
+    'views/Aps/TaskSplitRuleConfig.vue',
+    'views/Aps/SetupExact.vue',
+    'views/Aps/SetupDefault.vue',
+    'views/Aps/SetupUncovered.vue',
+    'views/Aps/SetupDiff.vue'
   ]
   const pageUsesUtil = datetimePages.map((p) => {
     const fp = join(SRC_ROOT, p)
@@ -591,7 +608,7 @@ function verifyStaticScan() {
   })
   const allPagesUseUtil = pageUsesUtil.every((x) => x.uses)
   assert(
-    'S03 9 个页面统一引用 @/utils/datetime 显示后端 DateTime（防 naive UTC 少 8h）',
+    'S03 13 个页面统一引用 @/utils/datetime 显示后端 DateTime（防 naive UTC 少 8h）',
     utilExists && allPagesUseUtil,
     utilExists
       ? `工具存在；引用情况：${pageUsesUtil.map((x) => `${x.p.split('/').pop()}=${x.uses ? '✓' : '✗'}`).join(' | ')}`
@@ -601,10 +618,14 @@ function verifyStaticScan() {
   // S04：datetime 工具化的页面禁止裸 dayjs()/new Date().toLocaleString() 显示后端 DateTime
   //  - 允许的例外：本地构造时间（如 dayjs().format('YYYY-MM-DD HH:mm') 当前时间用 dayjs() 没问题）
   //  - 重点拦：dayjs(someBackendField).format / new Date(someBackendField).toLocaleString('zh-CN')
+  //  - 10-14 补：原三条只认模板里的内联写法 dayjs(row.xxx)，认不出包在
+  //    formatDateTime(iso) 这类辅助函数里的 dayjs(iso).format（Setup 4 页当时全中招且 S04 全绿）。
+  //    末条用 (?!\)) 零参负向断言，只拦"带参数的"裸 dayjs，不误伤当前时间 dayjs()。
   const oldPatterns = [
     /new Date\([^)]*\)\.toLocaleString\(['"]zh-CN['"]\)/,
     /dayjs\((?:row|currentRow|item|headerNN|lastConfirmResult|lastActivateResult)\.\w*[aA]t\w*\)\.format/,
-    /dayjs\((?:currentDetail|detail)\.\w*[aA]t\w*\)\.format/
+    /dayjs\((?:currentDetail|detail)\.\w*[aA]t\w*\)\.format/,
+    /dayjs\((?!\))[A-Za-z_$][\w$]*(?:\.[\w$]+)*\)\.format/
   ]
   const oldHits = []
   for (const p of datetimePages) {
@@ -1344,6 +1365,389 @@ function runP01P05Static() {
     'P05 api/aps-v1/index.ts 重导出 flattenBlocks/applyEdit/buildPutBody',
     indexHasReexport,
     indexHasReexport ? '已重导出' : '重导出缺失'
+  )
+
+  // P06 静态探针：退役 → 停用 重命名契约（v1.4 后端语义改 disable；UI 与端点对齐）
+  // 历史背景：2026-10-12 用户拍板 → 4号位 主导 A 方案全栈对齐（按钮 + Dialog + store + api + types + state + getters）
+
+  /* -------- P06b 静态：buildPutBody 不得自行删除 contentSnapshotJson（10-15 Q2 落地配套锁）--------
+   *  事实：3号位 Q2 回执已把 `version.ContentSnapshotJson = existing.ContentSnapshotJson;` 加进
+   *  UpdateRuleSetVersionAsync:1632 与 UpdateParameterSetVersionAsync:1725，写路径从此无视请求体的该列。
+   *  但前端 buildPutBody 是读改写（spread governance 整份回传），而 ⑦ 换型规则子块
+   *  SetupTransitionRules **只存在这一列内**（SetupRuleService.cs:746）。
+   *  若前端主动 delete 这一列，一旦后端回退到「读路径置空 + 写路径全量采纳」，用户保存一次即清空
+   *  DRAFT 上的全部换型规则 —— 数据损坏且无任何报错。所以此处锁死「保持 spread 原样回传」。
+   *  - 反向探针自证可失败：加 `delete (out as any).contentSnapshotJson` 或改注释说「不传」→ 转红
+   */
+  const draftBufferSrc = readSrc('api/aps-v1/draftBuffer.ts')
+  const draftBufferCode = draftBufferSrc
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  const p06bNoDelete = !/delete\s+[^;]*contentSnapshotJson/.test(draftBufferCode)
+  assert(
+    'P06b 静态：buildPutBody 不 delete contentSnapshotJson（换型规则只存这一列，删了会清空 DRAFT）',
+    p06bNoDelete,
+    p06bNoDelete ? '保持 spread 原样回传' : '代码里出现了 delete contentSnapshotJson —— 会清空 DRAFT 换型规则'
+  )
+
+  const p06bKeepsSpread = /\.\.\.governance,/.test(draftBufferCode)
+  assert(
+    'P06b 静态：buildPutBody 仍 spread governance 原样回传（读改写是全量覆写语义下的正确行为）',
+    p06bKeepsSpread,
+    p06bKeepsSpread ? 'spread 完整' : 'spread governance 被去掉，读改写语义已破'
+  )
+
+  const p06bCommentFixed =
+    /contentSnapshotJson：\*\*不主动删、不主动改\*\*/i.test(draftBufferSrc) &&
+    !/contentSnapshotJson 不传（后端 service 自行序列化）/.test(draftBufferSrc)
+  assert(
+    'P06b 静态：draftBuffer 头注释已改成「不主动删、不主动改」，不再误导后人删该列',
+    p06bCommentFixed,
+    p06bCommentFixed ? '注释已更正' : '注释仍写「contentSnapshotJson 不传」，会诱导后人删掉它'
+  )
+  // 防止后续回归到「按钮写『退役』但 store 内部还叫 retire」或 store 已改但类型/方法未改这种半完成状态。
+  /* -------- P08 静态：列表不再谎报「已发布」（10-14 用户截图：698 全标已发布，点开全报错）--------
+   *  事实（dev 实测 2026-10-14）：/api/governance/rule-sets 返 698 条，其中 695 条**连 status key 都没有**
+   *  —— 因为 Program.cs:94 设了 WhenWritingNull，而后端 status 来自 RuleSetVersion 的 OUTER APPLY，
+   *  一条版本都没有时整个 key 消失。这些规则集点开必然 404（published-version 无行 → versions 空数组）。
+   *  前端原实现是 `status = isActive === false ? 'DISABLED' : 'PUBLISHED'`，于是 695 个点不开的
+   *  全被标成「已发布」，KPI 也跟着虚高。
+   *  修复：status 有就用后端真值；没有 = 无任何版本（正交布尔 hasVersion），列表显示「未配版本」，
+   *  点击直接走空态，不再抛红条 + 外露内部 ID。
+   *  - 反向探针自证可失败：把 status 派生改回 isActive / 去掉 hasVersion / 去掉空态 → P08 转红
+   */
+  const ruleApiSrc = readSrc('api/aps-v1/rule.ts')
+  const rulesStoreSrc = readSrc('store/modules/aps/rules.ts')
+  const rulesVueSrc = readSrc('views/Aps/Rules.vue')
+  const p08UsesBackendStatus =
+    /const\s+hasVersion\s*=\s*r\.status\s*!=\s*null/.test(ruleApiSrc) &&
+    /status:\s*hasVersion\s*\?\s*normalizeRuleStatus\(r\.status\)/.test(ruleApiSrc)
+  const p08NoIsActiveDerive =
+    !/isActive\s*===\s*false\s*\?\s*'DISABLED'\s*:\s*'PUBLISHED'/.test(ruleApiSrc)
+  const p08TypeHasFlag = /hasVersion:\s*boolean/.test(readSrc('api/aps-v1/types/rule.ts'))
+  const p08NoVersionConst =
+    /export\s+const\s+NO_VERSION\s*=\s*'NO_VERSION'/.test(readSrc('api/aps-v1/types/common.ts')) &&
+    /export\s+const\s+NO_VERSION_LABEL\s*=\s*'未配版本'/.test(readSrc('api/aps-v1/types/common.ts'))
+  const p08StoreCounts =
+    /const\s+noVersionCount\s*=\s*computed/.test(rulesStoreSrc) &&
+    /arr\s*=\s*arr\.filter\(\(r\)\s*=>\s*!r\.hasVersion\)/.test(rulesStoreSrc)
+  const p08ViewShowsLabel =
+    rulesVueSrc.includes('NO_VERSION_LABEL') &&
+    /r\.hasVersion\s*\?\s*RULE_STATUS_LABELS\[r\.status\]\s*:\s*NO_VERSION_LABEL/.test(rulesVueSrc)
+  const p08ViewGuardsClick =
+    /if\s*\(!ruleSet\.hasVersion\)\s*\{/.test(rulesVueSrc) && rulesVueSrc.includes('noVersionPicked')
+  const p08NoInternalIdError = !/无可用版本/.test(rulesVueSrc) && !/RuleSet\s#\$\{/.test(ruleApiSrc)
+  const p08All =
+    p08UsesBackendStatus &&
+    p08NoIsActiveDerive &&
+    p08TypeHasFlag &&
+    p08NoVersionConst &&
+    p08StoreCounts &&
+    p08ViewShowsLabel &&
+    p08ViewGuardsClick &&
+    p08NoInternalIdError
+  assert(
+    'P08 静态：无版本规则集不再谎报「已发布」（后端 status 优先 + hasVersion + 未配版本标签 + 点击空态）',
+    p08All,
+    p08All
+      ? 'status 取后端真值 + 未配版本独立计数与空态齐'
+      : `backendStatus=${p08UsesBackendStatus} noIsActive=${p08NoIsActiveDerive} type=${p08TypeHasFlag} const=${p08NoVersionConst} store=${p08StoreCounts} viewLabel=${p08ViewShowsLabel} guard=${p08ViewGuardsClick} noIdLeak=${p08NoInternalIdError}`
+  )
+
+  /* -------- SP01 静态：策略配置 KPI 不再展示 V1 够不着的状态（10-14 用户截图红框）--------
+   *  DDL 六态齐全，但 V1 只有三个有写入路径（07 v5.1.10:3774「V1 不做完整审批流闭环」）：
+   *    DRAFT      GovernanceVersionService.cs:1670 创建时强制 Draft
+   *    PUBLISHED  :84 / :131 publish 赋值
+   *    DISABLED   :206 / :237 / :277 disable 赋值
+   *  SUBMITTED / APPROVED / ARCHIVED 无任何赋值点，只出现在读取侧白名单 PublishableStatuses(:63)
+   *  与拒绝提示(:193) 里。KPI 渲染这三个会让用户误读成「还没提交过」，而 V1 根本提交不了。
+   *  - 反向探针自证可失败：KPI 改回遍历 STRATEGY_STATUS_META → SP01 转红
+   */
+  const spTypesSrc = readSrc('api/aps-v1/types/strategyProfile.ts')
+  const spVueSrc = readSrc('views/Aps/StrategyProfiles.vue')
+  const sp01ReachableConst =
+    /export\s+const\s+STRATEGY_V1_REACHABLE_STATUSES/.test(spTypesSrc) &&
+    /'DRAFT',\s*\n\s*'PUBLISHED',\s*\n\s*'DISABLED'\s*\n\s*\]/.test(spTypesSrc) &&
+    !/STRATEGY_V1_REACHABLE_STATUSES[^=]*=\s*\[[^\]]*'(SUBMITTED|APPROVED|ARCHIVED)'/.test(
+      spTypesSrc
+    )
+  const sp01ViewFiltersKpi =
+    /const\s+kpiStatuses\s*=\s*computed/.test(spVueSrc) &&
+    /STRATEGY_V1_REACHABLE_STATUSES\.includes\(s\)/.test(spVueSrc)
+  const sp01ViewNoFullSixIterate = !/v-for="\(meta,\s*key\)\s+in\s+STRATEGY_STATUS_META"/.test(spVueSrc)
+  const sp01SurfacesUnexpected =
+    /statusCounts\.value\[s\]\s*>\s*0/.test(spVueSrc) && /unexpected/.test(spVueSrc)
+  const sp01All =
+    sp01ReachableConst && sp01ViewFiltersKpi && sp01ViewNoFullSixIterate && sp01SurfacesUnexpected
+  assert(
+    'SP01 静态：策略配置 KPI 只显示 V1 可达状态（DRAFT/PUBLISHED/DISABLED），预留状态不虚报 0',
+    sp01All,
+    sp01All
+      ? '三态 KPI + 预留状态真有数据时仍显示'
+      : `const=${sp01ReachableConst} filter=${sp01ViewFiltersKpi} noSixIterate=${sp01ViewNoFullSixIterate} unexpected=${sp01SurfacesUnexpected}`
+  )
+
+  /* -------- SP02/03/04 静态：3号位 2026-10-14 A组 A4/A5 落地后的前端消费（10-14 4号位）--------
+   *  A4 列表 DTO 增 ruleSetVersionCode / parameterSetVersionCode → 展示位改用编码（不露裸 Id）
+   *  A5 列表 DTO 增 ruleSetId / parameterSetId → 编辑态一级下拉直接定位，撤掉 698 次串行反查
+   *  A3 trace 增 referencingRuns —— 前端此前已实现（类型 + 空态 + 表格），此处一并锁住
+   *  - 反向探针自证可失败：表头改回 prop="ruleSetVersionId" 或恢复 for 循环反查 → SP03/SP02 转红
+   */
+  const spDraftSrc = readSrc('views/Aps/components/StrategyDraftDialog.vue')
+  const sp03ShowsCodes =
+    /row\.ruleSetVersionCode/.test(spVueSrc) && /row\.parameterSetVersionCode/.test(spVueSrc) &&
+    /currentVersion\.ruleSetVersionCode/.test(spVueSrc) &&
+    /runTrace\.ruleSetVersionCode/.test(spVueSrc)
+  const sp03NoRawIdColumn =
+    !/prop="ruleSetVersionId"/.test(spVueSrc) && !/prop="parameterSetVersionId"/.test(spVueSrc) &&
+    !/label="规则集版本 ID"/.test(spVueSrc) && !/label="参数集版本 ID"/.test(spVueSrc)
+  assert(
+    'SP03 静态：策略版本表/详情/追溯展示 ruleSetVersionCode、parameterSetVersionCode 编码（不露裸 Id）',
+    sp03ShowsCodes && sp03NoRawIdColumn,
+    sp03ShowsCodes && sp03NoRawIdColumn
+      ? '四处展示位已切编码，裸 Id 列已撤'
+      : `codes=${sp03ShowsCodes} noRawId=${sp03NoRawIdColumn}`
+  )
+
+  const sp02UsesParentIds =
+    /props\.version\.ruleSetId\s*!=\s*null/.test(spDraftSrc) &&
+    /props\.version\.parameterSetId\s*!=\s*null/.test(spDraftSrc)
+  const sp02NoSerialReverseLookup =
+    !/for\s*\(\s*const\s+rs\s+of\s+allSets\s*\)/.test(spDraftSrc) &&
+    !/for\s*\(\s*const\s+ps\s+of\s+allSets\s*\)/.test(spDraftSrc)
+  const sp02LoaderKeepsValidSelection =
+    /prev\s*!=\s*null\s*&&\s*list\.some\(\(v\)\s*=>\s*v\.id\s*===\s*prev\)\s*\?\s*prev\s*:\s*undefined/.test(
+      spDraftSrc
+    )
+  const sp02All = sp02UsesParentIds && sp02NoSerialReverseLookup && sp02LoaderKeepsValidSelection
+  assert(
+    'SP02 静态：策略 DRAFT 编辑态用列表 DTO 的 ruleSetId/parameterSetId 定位父主表，零串行反查',
+    sp02All,
+    sp02All
+      ? '直接赋值 + watch 加载，loader 保留仍匹配的已选版本'
+      : `parentIds=${sp02UsesParentIds} noLoop=${sp02NoSerialReverseLookup} keepValid=${sp02LoaderKeepsValidSelection}`
+  )
+
+  const sp04TraceRuns =
+    /runTrace\.referencingRuns/.test(spVueSrc) &&
+    /referencingRuns:\s*Array</.test(readSrc('api/aps-v1/types/strategyProfile.ts'))
+  assert(
+    'SP04 静态：追溯面板渲染 referencingRuns（后端 A3 已恒返 []，前端不得 .length 崩）',
+    sp04TraceRuns,
+    sp04TraceRuns ? '类型 + 渲染均在位' : 'referencingRuns 渲染或类型缺失'
+  )
+
+  /* -------- SP05 静态：策略 DRAFT 一级「规则集」下拉只列已配版本的（10-15 用户报「选完下拉没数据」）--------
+   * dev 实测：698 个 RuleSet 里仅 3 个有版本行（id 1 / 538 / 1287），其余 695 个选中后二级下拉必空；
+   * 且 GET /api/governance/rule-sets 带 pageSize 时后端硬顶 500 条且顺序不保证（实测只回 id 629~1802），
+   * 有版本的 id 1 与 538 被截掉——策略包绑不上。修法：不带查询参数取全量 + 客户端只留 status 非空者。
+   * 反向探针自证可失败：去掉 filter 或改回 listRuleSets({...pageSize}) → SP05a/SP05b 转红。
+   */
+  const sp05Dialog = readSrc('views/Aps/components/StrategyDraftDialog.vue')
+  const sp05Types = readSrc('api/aps-v1/types/strategyProfile.ts')
+  const sp05NoPaging =
+    /listRuleSets\(\s*\)/.test(sp05Dialog) &&
+    !/listRuleSets\(\s*\{[^}]*pageSize/.test(sp05Dialog)
+  assert(
+    'SP05a 静态：策略 DRAFT 取规则集主表不带 pageSize（后端硬顶 500 会截掉有版本的 id 1 / 538）',
+    sp05NoPaging,
+    sp05NoPaging ? '全量取数' : '仍带分页参数，会漏掉前 500 条之外的有版本规则集'
+  )
+  const sp05FilterHasVersion = /\.filter\(\s*\(r\)\s*=>\s*r\.isActive\s*&&\s*r\.status\s*!=\s*null/.test(
+    sp05Dialog
+  )
+  assert(
+    'SP05b 静态：一级规则集下拉只列「已配版本」的（698 条里 695 条无版本行，列出来选了就是空）',
+    sp05FilterHasVersion,
+    sp05FilterHasVersion ? '已按 status 过滤' : '未过滤无版本的规则集，用户选完才发现下拉是空的'
+  )
+  const sp05StatusDeclared = /interface RuleSetDto\s*\{[\s\S]{0,600}status\?:\s*string\s*\|\s*null/.test(
+    sp05Types
+  )
+  assert(
+    'SP05c 静态：RuleSetDto 声明后端版本摘要字段 status（WhenWritingNull：有版本才有，是判「已配版本」的唯一依据）',
+    sp05StatusDeclared,
+    sp05StatusDeclared ? '已声明' : 'RuleSetDto 缺 status，无法判定是否已配版本'
+  )
+  const sp05NoDataHint = /no-data-text="[^"]*还没有配过版本的规则集/.test(sp05Dialog)
+  assert(
+    'SP05d 静态：一级规则集下拉空态用大白话说明「先去规则维护页建草稿」（不留白面板）',
+    sp05NoDataHint,
+    sp05NoDataHint ? '已配空态提示' : '缺 no-data-text，全为空时下拉不提示原因'
+  )
+
+  /* -------- SP06 静态：策略 DRAFT 一级「参数集」下拉与规则集同款（3号位 10-15 联调通知 §一）--------
+   * 3号位 已把 GET /parameter-sets 从裸实体换型为 ParameterSetListItemDto（dev 实测 722 条里 3 条带
+   * status/currentVersionCode/lastChangeReason/publishedAt，无版本行整键被 WhenWritingNull 省略）。
+   * 前端跟进两件事：去掉 pageSize（硬顶 500 会截掉有版本的 PS_DEMO，dev 排在第 571 位）+ 按 status 过滤。
+   * 反向探针自证可失败：把 pageSize 塞回去或删掉 filter → SP06a/SP06b 转红。
+   */
+  const sp06NoPaging =
+    /listParameterSets\(\s*\{[^}]*activeOnly/.test(sp05Dialog) &&
+    !/listParameterSets\(\s*\{[^}]*pageSize/.test(sp05Dialog)
+  assert(
+    'SP06a 静态：策略 DRAFT 取参数集主表不带 pageSize（后端硬顶 500，会截掉有版本的 PS_DEMO/286）',
+    sp06NoPaging,
+    sp06NoPaging ? '全量取数' : '仍带分页参数，会漏掉前 500 条之外的有版本参数集'
+  )
+  const sp06FilterHasVersion = /\.filter\(\s*\(p\)\s*=>\s*p\.isActive\s*&&\s*p\.status\s*!=\s*null/.test(
+    sp05Dialog
+  )
+  assert(
+    'SP06b 静态：一级参数集下拉只列「已配版本」的（722 条里 719 条无版本行，列出来选了就是空）',
+    sp06FilterHasVersion,
+    sp06FilterHasVersion ? '已按 status 过滤' : '未过滤无版本的参数集，用户选完才发现下拉是空的'
+  )
+  const sp06SummaryDeclared =
+    /interface ParameterSetDto\s*\{[\s\S]{0,900}status\?\s*:\s*string\s*\|\s*null[\s\S]{0,900}currentVersionCode\?\s*:/.test(
+      sp05Types
+    )
+  assert(
+    'SP06c 静态：ParameterSetDto 声明后端版本摘要字段 status/currentVersionCode（判「已配版本」的唯一依据）',
+    sp06SummaryDeclared,
+    sp06SummaryDeclared ? '已声明' : 'ParameterSetDto 缺版本摘要字段，无法判定是否已配版本'
+  )
+  const sp06NoDataHint = /no-data-text="[^"]*还没有配过版本的参数集/.test(sp05Dialog)
+  assert(
+    'SP06d 静态：一级参数集下拉空态用大白话说明「先去规则维护页建草稿」（不留白面板）',
+    sp06NoDataHint,
+    sp06NoDataHint ? '已配空态提示' : '缺 no-data-text，全为空时下拉不提示原因'
+  )
+
+  /* -------- SP07 静态：PS 版本端点不得再放宽超时 + 加载失败提示去 axios 原文 --------
+   * 沿革：10-15 用户报 `timeout of 30000ms exceeded`（PS-PROD/1305 实测 37s），前端临时放宽到 60s。
+   * 10-16 3号位 Q1/Q2 落码并部署（契约登记 S-12，HTTP 响应零变化），复测 1305 = 17ms，
+   * 与其余参数集同量级 ⇒ 60s 兜底已撤。**本条改为反向探针**：锁「别把 timeout 加回来」——
+   * 加回来不会立刻报错，只会让将来真出现慢响应时被静默容忍，掩盖根因。
+   * 自证可失败：加回 timeout: 60000 → SP07a 转红。
+   */
+  const sp07ListPsVersionsBody =
+    readSrc('api/aps-v1/strategyProfile.ts').match(
+      /async listParameterSetVersions\([\s\S]{0,700}?\n {2}\}/
+    )?.[0] ?? ''
+  const sp07HasTimeoutOverride = /timeout:\s*\d+/.test(sp07ListPsVersionsBody)
+  assert(
+    'SP07a 反向：参数集版本端点已恢复全局默认超时（3号位 Q1 落码后 1305 实测 17ms，不得再加 60s 兜底）',
+    !sp07HasTimeoutOverride,
+    sp07HasTimeoutOverride
+      ? '又加了 timeout 兜底：会把将来真实的慢响应静默容忍掉，根因被掩盖'
+      : '已恢复默认超时'
+  )
+  const sp07NoRawAxiosText = !/ElMessage\.error\(`[^`]*\$\{\(err as Error\)\.message\}/.test(sp05Dialog)
+  assert(
+    'SP07b 静态：策略 DRAFT 四处加载失败提示不再把 axios 原文（timeout of 30000ms exceeded）抛给用户',
+    sp07NoRawAxiosText,
+    sp07NoRawAxiosText ? '已是大白话' : '仍有 ElMessage.error 拼接 err.message'
+  )
+
+  const rulesVueHasDisableButton = staticScanDtoHasField('views/Aps/Rules.vue', 'vi-mdi:archive" /> 停用') ||
+    staticScanDtoHasField('views/Aps/Rules.vue', 'vi-mdi:archive" />\n              停用') ||
+    /vi-mdi:archive"\s*\/>\s*停用/.test(readSrc('views/Aps/Rules.vue'))
+  assert(
+    'P06.1 Rules.vue 「停用」按钮文案已替换原「退役」（archive 图标 + 停用文本）',
+    rulesVueHasDisableButton,
+    rulesVueHasDisableButton ? '按钮文案对齐' : '按钮仍是「退役」或缺图标的「停用」'
+  )
+
+  const rulesVueHasDisableDialogTitle = staticScanDtoHasField('views/Aps/Rules.vue', 'title="停用已发布规则集"')
+  assert(
+    'P06.2 Rules.vue Disable Dialog 标题 = 「停用已发布规则集」（不再是「退役...」）',
+    rulesVueHasDisableDialogTitle,
+    rulesVueHasDisableDialogTitle ? 'Dialog 标题已对齐' : 'Dialog 标题未替换'
+  )
+
+  const rulesVueNoRetireUserFacing = !/退役后不可恢复|确认退役|>退役</.test(readSrc('views/Aps/Rules.vue'))
+  assert(
+    'P06.3 Rules.vue 无「退役后不可恢复/确认退役/>退役<」用户可见残留（注释/文档引用 RETIRED 不计）',
+    rulesVueNoRetireUserFacing,
+    rulesVueNoRetireUserFacing ? '无残留' : '仍有「退役」用户可见文案'
+  )
+
+  const rulesVueCallsDisable = /rulesStore\.disable\(/.test(readSrc('views/Aps/Rules.vue')) &&
+    !/rulesStore\.retire\(/.test(readSrc('views/Aps/Rules.vue'))
+  assert(
+    'P06.4 Rules.vue 调 rulesStore.disable()（不再调 rulesStore.retire）',
+    rulesVueCallsDisable,
+    rulesVueCallsDisable ? '调用栈已切到 disable' : '仍调用 retire 或未切到 disable'
+  )
+
+  const storeActionRenamed = /async\s+function\s+disable\s*\(/.test(readSrc('store/modules/aps/rules.ts')) &&
+    !/async\s+function\s+retire\s*\(/.test(readSrc('store/modules/aps/rules.ts'))
+  assert(
+    'P06.5 rules.ts store action = disable()（不再是 retire()）',
+    storeActionRenamed,
+    storeActionRenamed ? 'action 已对齐 disable' : '仍叫 retire 或未切到 disable'
+  )
+
+  const storeStateRenamed = /lastDisable\b/.test(readSrc('store/modules/aps/rules.ts')) &&
+    !/lastRetire\b/.test(readSrc('store/modules/aps/rules.ts')) &&
+    /canDisable\b/.test(readSrc('store/modules/aps/rules.ts')) &&
+    !/canRetire\b/.test(readSrc('store/modules/aps/rules.ts'))
+  assert(
+    'P06.6 rules.ts state/getter = lastDisable/canDisable（不再用 lastRetire/canRetire）',
+    storeStateRenamed,
+    storeStateRenamed ? 'state/getter 已对齐' : 'state/getter 有未改命名'
+  )
+
+  const apiMethodRenamed = /async\s+disable\s*\(input:\s*DisableRuleInput/.test(readSrc('api/aps-v1/rule.ts'))
+  assert(
+    'P06.7 rule.ts API 方法 = disable(input: DisableRuleInput)（调用 /disable 端点）',
+    apiMethodRenamed,
+    apiMethodRenamed ? 'API 方法签名已对齐' : 'API 方法仍叫 retire 或入参类型未切'
+  )
+
+  const typesRenamed = /export\s+interface\s+DisableRuleInput\b/.test(readSrc('api/aps-v1/types/rule.ts')) &&
+    /export\s+interface\s+DisableRuleResult\b/.test(readSrc('api/aps-v1/types/rule.ts')) &&
+    !/export\s+interface\s+RetireRuleInput\b/.test(readSrc('api/aps-v1/types/rule.ts')) &&
+    !/export\s+interface\s+RetireRuleResult\b/.test(readSrc('api/aps-v1/types/rule.ts'))
+  assert(
+    'P06.8 types/rule.ts 接口 = DisableRuleInput/Result（不再用 RetireRuleInput/Result）',
+    typesRenamed,
+    typesRenamed ? '类型已对齐 disable' : '类型仍叫 RetireRule*'
+  )
+
+  // P07 静态：Rules.vue KPI + Tab 用 UI 流程 3 态子集（v1.4 §二十 6 态冻结；前端无 submit/approve/archive 入口）
+  // 历史：2026-10-12 用户观察到 SUBMITTED/APPROVED/ARCHIVED 在 KPI/Tab 中永远是 0 噪声；3 态即可覆盖 UI 实际流程
+  // 保留 RULE_STATUSES（6 态）作 wire 兼容；新增 RULE_STATUSES_UI（3 态）专供 KPI/Tab v-for
+  const commonHasUiSubset = /export\s+const\s+RULE_STATUSES_UI\s*=\s*\[\s*'DRAFT'\s*,\s*'PUBLISHED'\s*,\s*'DISABLED'\s*\]/.test(
+    readSrc('api/aps-v1/types/common.ts')
+  )
+  assert(
+    'P07.1 common.ts 导出 RULE_STATUSES_UI = [DRAFT, PUBLISHED, DISABLED]（6 态 RULE_STATUSES 保留供类型/normalize）',
+    commonHasUiSubset,
+    commonHasUiSubset ? '常量定义齐备' : 'RULE_STATUSES_UI 缺失或元素错'
+  )
+
+  const commonHasSixStates = /export\s+const\s+RULE_STATUSES\s*=\s*\[\s*'DRAFT'\s*,\s*'SUBMITTED'\s*,\s*'APPROVED'\s*,\s*'PUBLISHED'\s*,\s*'DISABLED'\s*,\s*'ARCHIVED'\s*\]/.test(
+    readSrc('api/aps-v1/types/common.ts')
+  )
+  assert(
+    'P07.2 common.ts 保留 6 态 RULE_STATUSES（DDL 冻结兼容；normalize 与 Record 键空间仍按 6 态）',
+    commonHasSixStates,
+    commonHasSixStates ? '6 态冻结契约保留' : '6 态被删或顺序错'
+  )
+
+  const rulesVueKpiLoopUi3 = /v-for="key in RULE_STATUSES_UI"/.test(readSrc('views/Aps/Rules.vue'))
+  assert(
+    'P07.3 Rules.vue KPI 横条 v-for 用 RULE_STATUSES_UI（不再用 6 态）',
+    rulesVueKpiLoopUi3,
+    rulesVueKpiLoopUi3 ? 'KPI 已切 3 态' : 'KPI 仍遍历 6 态'
+  )
+
+  const rulesVueTabLoopUi3 = readSrc('views/Aps/Rules.vue').match(/v-for="key in (RULE_STATUSES|RULE_STATUSES_UI)"/g) ?? []
+  const tabsAllUi = rulesVueTabLoopUi3.length === 2 && rulesVueTabLoopUi3.every((s) => s.includes('RULE_STATUSES_UI'))
+  assert(
+    'P07.4 Rules.vue Tab + KPI 两处 v-for 都用 RULE_STATUSES_UI',
+    tabsAllUi,
+    tabsAllUi ? '两处一致切 3 态' : `命中 ${rulesVueTabLoopUi3.length} 处：${rulesVueTabLoopUi3.join(' | ')}`
+  )
+
+  const rulesVueSixTabGone = !/<ElRadioButton[^>]*v-for="key in RULE_STATUSES"/.test(readSrc('views/Aps/Rules.vue')) &&
+    !/<div[^>]*v-for="key in RULE_STATUSES"\s*:key="key"\s*class="kpi-pill"/.test(readSrc('views/Aps/Rules.vue'))
+  assert(
+    'P07.5 Rules.vue 已无遍历 6 态的 v-for（防 SUBMITTED/APPROVED/ARCHIVED 噪声恢复）',
+    rulesVueSixTabGone,
+    rulesVueSixTabGone ? '无 6 态噪声' : '仍有 6 态遍历'
   )
 }
 
@@ -2350,6 +2754,105 @@ async function verifyManualEta(token) {
     /a\.materialId\s*===\s*b\.materialId/.test(me14Store) &&
     /\(a\.receivingWarehouse\s*\?\?\s*''\)\s*===\s*\(b\.receivingWarehouse\s*\?\?\s*''\)/.test(me14Store)
   assert('ME14c 静态：sameBusinessKey 含 materialId + receivingWarehouse（4 键完整）', me14c, me14c ? '4 键齐备' : '缺 materialId / receivingWarehouse 对齐')
+
+  /* -------- ME15 静态：KPI 三卡改读累计值（10-12 ME13 收）--------
+   *  - 触发：5号位 10-12 函三函都已落地（ManualETA 10-08 / business-fact-issues 10-10 / manual-capacity 10-12）
+   *  - 5号位 未落 summary 聚合端点 → store 端维护 cumulative KPI（active + cancelled）
+   *  - KPI 三卡：总记录数 = backend `total`（全集）/ 启用 = totalActive / 已取消 = totalCancelled
+   *  - 不再读 list.length / activeCount / cancelledCount（per-page 会跳）
+   *  - 反向探针自证可失败：
+   *     - 删 totalActive/totalCancelled → ME15a 由绿转红
+   *     - KPI 卡回退读 list.length → ME15b 由绿转红
+   *     - 删 cumulative reset → ME15c 由绿转红
+   */
+  const me15Store = readSrc('store/modules/aps/manualEta.ts')
+  const me15View = readSrc('views/Aps/ManualEta.vue')
+  // a. store 增 totalActive + totalCancelled 两个 ref
+  const me15aStoreHasRefs =
+    /const\s+totalActive\s*=\s*ref(?:<number>)?\s*\(0\)/.test(me15Store) &&
+    /const\s+totalCancelled\s*=\s*ref(?:<number>)?\s*\(0\)/.test(me15Store)
+  // b. KPI 三卡不读 list.length / activeCount / cancelledCount
+  const me15bKpiNotListLength =
+    !/kpi-value[^>]*>\s*\{\{\s*list\.length\s*\}\}/.test(me15View) &&
+    !/kpi-value[^>]*>\s*\{\{\s*activeCount\s*\}\}/.test(me15View) &&
+    !/kpi-value[^>]*>\s*\{\{\s*cancelledCount\s*\}\}/.test(me15View)
+  // KPI 三卡读 total / totalActive / totalCancelled
+  const me15bKpiUseTotal =
+    /kpi-value[^>]*>\s*\{\{\s*total\s*\}\}/.test(me15View) &&
+    /kpi-value[^>]*>\s*\{\{\s*totalActive\s*\}\}/.test(me15View) &&
+    /kpi-value[^>]*>\s*\{\{\s*totalCancelled\s*\}\}/.test(me15View)
+  const me15b = me15bKpiNotListLength && me15bKpiUseTotal
+  // c. store 维护 cumulative：resetKpiAggregate + accumulateKpi + load 内调用 + upsert/cancel 同步翻转
+  const me15cReset =
+    /function\s+resetKpiAggregate\(\):\s*void\s*\{[\s\S]{0,200}?totalActive\.value\s*=\s*0/.test(me15Store) &&
+    /function\s+resetKpiAggregate\(\):\s*void\s*\{[\s\S]{0,200}?totalCancelled\.value\s*=\s*0/.test(me15Store)
+  const me15cAccumulate =
+    /function\s+accumulateKpi\([\s\S]{0,300}?if\s*\(item\.isActive\)\s*totalActive\.value\s*\+=\s*1/.test(me15Store) &&
+    /function\s+accumulateKpi\([\s\S]{0,300}?else\s*totalCancelled\.value\s*\+=\s*1/.test(me15Store)
+  const me15cLoadCalls =
+    /accumulateKpi\(\s*currentPage\s*\)/.test(me15Store) ||
+    /accumulateKpi\(\s*pageIndex\.value\s*\)/.test(me15Store)
+  const me15c = me15cReset && me15cAccumulate && me15cLoadCalls
+  // d. view 暴露 totalActive / totalCancelled（storeToRefs 解构）
+  const me15dViewExposes =
+    /totalActive[\s\S]{0,40}?totalCancelled[\s\S]{0,80}?=\s*storeToRefs\(/.test(me15View)
+  const me15All = me15aStoreHasRefs && me15b && me15c && me15dViewExposes
+  assert(
+    'ME15 静态：KPI 三卡改读累计值（store totalActive/totalCancelled + cumulative 维护 + view 三卡不读 list.length）',
+    me15All,
+    me15All
+      ? '全齐'
+      : `storeRefs=${me15aStoreHasRefs} kpiUseTotal=${me15bKpiUseTotal} kpiNotPage=${me15bKpiNotListLength} reset=${me15cReset} accumulate=${me15cAccumulate} loadCalls=${me15cLoadCalls} viewExposes=${me15dViewExposes}`
+  )
+
+  /* -------- ME15 动态：dev 联调 GET /api/procurement-manual-eta pageIndex/pageSize 返 PageResult --------
+   *  - 5号位 10-08 已落地分页（dev 实测 total ≥ 1 + 翻 page 真换数据）
+   *  - 翻页不影响 total（与 KPI 累计语义一致）
+   */
+  const me15Page1 = await call('GET', '/api/procurement-manual-eta', {
+    token,
+    query: { pageIndex: 1, pageSize: 20, activeOnly: false }
+  })
+  const me15P1Raw = me15Page1.json?.data
+  const me15P1IsPage = me15P1Raw && typeof me15P1Raw === 'object' && Array.isArray(me15P1Raw.items)
+  const me15P1Ok =
+    me15Page1.code === 200 &&
+    me15P1IsPage &&
+    typeof me15P1Raw.total === 'number' &&
+    me15P1Raw.total >= (me15P1Raw.items?.length ?? 0) &&
+    me15P1Raw.page === 1
+  assert(
+    'ME15 动态：GET /api/procurement-manual-eta?pageIndex=1&pageSize=20&activeOnly=false 返 {items,total,page,pageSize}（5号位 10-08 已落地）',
+    me15P1Ok,
+    me15P1Ok
+      ? `total=${me15P1Raw.total} items=${me15P1Raw.items.length} page=${me15P1Raw.page} pageSize=${me15P1Raw.pageSize}`
+      : `code=${me15Page1.code} shape=${JSON.stringify(me15P1Raw).slice(0, 200)}`
+  )
+  // 翻 page 2 验证 data.items[0] 不同（真翻页）+ data.total 稳定
+  if (me15P1Ok && me15P1Raw.total > me15P1Raw.items.length) {
+    const me15Page2 = await call('GET', '/api/procurement-manual-eta', {
+      token,
+      query: { pageIndex: 2, pageSize: 20, activeOnly: false }
+    })
+    const me15P2Raw = me15Page2.json?.data
+    const me15P2IsPage = me15P2Raw && Array.isArray(me15P2Raw?.items)
+    const me15P2Ok =
+      me15Page2.code === 200 &&
+      me15P2IsPage &&
+      me15P2Raw.page === 2 &&
+      me15P2Raw.total === me15P1Raw.total &&
+      (me15P2Raw.items?.[0]?.poNo !== me15P1Raw.items?.[0]?.poNo ||
+        me15P2Raw.items?.[0]?.lineNo !== me15P1Raw.items?.[0]?.lineNo)
+    assert(
+      'ME15 动态：翻 page 2 真换数据 + total 稳定（KPI cumulative 翻页不跳的语义保证）',
+      me15P2Ok,
+      me15P2Ok
+        ? `p1.items[0]=${me15P1Raw.items?.[0]?.poNo}/${me15P1Raw.items?.[0]?.lineNo} p2.items[0]=${me15P2Raw.items?.[0]?.poNo}/${me15P2Raw.items?.[0]?.lineNo} total=${me15P2Raw.total}（稳定）`
+        : `code=${me15Page2.code} p1[0]=${me15P1Raw.items?.[0]?.poNo} p2[0]=${me15P2Raw.items?.[0]?.poNo} total p1=${me15P1Raw.total} p2=${me15P2Raw?.total}`
+    )
+  } else {
+    skip('ME15 动态：翻 page 2 验证（数据 < 21 条，无法验证翻页真换；不阻断 ME15 主探针）')
+  }
 }
 
 /* ==================== [RC] ResourceCalendar / ManualCapacity ==================== */
@@ -2439,8 +2942,14 @@ async function verifyResourceCalendar(token) {
       : `缺权限码：${missingPerms.join(',')}；bounds=${hasBounds}；三态=${hasStatusValues}`
   )
 
-  /* -------- R04 静态：api/aps-v1/resourceCalendar.ts 9 端点 + 过渡数据源 -------- */
+  /* -------- R04 静态：api/aps-v1/resourceCalendar.ts 9 端点 + 资源主表（G1 已闭环） --------
+   *  - 10-12 RC23：listResourceCandidates（过渡数据源）已撤，改走 listResources（GET /api/resource 正式端点）
+   */
   const apiContent = readSrc('api/aps-v1/resourceCalendar.ts')
+  /** 剥除 JSDoc/行内注释再扫描（避免历史 docstring 误命中） */
+  const apiContentCodeOnly = apiContent
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
   const apiMethods = [
     'bulkCreateWindows',
     'getWindows',
@@ -2451,18 +2960,29 @@ async function verifyResourceCalendar(token) {
     'bulkCreateSlotWindows',
     'getSlotWindows',
     'deleteSlotWindow',
-    'listResourceCandidates',
+    'listResources',
     'listDepartmentCandidates'
   ]
-  const missingApi = apiMethods.filter((m) => !apiContent.includes(m))
+  const missingApi = apiMethods.filter((m) => !apiContentCodeOnly.includes(m))
+  // RC23 探针验证：撤过渡方法（listResourceCandidates 不再存在）—— 仅扫代码
+  const legacyTransitionGone = !/listResourceCandidates/.test(apiContentCodeOnly)
   assert(
-    'RC04 静态：api/aps-v1/resourceCalendar.ts 含 9 端点 + 2 过渡数据源方法',
-    missingApi.length === 0,
-    missingApi.length === 0 ? 'API 封装齐备' : `缺方法：${missingApi.join(',')}`
+    'RC04 静态：api/aps-v1/resourceCalendar.ts 含 9 端点 + 资源主表正式端点 listResources + 撤过渡 listResourceCandidates',
+    missingApi.length === 0 && legacyTransitionGone,
+    missingApi.length === 0
+      ? legacyTransitionGone ? 'API 封装齐备 + 撤过渡已清' : '缺过渡清场'
+      : `缺方法：${missingApi.join(',')}；撤过渡=${legacyTransitionGone}`
   )
 
-  /* -------- R05 静态：store 双缓存 + 三态推导 + 六权限 getter -------- */
+  /* -------- R05 静态：store 双缓存 + 三态推导 + 六权限 getter + 10 动作 --------
+   *  - 10-12 RC23：loadResourceCandidates（过渡）撤 → 改 loadResources（资源主表正式端点）
+   *  - 13 动作 → 10 动作：原 `loadResourceCandidates` 不计入（已撤）
+   */
   const storeContent = readSrc('store/modules/aps/resourceCalendar.ts')
+  /** 剥除 JSDoc/行内注释再扫描（避免历史 docstring 误命中） */
+  const storeContentCodeOnly = storeContent
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
   const storeChecks = [
     'deviceWindowCache',
     'slotWindowCache',
@@ -2473,6 +2993,7 @@ async function verifyResourceCalendar(token) {
     'canViewManual',
     'canEditManual',
     'canDeleteManual',
+    'loadResources',
     'loadDeviceWindows',
     'createDeviceWindows',
     'removeDeviceWindow',
@@ -2483,16 +3004,25 @@ async function verifyResourceCalendar(token) {
     'createSlotWindows',
     'removeSlotWindow'
   ]
-  const missingStore = storeChecks.filter((m) => !storeContent.includes(m))
+  const missingStore = storeChecks.filter((m) => !storeContentCodeOnly.includes(m))
   // statusOf() 返回三个字符串字面量（值，非 object key）→ 用 includes 匹配
   const storeHasTri =
-    storeContent.includes('UNKNOWN') &&
-    storeContent.includes('CONFIGURED') &&
-    storeContent.includes('NOT_CONFIGURED')
+    storeContentCodeOnly.includes('UNKNOWN') &&
+    storeContentCodeOnly.includes('CONFIGURED') &&
+    storeContentCodeOnly.includes('NOT_CONFIGURED')
+  // RC23 探针验证：store 端同步撤 transition state（candidateNote / candidateIsFallback 不再存在）—— 仅扫代码
+  const legacyStoreFieldsGone =
+    !/candidateNote/.test(storeContentCodeOnly) &&
+    !/candidateIsFallback/.test(storeContentCodeOnly) &&
+    !/loadResourceCandidates/.test(storeContentCodeOnly)
   assert(
-    'RC05 静态：store 含双缓存 + 三态推导 + 六权限 getter + 12 动作',
-    missingStore.length === 0 && storeHasTri,
-    missingStore.length === 0 ? 'store 齐备' : `缺项：${missingStore.join(',')}；三态=${storeHasTri}`
+    'RC05 静态：store 含双缓存 + 三态推导 + 六权限 getter + 10 动作 + 撤 transition 字段（candidateNote/candidateIsFallback/loadResourceCandidates）',
+    missingStore.length === 0 && storeHasTri && legacyStoreFieldsGone,
+    missingStore.length === 0
+      ? legacyStoreFieldsGone
+        ? 'store 齐备 + 撤过渡已清'
+        : `撤过渡未清 (candidateNote/candidateIsFallback/loadResourceCandidates)`
+      : `缺项：${missingStore.join(',')}；三态=${storeHasTri}；撤过渡=${legacyStoreFieldsGone}`
   )
 
   /* -------- R06 静态：3 文件存在 + 页面 3 Tab + 顶部三 Alert -------- */
@@ -2506,18 +3036,23 @@ async function verifyResourceCalendar(token) {
     pageContent.includes('人工能力槽') &&
     pageContent.includes('人工槽日历')
   const hasAlerts =
-    pageContent.includes('未配日历 = 不可排') &&
-    pageContent.includes('无有效窗口') &&
+    pageContent.includes('这台设备本级还没登记') &&
+    pageContent.includes('这个工位本级还没登记') &&
     pageContent.includes('该人工槽已停用')
   // 内部协调痕迹不得出现在页面模板（用户可见）：2026-09-27 按用户要求清理
+  // 10-12 RC23：仅扫描 <template> 区域（docstring 历史注释允许保留）；探测「资源池来源 / 手填资源 ID / 过渡」用户可见文本
+  //    - RC08 已用 templateOf() 模式 → 复用同一辅助（模板起始于 <template>）
+  const rc6TemplateStart = pageContent.indexOf('<template>')
+  const pageTemplateOnly = rc6TemplateStart >= 0 ? pageContent.slice(rc6TemplateStart) : pageContent
   const internalLeaks = [
     '冻结文档同步中',
     '过渡数据源（G1 / G2 未决）',
     '待 5号位 交付',
-    '资源池来源'
-  ].filter((t) => pageContent.includes(t))
+    '资源池来源',
+    '手填资源 ID'
+  ].filter((t) => pageTemplateOnly.includes(t))
   assert(
-    'RC06 静态：3 文件存在 + 3 Tab + 上下文态提示保留（未配/不可排/已停用），内部协调提示已清出页面',
+    'RC06 静态：3 文件存在 + 3 Tab + 上下文态提示保留（本级未登记 ×2 / 已停用），内部协调提示已清出页面',
     pageExists && bulkDlgExists && slotDlgExists && hasTabs && hasAlerts && internalLeaks.length === 0,
     `文件:${pageExists}/${bulkDlgExists}/${slotDlgExists}；Tab=${hasTabs}；上下文提示=${hasAlerts}；残留内部提示=${internalLeaks.join(',') || '无'}`
   )
@@ -2565,7 +3100,7 @@ async function verifyResourceCalendar(token) {
   }
   const bulkTpl = templateOf('views/Aps/components/CalendarBulkDialog.vue')
   const slotTpl = templateOf('views/Aps/components/ManualSlotCreateDialog.vue')
-  const hasAppendNotice = bulkTpl.includes('追加') && bulkTpl.includes('不覆盖')
+  // 10-14：铺窗语义由「追加」正名为「覆盖」（后端先删该区间旧窗再逐天 INSERT），RC29 盯那条黄条
   const hasBizHints =
     slotTpl.includes('人工能力槽不是员工') && slotTpl.includes('小工序')
   const leakWords = ['发函', '5号位', '2号位', '待交付', 'expose', '§', '过渡方案']
@@ -2580,9 +3115,9 @@ async function verifyResourceCalendar(token) {
     }
   }
   assert(
-    'RC08 静态：弹窗业务提示保留（追加不覆盖 / 能力槽不是员工）+ 三处模板无内部措辞残留',
-    hasAppendNotice && hasBizHints && tplLeaks.length === 0,
-    `追加=${hasAppendNotice}；业务提示=${hasBizHints}；模板残留=${tplLeaks.join(',') || '无'}`
+    'RC08 静态：弹窗业务提示保留（能力槽不是员工）+ 三处模板无内部措辞残留',
+    hasBizHints && tplLeaks.length === 0,
+    `业务提示=${hasBizHints}；模板残留=${tplLeaks.join(',') || '无'}`
   )
 
   /* -------- R09/R10 端点可达（3号位 绑定脚本落地后已收紧为「要求 200」） -------- */
@@ -2634,6 +3169,523 @@ async function verifyResourceCalendar(token) {
   }
 
   info('RC 段全部为「静态契约 + 端点可达」；C1/G1/G2/G3/G4/D2/D3/G5 缺口见 4号位 致 5号位 函')
+
+  /* -------- RC27 静态：撤 RC19 版本选择器（10-14 增）--------
+   *  业务事实：RC19（10-12 加版本条）的根因是"资源池从 gantt 派生，ACTIVE 版本无 gantt 数据"，
+   *  RC23（同日）改走 GET /api/resource 后该根因已消失；本页不读 gantt/summary，版本维度无消费者。
+   *  且上级工作日历（1/2 级）无版本概念，同一棵树两种口径 → 10-14 用户拍板撤掉版本条。
+   *  - 反向探针自证可失败：把 <div class="version-bar"> 或 selectVersion / useScheduleStore 加回去 → RC27 由绿转红
+   */
+  const rc27NoVersionBar = !/class="version-bar"/.test(pageContent)
+  const rc27NoSelectVersion = !/function\s+selectVersion\s*\(/.test(pageContent)
+  const rc27NoScheduleStore = !/useScheduleStore|scheduleStore\./.test(pageContent)
+  const rc27NoDisplayedVersions = !/displayedVersions|currentVersionId/.test(pageContent)
+  const rc27All = rc27NoVersionBar && rc27NoSelectVersion && rc27NoScheduleStore && rc27NoDisplayedVersions
+  assert(
+    'RC27 静态：撤 RC19 版本选择器（无 version-bar / selectVersion / useScheduleStore / displayedVersions）',
+    rc27All,
+    rc27All
+      ? '全撤'
+      : `bar=${rc27NoVersionBar} sel=${rc27NoSelectVersion} sched=${rc27NoScheduleStore} disp=${rc27NoDisplayedVersions}`
+  )
+
+  info('RC 段全部为「静态契约 + 端点可达」；C1/G1/G2/G3/G4/D2/D3/G5 缺口见 4号位 致 5号位 函')
+
+  /* -------- RC20 静态：Resource Calendar Tab 切换不阻塞（10-12 增） -------- */
+  //  - onTabChange 内不 await 数据加载（fire-and-forget void promise）
+  //  - 3 个 ElTabPane 都加 lazy（Element Plus 内部 keep-alive，未激活 Tab 不挂载）
+  //  - 反向探针自证可失败：把 onTabChange 改回 await 会让 RC20 由绿转红
+  //  - @see 10-12 用户反馈"切到人工能力槽切别的卡顿"
+  const rc20OnTabChangeNoAwait = (() => {
+    // onTabChange 函数体：void (async () => {...})() 之前不能有顶层 await
+    // （IIFE 内部的 await 是合法的 fire-and-forget 模式）
+    const match = pageContent.match(/async\s+function\s+onTabChange\s*\([^)]*\)[^{]*\{([\s\S]*?)\n\s*\}\s*\n/)
+    if (!match) return false
+    const body = match[1]
+    // 找 void (async 起点
+    const voidIdx = body.search(/void\s*\(\s*async/)
+    if (voidIdx < 0) return false
+    // void 之前的部分（函数顶层）
+    const topLevel = body.slice(0, voidIdx)
+    const hasTopLevelAwait = /^\s*await\s+/m.test(topLevel)
+    return !hasTopLevelAwait
+  })()
+  const rc20HasThreeLazyPanes =
+    (pageContent.match(/<ElTabPane[^>]*lazy/g) || []).length >= 3
+  const rc20OnTabChangeKeepsLoadedTabsGuard = /loadedTabs\.value\.has\(name\)/.test(pageContent)
+  const rc20OnTabChangeKeepsErrorHandling = /catch\s*\{[\s\S]*?错误[\s\S]*?\}/.test(pageContent) ||
+    /catch\s*\{[\s\S]*?store handleError[\s\S]*?\}/.test(pageContent)
+  const rc20All =
+    rc20OnTabChangeNoAwait &&
+    rc20HasThreeLazyPanes &&
+    rc20OnTabChangeKeepsLoadedTabsGuard &&
+    rc20OnTabChangeKeepsErrorHandling
+  assert(
+    'RC20 静态：Resource Calendar Tab 切换不阻塞（onTabChange fire-and-forget + 3 ElTabPane lazy + loadedTabs 防重 + 错误由 store 处理）',
+    rc20All,
+    rc20All
+      ? '全齐'
+      : `noAwait=${rc20OnTabChangeNoAwait} lazy=${rc20HasThreeLazyPanes} guard=${rc20OnTabChangeKeepsLoadedTabsGuard} err=${rc20OnTabChangeKeepsErrorHandling}`
+  )
+
+  info('RC 段全部为「静态契约 + 端点可达」；C1/G1/G2/G3/G4/D2/D3/G5 缺口见 4号位 致 5号位 函 + RC20 Tab 切换不阻塞')
+
+  /* -------- RC21 静态：Resource Calendar gantt 慢响应兜底（10-12 增；RC23 收 G1 / RC27 撤版本条后收敛） --------
+   *  原意图："页面首次刷新 gantt/143 很快，但从 tab 切回 device 时这个接口卡 1min"
+   *  - 原根因：selectVersion 主动 fire `void store.loadResourceCandidates` 重复调 gantt（同会话第二次 gantt 卡 1min）
+   *  - RC23 收：listResourceCandidates（过渡数据源）**已撤**，改走 /api/resource（不调 gantt，无卡顿根因）
+   *  - RC27 收（10-14）：selectVersion / 版本条**已撤**，页面不再有 gantt 相关调用方
+   *  - 现仅保留底层兜底契约：schedule.ts getGantt 显式 30s 超时（gantt 页仍在用）
+   *  - 反向探针自证可失败：删 getGantt 的 timeout: 30_000 → RC21 由绿转红
+   *  - @see 4号位 10-12「Resource Calendar gantt/143 第二次卡死」拍板件 + RC23 收口 G1 + RC27 撤版本条
+   */
+  const rc21ScheduleContent = readSrc('api/aps-v1/schedule.ts')
+  const rc21GetGanttHasTimeout =
+    /async\s+getGantt[\s\S]{0,500}?timeout:\s*30_?000/.test(rc21ScheduleContent)
+  assert(
+    'RC21 静态：getGantt 显式 30s 超时（页面侧触发源已由 RC23/RC27 撤除，兜底留在 API 层）',
+    rc21GetGanttHasTimeout,
+    rc21GetGanttHasTimeout ? '全齐' : 'timeout 缺失'
+  )
+
+  /* -------- RC22 静态：Resource Calendar 页面说明区 ElCard→div 收口（10-12 增） --------
+   *  用户反馈：顶部页面说明 ElCard 仅有 header 无 body，空 body 占用行高
+   *  - 修复：原 <ElCard class="rc-intro"> + #header 改为 <div class="rc-intro">，body 高度彻底消除
+   *  - 不动：title/sub/help/role-switcher 4 元素（保留所有 UX 内容）
+   *  - 反向探针自证可失败：把 <ElCard class="rc-intro"> 加回去 → RC22 由绿转红
+   *  - @see 10-12 用户反馈"页面说明区感觉没用，高度去掉"
+   */
+  const rc22IntroNoElCard = !/<ElCard[^>]*class="rc-intro"/.test(pageContent)
+  const rc22IntroStillHasContent =
+    /<div class="rc-intro">[\s\S]*?intro-title[\s\S]*?资源日历维护[\s\S]*?<\/div>/.test(pageContent)
+  const rc22IntroKeepsHelp =
+    /class="intro-help"[\s\S]*?能不能排产，看厂和部门开没开/.test(pageContent)
+  const rc22IntroKeepsRoleSwitcher =
+    /class="role-switcher"[\s\S]*?mockActiveRole/.test(pageContent)
+  const rc22All =
+    rc22IntroNoElCard &&
+    rc22IntroStillHasContent &&
+    rc22IntroKeepsHelp &&
+    rc22IntroKeepsRoleSwitcher
+  assert(
+    'RC22 静态：Resource Calendar 页面说明区 ElCard→div 收口（不留空 body + title/help/role-switcher 内容保留）',
+    rc22All,
+    rc22All
+      ? '全齐'
+      : `noElCard=${rc22IntroNoElCard} hasContent=${rc22IntroStillHasContent} keepsHelp=${rc22IntroKeepsHelp} keepsRoleSwitcher=${rc22IntroKeepsRoleSwitcher}`
+  )
+
+  /* -------- RC25 静态：v1.4 §23 / 废止清单 O-024 覆盖 v1.3 §九（10-14 增；10-14 扩范围）--------
+   *  业务事实：资源日历维护页 = 三级继承第 3 级。冻结 v1.4 line 23 定向覆盖 v1.3 §九——
+   *  「本级无窗口即不可排」**不再是判据**：本级 MISSING 允许继承上级已认证窗口，
+   *  仅当三级计算后仍无权威合法窗口才判不可排（废止清单 O-024 同口径）。
+   *  ⇒ 页面文案只准陈述「本级事实」，**不准断言该资源不可排**（那会教用户白铺窗口）
+   *  - 合并后真实状态暂无查询端点（ResourceCalendarResolver 未挂 Service/Controller），
+   *    已发函 5号位；落地前不得在 UI 伪造三态（@see 4号位-2026-10-14 函）
+   *  - 10-14 扩范围：首轮只扫页面模板，漏掉 2 个弹窗 + 状态标签 description 三处用户可见文案，
+   *    本次一并纳入（教训：口径类探针必须覆盖**全部**渲染来源，而非只看主页面）
+   *  - 反向探针自证可失败：把任一处「本级还没单独登记」改回「未配日历 = 不可排」→ RC25 转红
+   */
+  const rc25TypesContent = readSrc('api/aps-v1/types/resourceCalendar.ts')
+  // 状态标签 description 由 CALENDAR_CONFIG_META 渲染进页面（非字面量在模板里）→ 单独扫该对象
+  const rc25MetaStart = rc25TypesContent.indexOf('export const CALENDAR_CONFIG_META')
+  const rc25MetaBlock =
+    rc25MetaStart >= 0 ? rc25TypesContent.slice(rc25MetaStart, rc25MetaStart + 900) : ''
+  /** 用户可见文案的全部渲染来源 */
+  const rc25UserVisible = [pageTemplateOnly, bulkTpl, slotTpl, rc25MetaBlock].join('\n')
+  const rc25BlanketUnusablePhrases = [
+    '未配日历 = 不可排',
+    '排产判定该设备不可用',
+    '排产判定该人工槽不可用',
+    '无有效日历窗口 = 不可用',
+    '尚无日历窗口 = 不可排',
+    '无有效日历即不可用'
+  ].filter((t) => rc25UserVisible.includes(t))
+  const rc25StatesLocalFact =
+    pageTemplateOnly.includes('这台设备本级还没登记') &&
+    pageTemplateOnly.includes('这个工位本级还没登记') &&
+    pageTemplateOnly.includes('不代表它一定不能排产')
+  const rc25MentionsInheritance =
+    pageTemplateOnly.includes('厂里或部门开放') &&
+    pageTemplateOnly.includes('所属工厂或部门开放') &&
+    /工厂\s*→\s*部门\s*→\s*设备/.test(pageTemplateOnly)
+  // 10-14 增：人工槽弹窗 + 状态标签必须给「本级事实 + 可继承」口径
+  //（批量铺窗弹窗的口径原文已于同日精简撤除 —— 用户反馈弹窗啰嗦，该页改为只留阻塞信息；
+  //  本级事实口径由页面状态行 CALENDAR_CONFIG_META 持续承载，弹窗背后的页面本就可见）
+  const rc25DialogsLocalFact =
+    slotTpl.includes('本级还没单独登记') &&
+    rc25MetaBlock.includes('本级没单独登记') &&
+    rc25MetaBlock.includes('所属工厂或部门开放了，它照样能排产')
+  const rc25All =
+    rc25BlanketUnusablePhrases.length === 0 &&
+    rc25StatesLocalFact &&
+    rc25MentionsInheritance &&
+    rc25DialogsLocalFact
+  assert(
+    'RC25 静态：v1.4 §23/O-024 覆盖 v1.3 §九 —— 页面+人工槽弹窗+状态标签均只陈述本级事实，不断言不可排',
+    rc25All,
+    rc25All
+      ? '均为本级事实口径 + 继承说明齐；无「不可排」断言'
+      : `旧断言残留=${rc25BlanketUnusablePhrases.join(',') || '无'} 页面口径=${rc25StatesLocalFact} 继承说明=${rc25MentionsInheritance} 弹窗/标签口径=${rc25DialogsLocalFact}`
+  )
+
+  /* -------- RC26 静态：设备窗口列表分页（10-14 增）--------
+   *  用户实测：单资源 365 条窗口（批量铺窗 Days 上限 370），整页入 ElTable 无法翻页/定位
+   *  过渡方案：后端 GET /api/resource-calendar/{id} 仍返裸数组（已发函 5号位 改 PageResult），
+   *            前端先切片分页；单资源上限 370 行，切片完全撑得住
+   *  落地后切换成本：store 取数方式换掉，view 与分页组件不动
+   *  - 反向探针自证可失败：把 :data 改回 deviceWindows → RC26b 转红
+   */
+  const rc26StorePaging =
+    /const\s+deviceWindowPage\s*=\s*ref\(1\)/.test(storeContent) &&
+    /const\s+deviceWindowPageSize\s*=\s*ref\(20\)/.test(storeContent) &&
+    /deviceWindowTotal/.test(storeContent) &&
+    /deviceWindowPageRows/.test(storeContent)
+  assert(
+    'RC26a 静态：store 有设备窗口分页 4 件套（deviceWindowPage/PageSize/Total/PageRows）',
+    rc26StorePaging,
+    rc26StorePaging ? '2 ref + 2 computed 齐' : '分页 4 件套缺项'
+  )
+
+  const rc26ViewPaging =
+    /:data="deviceWindowPageRows"/.test(pageContent) &&
+    /v-if="deviceWindowTotal > 0"/.test(pageContent) &&
+    /:page-sizes="\[10, 20, 50, 100, 200\]"/.test(pageContent) &&
+    /layout="total, sizes, prev, pager, next, jumper"/.test(pageContent) &&
+    /@current-change="onDeviceWindowPageChange"/.test(pageContent) &&
+    /@size-change="onDeviceWindowSizeChange"/.test(pageContent)
+  assert(
+    'RC26b 静态：Tab1 设备窗口表用 PageRows + ElPagination 6 属性（同 Tab2 RC24 范式）',
+    rc26ViewPaging,
+    rc26ViewPaging ? '表格切片 + 分页组件 6 属性齐' : '表格/分页组件属性不全'
+  )
+
+  const rc26KeepsFullArray =
+    /const\s+deviceWindows\s*=\s*computed/.test(storeContent) &&
+    /deviceWindowCache\.value\[id\]\s*\?\?\s*\[\]/.test(storeContent) &&
+    /windowCountLabel\(deviceWindows\)/.test(pageContent)
+  assert(
+    'RC26c 静态：deviceWindows 保持全量（空态判断/状态徽标/总条数不得因分页失真）',
+    rc26KeepsFullArray,
+    rc26KeepsFullArray ? '全量与切片分离' : '全量语义被分页污染'
+  )
+
+  const rc26ResetOnSwitch =
+    /if\s*\(currentResourceId\.value\s*!==\s*resourceId\)\s*deviceWindowPage\.value\s*=\s*1/.test(
+      storeContent
+    )
+  assert(
+    'RC26d 静态：切换资源时窗口分页回第 1 页（防沿用上一资源的页码）',
+    rc26ResetOnSwitch,
+    rc26ResetOnSwitch ? 'loadDeviceWindows 内已重置' : '切资源未重置页码'
+  )
+
+  /* -------- RC28 静态：设备归属部门可见（10-14 增）--------
+   *  冻结 v1.4 line 17：「Resource 归部门」是三级继承的硬前提，用户须先知道设备属于哪个车间，
+   *  才能判断「上级（工厂/部门）开没开」——而这正是本页最该帮人做的事。
+   *  事实：后端 ResourceListItemDto 已带 productionDepartmentName（ResourceCalendarDtos.cs:116），
+   *        前端类型早有该字段，此前只是没用（dev 7773 条同名设备无法区分）。
+   *  - 反向探针自证可失败：把 labelOfResource 里的 `（${dept}）` 去掉 / 删状态行部门标签 → RC28 转红
+   */
+  const rc28DropdownShowsDept = /`（\$\{dept\}）`/.test(pageContent)
+  const rc28StatusRowShowsDept =
+    /currentResourceDept/.test(pageContent) &&
+    /所属部门：\{\{ currentResourceDept \}\}/.test(pageTemplateOnly)
+  const rc28TypeHasDept = /productionDepartmentName/.test(readSrc('api/aps-v1/types/resourceCalendar.ts'))
+  const rc28All = rc28DropdownShowsDept && rc28StatusRowShowsDept && rc28TypeHasDept
+  assert(
+    'RC28 静态：设备归属部门可见（下拉 label 带部门 + 状态行「所属部门」标签，用已返回的 productionDepartmentName）',
+    rc28All,
+    rc28All
+      ? '下拉 + 状态行双落点齐'
+      : `dropdown=${rc28DropdownShowsDept} statusRow=${rc28StatusRowShowsDept} type=${rc28TypeHasDept}`
+  )
+
+  /* -------- RC29 静态：撤除本级重叠拦截 + 覆盖语义必须写在弹窗上（10-14 自纠）--------
+   *  自纠背景：本日早些时候按「后端只追加不覆盖」的旧认知加了前端重叠拦截，属功能倒退 ——
+   *  ResourceCalendarService.cs:51-59 / ManualCapacityService.cs:154 起手就是
+   *    DELETE ... WHERE ResourceId=@Id AND StartTime >= @Start AND StartTime < @Start+Days
+   *  再逐天 INSERT，注释明写「覆盖式铺窗…保证无重叠且重复铺窗幂等」。
+   *  既然后端已保证结果无重叠且可幂等重铺，前端再拦 = 凭空阻止合法的「改时段重铺」。
+   *  冻结 v1.4 §21「相同级别重叠矛盾拒绝发布」由后端删除语义天然满足。
+   *  但覆盖 = 会删数据，属破坏性语义，必须让用户在弹窗上看见 → 正向探针盯住那条黄字。
+   *  - 反向探针自证可失败：把 overlappingDates / 提交前 return / 按钮禁用加回去 → 转红；
+   *    删掉「覆盖」黄条 → 转红
+   */
+  const bulkDialogContent = readSrc('views/Aps/components/CalendarBulkDialog.vue')
+  const rc29NoOverlapComputed = !/overlappingDates/.test(bulkDialogContent)
+  const rc29NoSubmitBlock =
+    !/const\s+conflicts\s*=/.test(bulkDialogContent) &&
+    !/时段和已有窗口重叠/.test(bulkDialogContent)
+  const rc29NoDisableBtn = !/:disabled="overlappingDates/.test(bulkTpl)
+  const rc29StatesOverwrite =
+    bulkTpl.includes('这段日期是「覆盖」，不是「追加」') &&
+    bulkTpl.includes('全部删掉') &&
+    bulkTpl.includes('再按你填的时间重新生成')
+  const rc29All =
+    rc29NoOverlapComputed && rc29NoSubmitBlock && rc29NoDisableBtn && rc29StatesOverwrite
+  assert(
+    'RC29 静态：铺窗为覆盖语义（前端不拦重叠 + 弹窗明示「覆盖不是追加」）',
+    rc29All,
+    rc29All
+      ? '无重叠拦截，破坏性语义已上弹窗'
+      : `noComputed=${rc29NoOverlapComputed} noSubmitBlock=${rc29NoSubmitBlock} noDisableBtn=${rc29NoDisableBtn} overwriteCopy=${rc29StatesOverwrite}`
+  )
+
+  /* -------- RC30 静态：批量铺窗弹窗精简（10-14 用户反馈「圈出来的三块都去掉」）--------
+   *  用户原话：弹窗里「键 = xxx」「可用标记的 availableFlag=false 说明」「本次将生成 + 追加语义 +
+   *  现有窗口表格」三块是纯提示，简洁好用即可。
+   *  判断依据：
+   *    - 「键 = 10291」= 内部自增 Id 外露，用户据此排不出车间口径（@see 列表不显示内部 ID 规范）
+   *    - availableFlag=false 是字段名，不是大白话；开关本身已写「可用 / 禁用」
+   *    - 「本次将生成」与按钮「确认铺窗（N 条）」+ 表单本身完全重复
+   *    - 「现有窗口」表格与弹窗背后的页面表 100% 重复，单资源 365 行还把视野挤没了
+   *  保留：必填项 + 时段预设 + 仅冲突时出现的红条（阻塞信息，用户必须看见）
+   *  - 反向探针自证可失败：把任一块加回去 → RC30 转红
+   */
+  const rc30RemovedInternalId = !/键\s*=\s*\{\{/.test(bulkTpl)
+  // 注意：只禁"把字段名当文案讲"（`availableFlag=false` /「禁用窗口（」），
+  // 不要误伤 v-model="form.availableFlag" 这类绑定
+  const rc30RemovedFieldNameHint =
+    !/availableFlag\s*=\s*false/.test(bulkTpl) && !bulkTpl.includes('禁用窗口（')
+  const rc30RemovedSummaryAlerts =
+    !bulkTpl.includes('本次将生成') &&
+    !bulkTpl.includes('追加语义') &&
+    !bulkTpl.includes('不覆盖')
+  const rc30RemovedExistingTable =
+    !bulkTpl.includes('现有窗口') && !/<ElTable/.test(bulkTpl)
+  const rc30KeepsOverwriteAlert = bulkTpl.includes('这段日期是「覆盖」，不是「追加」')
+  const rc30All =
+    rc30RemovedInternalId &&
+    rc30RemovedFieldNameHint &&
+    rc30RemovedSummaryAlerts &&
+    rc30RemovedExistingTable &&
+    rc30KeepsOverwriteAlert
+  assert(
+    'RC30 静态：批量铺窗弹窗精简（无内部 Id / 无字段名说明 / 无重复摘要 / 无现有窗口表，仅保留覆盖黄条）',
+    rc30All,
+    rc30All
+      ? '4 块提示全撤，覆盖黄条保留'
+      : `internalId=${rc30RemovedInternalId} fieldName=${rc30RemovedFieldNameHint} summary=${rc30RemovedSummaryAlerts} existTbl=${rc30RemovedExistingTable} overwriteAlert=${rc30KeepsOverwriteAlert}`
+  )
+
+  /* -------- RC25b 动态：5号位 落地 resolve-preview 后由绿转绿 --------
+   *  冻结 v1.4 §2 三态：WORK / OFF / MISSING；OFF 不得被上级 WORK 复活（v1.4 §18/§21）
+   *  口径来源：4号位-2026-10-14 致 5号位 函 R1（Resolver 已实现，仅缺只读端点）
+   */
+  if (token && process.env.VERIFY_RC25_RESOLVE === '1') {
+    const pResolve = await call('GET', '/api/resource-calendar/resolve-preview', {
+      token,
+      query: { resourceIds: '1', startDate: '2026-10-14', endDate: '2026-11-15' }
+    })
+    const rItems = pResolve.json?.data?.items ?? []
+    const rOk =
+      pResolve.ok &&
+      Array.isArray(rItems) &&
+      rItems.every(
+        (it) =>
+          typeof it.hasAnyWindow === 'boolean' &&
+          ['WORK', 'OFF', 'MISSING'].includes(it.status) &&
+          (it.windows ?? []).every((w) =>
+            ['FACTORY', 'DEPARTMENT', 'RESOURCE'].includes(w.source)
+          )
+      )
+    assert(
+      'RC25b 动态：resolve-preview 返三级合并后状态（hasAnyWindow + status 三态 + windows[].source 来源层级）',
+      rOk,
+      rOk ? `items=${rItems.length} 首项 status=${rItems[0]?.status}` : `ok=${pResolve.ok} body=${JSON.stringify(pResolve.json ?? pResolve).slice(0, 200)}`
+    )
+  } else {
+    skip('RC25b 动态：resolve-preview 三级合并状态（需 5号位 落地 R1 后开 VERIFY_RC25_RESOLVE=1；当前前端按本级事实表述）')
+  }
+
+  info('RC 段全部为「静态契约 + 端点可达」；C1/G1/G2/G3/G4/D2/D3/G5 缺口见 4号位 致 5号位 函 + RC20 Tab 切换不阻塞 + RC21 gantt 慢响应兜底 + RC22 页面说明区 ElCard→div 收口 + RC23 G1 撤过渡切正式端点 + RC27 撤版本选择器')
+
+  /* -------- RC23 静态：Resource Calendar G1 撤过渡切正式端点（10-12 增） --------
+   *  触发：用户问"现实中需要手填资源ID吗"——答案否；
+   *        撤过渡数据源（gantt.resources 派生）+ 撤「手填资源 ID」UI + 撤 closure 缓存
+   *        资源主表正式端点 GET /api/resource（@see ResourceController.cs:34）已落地
+   *  - 6 项契约：
+   *     1. types 含 Resource 接口（resourceId/resourceCode/resourceName/productionDepartmentId/hasCalendar）
+   *     2. api 含 listResources（GET /api/resource） + listDepartmentCandidates（derive）
+   *     3. view 用 el-select-v2 虚拟滚动（dev 7773+ records 必须虚拟滚动，否则 el-select 卡顿）
+   *     4. view 已撤「手填资源 ID」UI
+   *     5. view 已撤「资源池来源/过渡数据源」用户可见提示
+   *     6. store 用 resources（不是 resourceCandidates）/ loadResources（不是 loadResourceCandidates）/ resourcesLoading
+   *  - 反向探针自证可失败：
+   *     - 改回 ElSelect → el-select-v2 失效 → RC23 by 3 由绿转红
+   *     - 加回「手填资源 ID」 → RC23 by 4 由绿转红
+   *     - 改回 resourceCandidates → RC23 by 6 由绿转红
+   */
+  const rc23Types = readSrc('api/aps-v1/types/resourceCalendar.ts')
+  const rc23Store = storeContentCodeOnly
+  // 仅扫 view 的 <template> 区域（docstring 历史 docstring 允许保留：旧「手填资源 ID」→ 撤 / 旧「资源池来源」等）
+  const rc23ViewStartIdx = pageContent.indexOf('<template>')
+  const rc23View = rc23ViewStartIdx >= 0 ? pageContent.slice(rc23ViewStartIdx) : pageContent
+  // 1. types 含 Resource interface + 8 字段（含 hasCalendar）
+  const rc23HasResourceInterface = /export\s+interface\s+Resource\s*\{/.test(rc23Types)
+  const rc23HasHasCalendarField = /hasCalendar/.test(rc23Types)
+  // 2. api 含 listResources + URL '/api/resource'
+  const rc23ApiHasListResources = /async\s+function\s+listResources\s*\(/.test(apiContentCodeOnly) ||
+    /listResources\s*\(/.test(apiContentCodeOnly)
+  const rc23ApiCallsApiResource = /\/api\/resource(?!\-calendar)/.test(apiContentCodeOnly)
+  // 3. view 用 ElSelectV2（虚拟滚动）
+  const rc23UsesSelectV2 = /ElSelectV2/.test(rc23View)
+  // 4. view 已撤「手填资源 ID」UI
+  const rc23NoManualResourceIdUi = !/手填资源 ID/.test(rc23View)
+  // 5. view 已撤「资源池来源/过渡数据源」用户可见提示
+  const rc23NoFallbackHint = !/资源池来源/.test(rc23View) && !/过渡数据源/.test(rc23View)
+  // 6. store 用 resources / loadResources / resourcesLoading（不是 resourceCandidates/loadResourceCandidates）
+  const rc23StoreUsesResources = /const\s+resources\s*=\s*ref/.test(rc23Store)
+  const rc23StoreUsesLoadResources = /async\s+function\s+loadResources\s*\(/.test(rc23Store)
+  const rc23StoreHasResourcesLoading = /resourcesLoading/.test(rc23Store)
+  const rc23StoreNotUsingCandidates = !/resourceCandidates/.test(rc23Store) &&
+    !/loadResourceCandidates/.test(rc23Store)
+  const rc23All =
+    rc23HasResourceInterface &&
+    rc23HasHasCalendarField &&
+    rc23ApiHasListResources &&
+    rc23ApiCallsApiResource &&
+    rc23UsesSelectV2 &&
+    rc23NoManualResourceIdUi &&
+    rc23NoFallbackHint &&
+    rc23StoreUsesResources &&
+    rc23StoreUsesLoadResources &&
+    rc23StoreHasResourcesLoading &&
+    rc23StoreNotUsingCandidates
+  assert(
+    'RC23 静态：G1 撤过渡切正式端点（types Resource 接口 + api listResources/GET /api/resource + view ElSelectV2 + 撤手填 ID + 撤 fallback 提示 + store resources/loadResources/resourcesLoading）',
+    rc23All,
+    rc23All
+      ? '全齐'
+      : `resIfc=${rc23HasResourceInterface} hasCal=${rc23HasHasCalendarField} apiRes=${rc23ApiHasListResources} apiUrl=${rc23ApiCallsApiResource} selV2=${rc23UsesSelectV2} noManual=${rc23NoManualResourceIdUi} noFb=${rc23NoFallbackHint} stRes=${rc23StoreUsesResources} stLoad=${rc23StoreUsesLoadResources} stLoading=${rc23StoreHasResourcesLoading} notCand=${rc23StoreNotUsingCandidates}`
+  )
+
+  info('RC 段全部为「静态契约 + 端点可达」；C1/G1/G2/G3/G4/D2/D3/G5 缺口见 4号位 致 5号位 函 + RC20 Tab 切换不阻塞 + RC21 gantt 慢响应兜底 + RC22 页面说明区 ElCard→div 收口 + RC23 G1 撤过渡切正式端点 + RC24 人工槽分页 + RC27 撤版本选择器')
+
+  /* -------- RC24 静态：人工能力槽 Tab2 接入 PageResult 分页（10-12 增） --------
+   *  触发：5号位 2026-10-12 函 [ManualCapacitySlots分页PageResult已落地-回执]
+   *        R1 已落地（build 0 Error，dev 实测 15360 records + 深页 path 覆盖）
+   *        R2 字段名定为 `page`（同 TSRC/ME/E）
+   *  - 7 项契约：
+   *     a. types 含 ManualCapacitySlotPageResult<T>（items/total/page/pageSize）
+   *     b. api getSlots 返 ManualCapacitySlotPageResult<ManualCapacitySlotDto>
+   *     c. api 显式传 pageIndex + pageSize（含默认 1/20）
+   *     d. ManualSlotQuery 含 pageIndex + pageSize
+   *     e. store 增 slotTotal/slotPage/slotPageSize 3 ref + slotsLoading
+   *     f. store loadSlots 支持 {resetPage, nextPageIndex, nextPageSize} options + 后端回传覆盖
+   *     g. view Tab2 用 ElPagination（6 属性 + pageSizes[10,20,50,100,200]） + applyFilter resetPage:true
+   *  - 反向探针自证可失败：
+   *     - 删 ManualCapacitySlotPageResult → RC24a 由绿转红
+   *     - 改回返数组 → RC24b 由绿转红
+   *     - 删 pageIndex/pageSize 默认 → RC24c 由绿转红
+   *     - 删 store 3 ref → RC24e 由绿转红
+   *     - 删 ElPagination → RC24g 由绿转红
+   */
+  const rc24Types = readSrc('api/aps-v1/types/resourceCalendar.ts')
+  // a. types 含 ManualCapacitySlotPageResult<T> 包装
+  const rc24HasPageResult = /export\s+interface\s+ManualCapacitySlotPageResult\s*<T>/.test(rc24Types) &&
+    /items:\s*T\[\]/.test(rc24Types) && /page:\s*number/.test(rc24Types)
+  // d. ManualSlotQuery 含 pageIndex + pageSize
+  const rc24QueryHasPaging = /pageIndex\?:/.test(rc24Types) && /pageSize\?:/.test(rc24Types)
+  // b+c. api getSlots 返 PageResult + 显式传 pageIndex/pageSize
+  const rc24GetSlotsReturnsPage = /getSlots[\s\S]{0,400}?Promise<ManualCapacitySlotPageResult<ManualCapacitySlotDto>>/.test(apiContentCodeOnly)
+  const rc24GetSlotsSendsPage = /getSlots[\s\S]{0,1500}?pageIndex:\s*page\b/.test(apiContentCodeOnly) &&
+    /getSlots[\s\S]{0,1500}?pageSize:\s*size\b/.test(apiContentCodeOnly)
+  // e. store 增 slotTotal/slotPage/slotPageSize 3 ref
+  const rc24StoreHas3Ref =
+    /const\s+slotTotal\s*=\s*ref<number>\(0\)/.test(storeContentCodeOnly) &&
+    /const\s+slotPage\s*=\s*ref<number>\(1\)/.test(storeContentCodeOnly) &&
+    /const\s+slotPageSize\s*=\s*ref<number>\(20\)/.test(storeContentCodeOnly)
+  // f. loadSlots 支持 options（resetPage / nextPageIndex / nextPageSize）+ 后端回传覆盖
+  const rc24LoadSlotsSupportsOptions = /async\s+function\s+loadSlots[\s\S]{0,500}?resetPage\?:\s*boolean/.test(storeContentCodeOnly) &&
+    /async\s+function\s+loadSlots[\s\S]{0,500}?nextPageIndex\?:\s*number/.test(storeContentCodeOnly) &&
+    /async\s+function\s+loadSlots[\s\S]{0,500}?nextPageSize\?:\s*number/.test(storeContentCodeOnly)
+  const rc24LoadSlotsEchoesPage = /slots\.value\s*=\s*res\.items/.test(storeContentCodeOnly) &&
+    /slotTotal\.value\s*=\s*res\.total/.test(storeContentCodeOnly) &&
+    /slotPage\.value\s*=\s*res\.page/.test(storeContentCodeOnly)
+  // g. view ElPagination 6 属性 + pageSizes + applyFilter resetPage:true
+  const rc24ViewElPagination =
+    /<ElPagination[\s\S]{0,500}?v-if="slotTotal\s*>\s*0"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?:current-page="slotPage"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?:page-size="slotPageSize"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?:total="slotTotal"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?:page-sizes="\[10,\s*20,\s*50,\s*100,\s*200\]"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?@current-change="onSlotPageChange"/.test(rc23View) &&
+    /<ElPagination[\s\S]{0,800}?@size-change="onSlotSizeChange"/.test(rc23View)
+  // searchSlots / resetSlotFilter 必传 resetPage: true（script setup 中）
+  const rc24ViewApplyFilterResets =
+    /store\.loadSlots\(\s*\{[\s\S]{0,200}?\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/.test(pageContent) ||
+    /store\.loadSlots\([\s\S]{0,300}?resetPage:\s*true/.test(pageContent)
+  // onSlotPageChange / onSlotSizeChange 函数定义（script setup 中）
+  const rc24ViewHasCallbacks =
+    /async\s+function\s+onSlotPageChange/.test(pageContent) &&
+    /async\s+function\s+onSlotSizeChange/.test(pageContent)
+  const rc24All =
+    rc24HasPageResult &&
+    rc24QueryHasPaging &&
+    rc24GetSlotsReturnsPage &&
+    rc24GetSlotsSendsPage &&
+    rc24StoreHas3Ref &&
+    rc24LoadSlotsSupportsOptions &&
+    rc24LoadSlotsEchoesPage &&
+    rc24ViewElPagination &&
+    rc24ViewApplyFilterResets &&
+    rc24ViewHasCallbacks
+  assert(
+    'RC24 静态：人工能力槽 Tab2 接入 PageResult 分页（types PageResult + api getSlots 返包装 + store 3 ref + loadSlots options + view ElPagination 6 属性 + applyFilter resetPage）',
+    rc24All,
+    rc24All
+      ? '全齐'
+      : `type=${rc24HasPageResult} query=${rc24QueryHasPaging} apiRet=${rc24GetSlotsReturnsPage} apiSend=${rc24GetSlotsSendsPage} stRef=${rc24StoreHas3Ref} stOpt=${rc24LoadSlotsSupportsOptions} stEcho=${rc24LoadSlotsEchoesPage} viewPg=${rc24ViewElPagination} applyReset=${rc24ViewApplyFilterResets} cb=${rc24ViewHasCallbacks}`
+  )
+
+  /* -------- RC24 动态：GET /api/manual-capacity/slots pageIndex/pageSize 返 PageResult --------
+   *  5号位 10-12 实测 15360 records + pageSize≤200
+   *  - RC24h：pageIndex=1&pageSize=2 → items.length≤2 且 total≥items.length
+   *  - RC24i：pageSize=9999 → 后端 Math.Clamp=200（仿 TSRC14k）
+   */
+  let rc24h = await call('GET', '/api/manual-capacity/slots', {
+    token,
+    query: { pageIndex: 1, pageSize: 2, includeInactive: false }
+  })
+  const rc24hRaw = rc24h.json?.data
+  const rc24hIsPage = rc24hRaw && typeof rc24hRaw === 'object' && Array.isArray(rc24hRaw.items)
+  const rc24hItems = rc24hIsPage ? rc24hRaw.items : null
+  const rc24hOk =
+    rc24h.code === 200 &&
+    rc24hIsPage &&
+    rc24hItems.length <= 2 &&
+    typeof rc24hRaw.total === 'number' &&
+    rc24hRaw.total >= rc24hItems.length &&
+    rc24hRaw.page === 1
+  assert(
+    'RC24h 动态：GET /api/manual-capacity/slots?pageIndex=1&pageSize=2 返 {items,total,page,pageSize}（5号位 10-12 已落地）',
+    rc24hOk,
+    rc24hOk
+      ? `total=${rc24hRaw.total} items=${rc24hItems.length} page=${rc24hRaw.page} pageSize=${rc24hRaw.pageSize}`
+      : `code=${rc24h.code} shape=${JSON.stringify(rc24hRaw).slice(0, 200)}`
+  )
+
+  let rc24i = await call('GET', '/api/manual-capacity/slots', {
+    token,
+    query: { pageIndex: 1, pageSize: 9999, includeInactive: false }
+  })
+  const rc24iRaw = rc24i.json?.data
+  const rc24iIsPage = rc24iRaw && typeof rc24iRaw === 'object' && Array.isArray(rc24iRaw.items)
+  if (rc24iIsPage) {
+    // 5号位 10-12 函 R1：pageSize 默认 20、上限 200（越界回落 20）→ pageSize=9999 应被后端兜回 ≤200
+    const rc24iOk = rc24i.code === 200 && rc24iRaw.pageSize <= 200 && rc24iRaw.items.length <= 200
+    assert(
+      'RC24i 动态：GET /api/manual-capacity/slots?pageSize=9999 → 后端兜回 ≤200（5号位 10-12 函上限 200）',
+      rc24iOk,
+      rc24iOk
+        ? `pageSize=${rc24iRaw.pageSize} items=${rc24iRaw.items.length}（已兜回）`
+        : `pageSize=${rc24iRaw.pageSize} items=${rc24iRaw.items.length}`
+    )
+  } else {
+    skip('RC24i 动态：dev 端尚未返 PageResult（10-12 部署可能滞后），无法验证上限兜底')
+  }
 }
 
 /**
@@ -3509,6 +4561,927 @@ async function verifyTaskSplitRuleConfig(token) {
 }
 
 /**
+ * [ST] Setup 换型规则 4 页（setup — 10-14 命名/红线横幅/时区三项整改）
+ *
+ * 依据：frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
+ *  - §四 默认换型规则粒度   §五 三层命中优先级   §18 缺失规则数据治理   §19.2 4号位页面职责
+ *
+ * 本组守 10-14 三项整改不回退：
+ *  - ST01 页面命名收敛到冻结术语且菜单 ≤6 字
+ *  - ST02 内部协调横幅 SetupRedlineAlert 已删除（组件 + 4 处引用）
+ *  - ST03 悬空的 v1.5 §N / S0N 文档引用已清零（那些章节号在任何现行有效文档里都不存在）
+ * 时区修复由 S03/S04 守（4 页已并入 datetimePages），此处只做"辅助函数不再存在"的结构兜底。
+ */
+async function verifySetupPages() {
+  log('\n[ST] Setup 换型规则 4 页（setup — 2026-10-14 命名/横幅/悬空引用整改）')
+
+  const setupViews = [
+    'views/Aps/SetupExact.vue',
+    'views/Aps/SetupDefault.vue',
+    'views/Aps/SetupUncovered.vue',
+    'views/Aps/SetupDiff.vue'
+  ]
+  const setupSrc = setupViews.map((p) => readSrc(p))
+  const routerSrc = readSrc('router/modules/aps.ts')
+
+  /* -------- ST01 静态：菜单/标题用冻结术语且 ≤6 字 -------- */
+  const st01Titles = [
+    { key: '明确产品转换', re: /title:\s*'明确产品转换'/ },
+    { key: '默认换型规则', re: /title:\s*'默认换型规则'/ },
+    { key: '缺失规则查询', re: /title:\s*'缺失规则查询'/ },
+    { key: '规则版本对比', re: /title:\s*'规则版本对比'/ }
+  ]
+  const st01TitlesOk = st01Titles.every((t) => t.re.test(routerSrc) && t.key.length <= 6)
+  const st01NoStaleTitle =
+    !/title:\s*'(明确产品转换规则|默认 Setup 规则|未维护 Setup 查询|Setup 版本 Diff)'/.test(routerSrc)
+  const st01All =
+    st01TitlesOk && st01NoStaleTitle
+  assert(
+    'ST01 静态：Setup 4 页菜单用冻结术语（明确产品转换/默认换型规则/缺失规则查询/规则版本对比）且 ≤6 字',
+    st01All,
+    st01All
+      ? st01Titles.map((t) => t.key).join(' / ')
+      : `titles=${st01TitlesOk} noStale=${st01NoStaleTitle}`
+  )
+
+  // h2 标题文本须与菜单一致且无（EXACT）/（DEFAULT）后缀；允许标题后跟内联元素（如 ⓘ tooltip）
+  const st01bH2 = [
+    /<h2>\s*明确产品转换\s*(?:<\/h2>|<)/.test(setupSrc[0]),
+    /<h2>\s*默认换型规则\s*(?:<\/h2>|<)/.test(setupSrc[1]),
+    /<h2>\s*缺失规则查询\s*(?:<\/h2>|<)/.test(setupSrc[2]),
+    /<h2>\s*规则版本对比\s*(?:<\/h2>|<)/.test(setupSrc[3])
+  ].every(Boolean)
+  const st01cOldTermGone = !setupSrc.some((c) => /明确产品转换规则（EXACT）|默认换型规则（DEFAULT）/.test(c))
+  const st01bAll = st01bH2 && st01cOldTermGone
+  assert(
+    'ST01b 静态：Setup 4 页 <h2> 与菜单一致，且去掉「（EXACT）/（DEFAULT）」后缀',
+    st01bAll,
+    st01bAll ? 'h2 四页齐 + 旧后缀清零' : `h2=${st01bH2} oldTermGone=${st01cOldTermGone}`
+  )
+
+  /* -------- ST02 静态：内部协调横幅已删除 -------- */
+  const st02ComponentGone = !existsSync(
+    join(__dirname, '..', 'src', 'views', 'Aps', 'components', 'SetupRedlineAlert.vue')
+  )
+  const st02NoRef = !setupSrc.some((c) => /SetupRedlineAlert/.test(c))
+  const st02NoStrayKey = !setupSrc.some((c) => /aps\.setup\.redline\.expanded/.test(c))
+  const st02All = st02ComponentGone && st02NoRef && st02NoStrayKey
+  assert(
+    'ST02 静态：SetupRedlineAlert 红线横幅已删除（组件文件 + 4 处引用 + localStorage key）',
+    st02All,
+    st02All
+      ? '组件文件不存在，4 页零引用'
+      : `componentGone=${st02ComponentGone} noRef=${st02NoRef} noStrayKey=${st02NoStrayKey}`
+  )
+
+  /* -------- ST03 静态：悬空 v1.5 章节引用清零 -------- */
+  const allSetupFiles = [
+    ...setupViews,
+    'views/Aps/components/SetupExactDialog.vue',
+    'views/Aps/components/SetupDefaultDialog.vue',
+    'store/modules/aps/setupExact.ts',
+    'store/modules/aps/setupDefault.ts',
+    'store/modules/aps/setupUncovered.ts',
+    'store/modules/aps/setupDiff.ts',
+    'api/aps-v1/setup.ts',
+    'api/aps-v1/types/setup.ts',
+    'api/aps-v1/types/schedule.ts'
+  ]
+  const st03Hits = allSetupFiles.filter((p) =>
+    /v1\.5\s*§|v1\.5 Setup 专项|§7\.1|§7\.2|§3\.3|§5\.4|§6\.3|§4\.2|§5\.5/.test(readSrc(p))
+  )
+  const st03Router = !/acceptance:\s*'v1\.5/.test(routerSrc)
+  const st03All = st03Hits.length === 0 && st03Router
+  assert(
+    'ST03 静态：Setup 全 13 文件 + 路由 meta 不再引用不存在的 v1.5 §N / S0N 章节',
+    st03All,
+    st03All
+      ? `已扫 ${allSetupFiles.length} 文件全清零`
+      : `残留：${st03Hits.join(', ')} router=${st03Router}`
+  )
+
+  /* -------- ST04 静态：Setup 页不再自建时区辅助函数（裸 dayjs 由 S04 兜底） -------- */
+  const st04NoHelper = !setupSrc.some((c) => /function\s+formatDateTime\s*\(/.test(c))
+  const st04UseUtil = setupSrc.every((c) => /from\s+['"]@\/utils\/datetime['"]/.test(c))
+  const st04All = st04NoHelper && st04UseUtil
+  assert(
+    'ST04 静态：Setup 4 页不再包 formatDateTime 辅助函数，统一直调 @/utils/datetime',
+    st04All,
+    st04All ? '4 页直调 formatUtcDateTimeSec' : `noHelper=${st04NoHelper} useUtil=${st04UseUtil}`
+  )
+
+  /* -------- ST05 静态：Setup 下拉不再硬编码占位值，改接后端主数据 lookup -------- */
+  const st05Files = [
+    'views/Aps/SetupExact.vue',
+    'views/Aps/SetupDefault.vue',
+    'views/Aps/SetupUncovered.vue',
+    'views/Aps/components/SetupExactDialog.vue',
+    'views/Aps/components/SetupDefaultDialog.vue',
+    'views/Aps/composables/useSetupMasterData.ts',
+    'api/aps-v1/resourceLookup.ts'
+  ]
+  // 占位值：DEPT_A/B、STAGE_1/2、MC001-3、MAT_A-X、OP10/20/30、MOCK_RESOURCE_IDS
+  const st05Placeholder = /DEPT_[AB]|STAGE_[12]|MC00[123]|MAT_[ABCXY]|MOCK_RESOURCE_IDS/
+  const st05Hits = st05Files.filter((p) => st05Placeholder.test(readSrc(p)))
+  assert(
+    'ST05 静态：Setup 4 页 + 2 Dialog + composable 无硬编码下拉占位值',
+    st05Hits.length === 0,
+    st05Hits.length === 0
+      ? `已扫 ${st05Files.length} 文件全清零`
+      : `残留：${st05Hits.join(', ')}`
+  )
+
+  // composable 必须真的打了三个 lookup 端点，且大工艺由 stageCode 派生
+  const mdSrc = readSrc('views/Aps/composables/useSetupMasterData.ts')
+  const st05Endpoints =
+    mdSrc.includes("'/api/governance/lookups/departments'") === false &&
+    mdSrc.includes('departmentLookupApi.listDepartments()') &&
+    mdSrc.includes('resourceLookupApi.listResources()') &&
+    mdSrc.includes('materialLookupApi.listActiveMaterials()')
+  const st05StageDerived = /stageCode[\s\S]{0,200}seen\.add|seen\.add\(code\)/.test(mdSrc)
+  assert(
+    'ST05 静态：useSetupMasterData 走 department/resource/material 三个 lookup，大工艺由 stageCode 派生',
+    st05Endpoints && st05StageDerived,
+    `endpoints=${st05Endpoints} stageDerived=${st05StageDerived}`
+  )
+
+  // Dialog 的 Code→Id 解析必须走 masterData，不得回 mock 常量
+  const st05Dialogs = [
+    'views/Aps/components/SetupExactDialog.vue',
+    'views/Aps/components/SetupDefaultDialog.vue'
+  ]
+  const st05NoMockResolve = st05Dialogs.every((p) => {
+    const c = readSrc(p)
+    return !/MOCK_RESOURCE_IDS/.test(c) && /masterData\.\w+IdByCode\(/.test(c)
+  })
+  assert(
+    'ST05 静态：两个 Dialog 的 Code→Id 解析走 masterData（不再 mock 常量映射）',
+    st05NoMockResolve,
+    st05NoMockResolve ? '2 个 Dialog 全部走后端 lookup Id' : '仍有 mock 映射残留'
+  )
+
+  /* -------- ST06 静态：明确产品转换页的用词是给车间看的大白话（10-15 4号位）--------
+   *  依据：Setup 专项指导 v1.2 §五 三层命中优先级（EXACT → DEFAULT → 无规则按 0 分钟）
+   *  - 副标题撤掉内部词「共同合法设备」（那是 OperationResourceEligibility 的实现口径，车间不关心）
+   *  - 三层优先级收进 ⓘ tooltip：业务规则进 tooltip，不上横幅（见「页面不放内部协调提示」）
+   *  - 反向探针自证可失败：副标题改回「共同合法设备」或 tooltip 被删 → 转红
+   */
+  const exactVueSrc = readSrc('views/Aps/SetupExact.vue')
+  const st06NoJargonSubtitle =
+    /<p class="subtitle">[^<]*换型时间/.test(exactVueSrc) &&
+    !/共同合法设备/.test(exactVueSrc.split('<template>')[1] ?? '')
+  assert(
+    'ST06a 静态：明确产品转换页副标题用大白话，模板区无「共同合法设备」内部词',
+    st06NoJargonSubtitle,
+    st06NoJargonSubtitle ? '副标题已改业务口径' : '副标题仍含内部实现词或已非换型口径'
+  )
+
+  const st06ThreeTierHint =
+    /<ElTooltip[\s\S]{0,400}vi-ep:question-filled/.test(exactVueSrc) &&
+    /①[\s\S]*前产品[\s\S]*②[\s\S]*默认换型规则[\s\S]*③[\s\S]*0\s*分钟/.test(exactVueSrc)
+  assert(
+    'ST06b 静态：三层命中优先级（明确→默认→0分钟兜底）在 ⓘ tooltip 里对用户讲清',
+    st06ThreeTierHint,
+    st06ThreeTierHint ? 'tooltip 三行齐全' : 'tooltip 缺失或三层说不全'
+  )
+
+  /* -------- ST07 静态：部门/大工艺筛选不得列「必然 0 条」的选项（10-15 4号位）--------
+   *  依据：用户 10-15 指令「页面中不要有假数据……一定要保证能前后端联调成功，用户能用」
+   *  - 原写法：两个下拉列 lookups 的全量主数据，用户选一个当前版本没有规则的部门 → 列表必然 0 条
+   *  - 现写法：选项 = 当前版本规则里真实出现过的 departmentCode / stageCode（数据仍是后端返回的真规则）
+   *  - 补部门→大工艺级联 + 换版本清空，避免留下必然 0 条的组合
+   *  - 反向探针自证可失败：改回 masterData.departments / 去掉 watch 级联 → 转红
+   */
+  const st07Pages = [
+    ['SetupExact', readSrc('views/Aps/SetupExact.vue')],
+    ['SetupDefault', readSrc('views/Aps/SetupDefault.vue')]
+  ]
+  for (const [pageName, src] of st07Pages) {
+    const optsDerived =
+      /const departmentOptions = computed\([\s\S]{0,300}rules\.value[\s\S]{0,300}masterData\.departments\.value\.filter/.test(
+        src
+      ) &&
+      /const stageOptions = computed\([\s\S]{0,400}filterDepartment\.value[\s\S]{0,400}masterData\.stages\.value\.filter/.test(
+        src
+      )
+    assert(
+      `ST07a 静态：${pageName} 部门/大工艺选项取自当前版本真实规则，不再列 lookups 全量主数据`,
+      optsDerived,
+      optsDerived ? '两个选项均已按规则实有值收窄' : '选项仍取全量主数据，会列出必然 0 条的项'
+    )
+
+    // 模板必须消费收窄后的选项，且不得再直接遍历 masterData
+    const usesDerived =
+      /v-for="opt in departmentOptions"/.test(src) && /v-for="opt in stageOptions"/.test(src)
+    assert(
+      `ST07b 静态：${pageName} 两个筛选下拉改绑 departmentOptions / stageOptions`,
+      usesDerived,
+      usesDerived ? '模板已改绑' : '模板仍绑全量主数据'
+    )
+
+    // 级联 + 换版本清空两条 watch
+    const hasCascade =
+      /watch\(filterDepartment[\s\S]{0,400}stageOptions\.value\.some/.test(src) &&
+      /watch\(selectedRuleSetVersionId[\s\S]{0,300}filterDepartment\.value = ''/.test(src)
+    assert(
+      `ST07c 静态：${pageName} 部门→大工艺级联收窄 + 换规则集版本清空两个筛选`,
+      hasCascade,
+      hasCascade ? '两条 watch 齐全' : '缺级联或换版本未清空，会留下必然 0 条的组合'
+    )
+  }
+
+  /* -------- ST08 静态：治理版 store 不得用 feature-detect 落空后返回手写桩（10-15 4号位）--------
+   *  依据：同上用户指令。原写法 `if ((ruleApi as any).getRuleSetVersion)` 恒为假（方法不存在），
+   *  于是真实联调路径上永远返回 versionCode `v-{id}` / ruleSetId 0 的桩对象——比 mock 更危险。
+   *  反向探针自证可失败：改回 (ruleApi as any).* 或删掉 ruleApi.getRuleSetVersion 调用 → 转红
+   */
+  const rulesStore = readSrc('store/modules/aps/rules.ts')
+  const ruleApiSrc = readSrc('api/aps-v1/rule.ts')
+  // 注释里提到旧写法不算桩，先剥掉注释再判
+  const rulesStoreCode = rulesStore.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const st08NoStub =
+    !/\(ruleApi as any\)/.test(rulesStoreCode) &&
+    /return ruleApi\.getRuleSetVersion\(versionId\)/.test(rulesStore) &&
+    /return ruleApi\.getParameterSetVersion\(versionId\)/.test(rulesStore)
+  assert(
+    'ST08a 静态：rules store 取 RS/PS 版本走 ruleApi 正式方法，无 feature-detect 手写桩',
+    st08NoStub,
+    st08NoStub ? '已是真实 GET' : '仍有 (ruleApi as any) 桩路径或未接真实方法'
+  )
+  const st08ApiExists =
+    /async getRuleSetVersion\(versionId: number\)/.test(ruleApiSrc) &&
+    /async getParameterSetVersion\(versionId: number\)/.test(ruleApiSrc) &&
+    /\/api\/governance\/rule-set\/version\/\$\{versionId\}/.test(ruleApiSrc) &&
+    /\/api\/governance\/parameter-set\/version\/\$\{versionId\}/.test(ruleApiSrc)
+  assert(
+    'ST08b 静态：ruleApi 补齐 getRuleSetVersion / getParameterSetVersion 指向后端单版本端点',
+    st08ApiExists,
+    st08ApiExists ? '两个方法已补' : 'api 侧方法缺失，store 会走桩'
+  )
+
+  /* -------- ST09 静态：打包环境绝不能开 mock（10-15 4号位）--------
+   *  依据：同上用户指令「一定要保证上线后能用」。VITE_USE_MOCK=true 会同时
+   *   ① viteMockServe 把 mock/ 全量注入生产包；② 让 api/aps-v1/*.ts 的 APS_USE_MOCK 分支返回 MOCK_* 桩。
+   *  四个 env 文件必须全为 false。反向探针：把 .env.pro 改回 true → 转红
+   */
+  const envFiles = ['.env.base', '.env.dev', '.env.pro', '.env.test']
+  const badEnvs = envFiles.filter((f) => {
+    try {
+      return !/^VITE_USE_MOCK=false$/m.test(readFileSync(join(__dirname, '..', f), 'utf-8'))
+    } catch {
+      return true
+    }
+  })
+  assert(
+    'ST09 静态：4 个 env 文件 VITE_USE_MOCK 全为 false（生产包不得携带 mock / APS_USE_MOCK 桩）',
+    badEnvs.length === 0,
+    badEnvs.length === 0 ? 'base/dev/pro/test 四档均关' : `以下文件仍开 mock：${badEnvs.join('、')}`
+  )
+
+  /* -------- ST10 静态：主数据 TOP 200 截断 + §19.2 一台或多台设备（10-15 4号位）--------
+   *  依据：用户指令「按照真实的现场使用来改，别为了能跑通前端随意修改，为了线上能用」。
+   *  根因：后端 lookups 三端点 SQL 都是 `SELECT TOP (@Limit) ... ORDER BY [Code]`，
+   *  limit 是仓储默认值（MasterDataLookupRepository.cs:87/98/108）且 Controller 不透传
+   *  （SetupRuleController.cs:299-347）→ 不带 search 永远只有字母序前 200 条。
+   *  解法：
+   *   ST10d 远程搜索（api 层 search* 三个方法一直存在却从未被调用）
+   *   ST10a/b 设备下拉改由 eligibility.resources 驱动（该集合不限 200、已按 Department Scope 过滤）
+   *   ST10e 大工艺由所选部门自动带出（部门→大工艺 1:1）
+   *   ST10f §19.2「一台或多台设备」：create 多选 + **串行**提交（并发会丢规则）
+   *  反向探针：把 resourceOptions 改回 masterData.resources / 把 for 改成 Promise.all / 去掉 remote → 转红
+   */
+  const masterDataSrc = readSrc('views/Aps/composables/useSetupMasterData.ts')
+  const exactDialogSrc = readSrc('views/Aps/components/SetupExactDialog.vue')
+  const defaultDialogSrc = readSrc('views/Aps/components/SetupDefaultDialog.vue')
+  const setupTypesSrc = readSrc('api/aps-v1/types/setup.ts')
+
+  // ST10d：composable 三个远程搜索走既有 api 的 search*，且结果 **merge 进** 列表而非替换。
+  // 必须锁「调用点也走 mergeBy」——只查 mergeBy 的定义的话，把调用点改回直接赋值同样能绿。
+  // 断言用 [\s\S] 容忍 eslint --fix 的换行重排。
+  const st10dSearch =
+    /rawDepartments\.value = mergeBy\(\s*rawDepartments\.value,\s*await departmentLookupApi\.searchDepartments\(/.test(
+      masterDataSrc
+    ) &&
+    /rawResources\.value = mergeBy\(\s*rawResources\.value,\s*await resourceLookupApi\.searchResources\(/.test(
+      masterDataSrc
+    ) &&
+    /rawMaterials\.value = mergeBy\(\s*rawMaterials\.value,\s*await materialLookupApi\.searchMaterials\(/.test(
+      masterDataSrc
+    )
+  const st10dMerge = /function mergeBy[\s\S]{0,600}return extra\.length \? \[\.\.\.base, \.\.\.extra\] : base/.test(
+    masterDataSrc
+  )
+  assert(
+    'ST10d 静态：useSetupMasterData 三个远程搜索走既有 api 的 search*，且结果 merge 进列表（不替换，已选项不消失）',
+    st10dSearch && st10dMerge,
+    st10dSearch
+      ? st10dMerge
+        ? 'search* + merge 齐（三处调用点均 merge）'
+        : '缺 mergeBy 定义'
+      : '有 search* 直接赋值替换了列表（会把用户已选项挤出下拉），或没走既有 api 的 search* 方法'
+  )
+
+  // ST10a：设备下拉由 eligibility 明细驱动
+  const st10a =
+    /const eligibilityResources = ref</.test(exactDialogSrc) &&
+    /const resourceOptions = computed<SetupLookupOption\[\]>\(\(\) => \{[\s\S]{0,200}!eligibilityResources\.value\) return masterData\.resources\.value[\s\S]{0,600}eligibilityResources\.value\.map/.test(
+      exactDialogSrc
+    )
+  assert(
+    'ST10a 静态：明确产品转换的设备下拉由 eligibility.resources 明细驱动（不受 lookups TOP 200 截断）',
+    st10a,
+    st10a ? '回落 masterData → 用后端交集明细' : '仍只从 masterData.resources（字母序前 200）取设备'
+  )
+
+  // ST10b：resolveResourceId 含 eligibility 明细回退
+  const st10b =
+    /function resolveResourceId\(code: string\)[\s\S]{0,600}eligibilityResources\.value\?\.find\([\s\S]{0,120}resourceId[\s\S]{0,200}masterData\.resourceIdByCode/.test(
+      exactDialogSrc
+    )
+  assert(
+    'ST10b 静态：resolveResourceId 三级回退（编辑态双返回 → eligibility 明细 → 主数据）',
+    st10b,
+    st10b ? '三级回退齐' : '缺 eligibility 明细回退：字母序 200 之外的设备解析不到 Id'
+  )
+
+  // ST10c：远程搜索绑定到模板（两个 Dialog + 缺失规则查询页，三个消费面）
+  const uncoveredSrc = readSrc('views/Aps/SetupUncovered.vue')
+  const st10cRemote =
+    (exactDialogSrc.match(/\bremote\b/g) ?? []).length >= 3 &&
+    /:remote-method="onSearchDepartment"/.test(exactDialogSrc) &&
+    /:remote-method="onSearchMaterial"/.test(exactDialogSrc) &&
+    /:remote-method="onSearchDepartment"/.test(defaultDialogSrc) &&
+    /:remote-method="onSearchResource"/.test(defaultDialogSrc) &&
+    /:remote-method="onSearchDepartment"/.test(uncoveredSrc) &&
+    /:remote-method="onSearchResource"/.test(uncoveredSrc)
+  assert(
+    'ST10c 静态：两个 Dialog + 缺失规则查询页的部门/产品/设备下拉改 remote + remote-method',
+    st10cRemote,
+    st10cRemote ? 'Exact 3 处 + Default 2 处 + Uncovered 2 处' : '有下拉未接远程搜索（TOP 200 之外的项选不到）'
+  )
+
+  // ST10e：大工艺由所选部门自动带出
+  const st10e =
+    /watch\(\s*\(\) => form\.departmentCode[\s\S]{0,300}masterData\.stageOfDepartment\(code\)[\s\S]{0,200}form\.stageCode = stage/.test(
+      exactDialogSrc
+    ) &&
+    /watch\(\s*\(\) => form\.departmentCode[\s\S]{0,300}masterData\.stageOfDepartment\(code\)[\s\S]{0,200}form\.stageCode = stage/.test(
+      defaultDialogSrc
+    )
+  assert(
+    'ST10e 静态：大工艺由所选部门自动带出（部门→大工艺 1:1，仍可手动改）',
+    st10e,
+    st10e ? '两个 Dialog 均有 stageOfDepartment 联动' : '有 Dialog 未做部门→大工艺联动'
+  )
+
+  // ST10f：create 多选 + 串行提交（并发必丢规则：后端 create 是读改写 ContentSnapshotJson）
+  const st10fMulti =
+    /:multiple="isCreate"/.test(exactDialogSrc) && /:multiple="isCreate"/.test(defaultDialogSrc)
+  const st10fSerial =
+    /for \(let i = 0; i < resourceIds\.length; i\+\+\)[\s\S]{0,200}await exactStore\.createRule/.test(
+      exactDialogSrc
+    ) &&
+    /for \(let i = 0; i < resourceIds\.length; i\+\+\)[\s\S]{0,200}await defaultStore\.createRule/.test(
+      defaultDialogSrc
+    )
+  const st10fNoPromiseAll =
+    !/Promise\.all\(\s*(?:form\.resourceCodes|resourceIds\.map)/.test(exactDialogSrc) &&
+    !/Promise\.all\(\s*(?:form\.resourceCodes|resourceIds\.map)/.test(defaultDialogSrc)
+  assert(
+    'ST10f 静态：§19.2「一台或多台设备」—— create 多选 + 逐台串行建单（不得 Promise.all，并发会丢换型规则）',
+    st10fMulti && st10fSerial && st10fNoPromiseAll,
+    !st10fMulti
+      ? '设备未按 create 多选'
+      : !st10fSerial
+        ? '提交不是逐台串行循环'
+        : st10fNoPromiseAll
+          ? '两处均串行'
+          : '检测到对 resourceCodes 用了 Promise.all —— 后端 create 是读改写同一列，并发会覆盖丢规则'
+  )
+
+  // ST10g：resourceId 已转必填（3号位 Q1 投影在 dev 实测生效：M102 → resourceId 13394，S-11-d）
+  // 故意断言「必填」而非「可选」：退回可选 = 类型系统不再保证资格集合自带主键，
+  // 将来后端回退部署时前端连编译期保护都没有。
+  const st10gRequired = /resources\?: Array<\{[\s\S]{0,400}resourceId: number/.test(setupTypesSrc)
+  const st10gOptional = /resources\?: Array<\{[\s\S]{0,400}resourceId\?: number/.test(setupTypesSrc)
+  assert(
+    'ST10g 静态：OperationResourceEligibilityDto.resources 的 resourceId 已转必填（3号位 Q1 已生效，S-11-d）',
+    st10gRequired && !st10gOptional,
+    st10gRequired && !st10gOptional
+      ? '已转必填，与后端非空 int 一致'
+      : st10gOptional
+        ? '退回可选：类型系统不再保证资格集合自带主键'
+        : '缺 resourceId 必填声明'
+  )
+
+  // ST10h：TOP 200 命中上限时必须对用户明说（截断静默 = 用户以为没有这条数据）
+  const st10h =
+    /truncated\.value\s*=[\s\S]{0,300}BACKEND_LOOKUP_LIMIT/.test(masterDataSrc) &&
+    /v-if="masterData\.truncated\.value"/.test(exactDialogSrc) &&
+    /v-if="masterData\.truncated\.value"/.test(defaultDialogSrc)
+  assert(
+    'ST10h 静态：主数据返满 200 条即置 truncated，并在两个 Dialog 明示「请用编码搜索」（不得静默截断）',
+    st10h,
+    st10h ? 'truncated 判定 + 两处提示齐' : '截断对用户不可见，用户会以为数据不存在'
+  )
+
+  // ST10i：后端 Q1 的 resourceId 未部署期间的兜底——三处本地解析落空时按编码向后端补拉
+  // （10-15 用户报「选设备保存报无法解析主数据 Id」；dev 实测资格集合只有 763-2，首屏 200 条不含它）
+  const st10i =
+    /async function resolveResourceIds/.test(exactDialogSrc) &&
+    /await resolveResourceIds\(form\.resourceCodes\)/.test(exactDialogSrc) &&
+    /await masterData\.searchResources\(code\)/.test(exactDialogSrc) &&
+    /ids\[codes\.indexOf\(code\)\]\s*=\s*masterData\.resourceIdByCode\(code\)/.test(exactDialogSrc)
+  assert(
+    'ST10i 静态：设备 Id 三处本地解析落空时按编码调 searchResources 补拉（否则本 Dialog 无法远程搜索，用户无从自救）',
+    st10i,
+    st10i ? '已补拉兜底' : '只会本地三查就报错，字母序 200 之外的合法设备必然保存失败'
+  )
+}
+
+/**
+ * [PWC] ProductionWorkCalendar 三级日历治理（pwc — 10-13 5号位 PWC 函 + v1.4 §三/§九 联调备料）
+ * 验收依据：5号位 2026-10-13《ProductionWorkCalendar三级日历维护接口文档 — 给4号位》
+ *  - 状态：G1 候选，前端按联调备料版落地（v1.3 继续有效 + PWC 路由与维护页并行）
+ *  - 三态语义：WORK / OFF / MISSING（无行，UI 不造）
+ *  - 三级继承：FACTORY → DEPARTMENT → 资源（StageCode 非固定第 4 层）
+ *  - 权限码：暂复用 aps.resource_calendar.{view,edit,delete}（5号位 函 §〇.2）
+ *  - PageResult 字段名 = `page`（§〇.3）
+ */
+async function verifyProductionWorkCalendar(token) {
+  log('\n[PWC] ProductionWorkCalendar 三级日历治理（pwc — 2026-10-13 5号位 PWC 函联调备料）')
+
+  // PWC01 静态：types/productionWorkCalendar.ts 含核心 DTO + Request + PageResult
+  const pwcTypes = readSrc('api/aps-v1/types/productionWorkCalendar.ts')
+  const pwc01a = /export\s+interface\s+ProductionWorkCalendarDto\b/.test(pwcTypes)
+  assert('PWC01a 静态：types 含 ProductionWorkCalendarDto', pwc01a, pwc01a ? '已含' : '缺 DTO')
+
+  const pwc01b =
+    /export\s+interface\s+WeeklyCalendarUpsertRequest\b/.test(pwcTypes) &&
+    /export\s+interface\s+WorkCalendarExceptionRequest\b/.test(pwcTypes) &&
+    /export\s+interface\s+CalendarCloseOpenRequest\b/.test(pwcTypes)
+  assert('PWC01b 静态：types 含 Weekly/Exception/CloseOpen 3 类 Request', pwc01b, pwc01b ? '3 Request 齐' : '缺 Request')
+
+  const pwc01c =
+    /export\s+interface\s+ProductionWorkCalendarPageResult<T>\s*\{[\s\S]*?items:\s*T\[\][\s\S]*?total:\s*number[\s\S]*?page:\s*number[\s\S]*?pageSize:\s*number[\s\S]*?\}/.test(pwcTypes)
+  assert(
+    'PWC01c 静态：types 含 ProductionWorkCalendarPageResult<T>（字段统一为 page）',
+    pwc01c,
+    pwc01c ? '字段名 page' : 'PageResult 字段名错位（与 5号位 函 §〇.3 不符）'
+  )
+
+  // PWC02 静态：types/index.ts 已 re-export productionWorkCalendar
+  const pwcIndex = readSrc('api/aps-v1/types/index.ts')
+  const pwc02 = /export\s+\*\s+from\s+['"]\.\/productionWorkCalendar['"]/.test(pwcIndex)
+  assert('PWC02 静态：types/index.ts re-export ./productionWorkCalendar', pwc02, pwc02 ? '已 re-export' : '缺 re-export')
+
+  // PWC03 静态：api/productionWorkCalendar.ts 含 6 端点
+  const pwcApi = readSrc('api/aps-v1/productionWorkCalendar.ts')
+  const pwc03a = /async\s+query\s*\(\s*query\s*:\s*ProductionWorkCalendarQuery/.test(pwcApi)
+  assert('PWC03a 静态：api 含 query(query: ProductionWorkCalendarQuery)', pwc03a, pwc03a ? '已含' : '缺 query')
+
+  const pwc03b = /async\s+upsertWeekly\s*\(\s*req\s*:\s*WeeklyCalendarUpsertRequest/.test(pwcApi)
+  assert('PWC03b 静态：api 含 upsertWeekly(req: WeeklyCalendarUpsertRequest)', pwc03b, pwc03b ? '已含' : '缺 upsertWeekly')
+
+  const pwc03c = /async\s+createException\s*\(\s*req\s*:\s*WorkCalendarExceptionRequest/.test(pwcApi)
+  assert('PWC03c 静态：api 含 createException(req: WorkCalendarExceptionRequest)', pwc03c, pwc03c ? '已含' : '缺 createException')
+
+  const pwc03d = /async\s+closeOpen\s*\(\s*req\s*:\s*CalendarCloseOpenRequest/.test(pwcApi)
+  assert('PWC03d 静态：api 含 closeOpen(req: CalendarCloseOpenRequest)', pwc03d, pwc03d ? '已含' : '缺 closeOpen')
+
+  const pwc03e = /async\s+closeRow\s*\(\s*id\s*:\s*number\s*,\s*effectiveTo\s*:\s*string/.test(pwcApi)
+  assert('PWC03e 静态：api 含 closeRow(id, effectiveTo)', pwc03e, pwc03e ? '已含' : '缺 closeRow')
+
+  const pwc03f = /async\s+deleteRow\s*\(\s*id\s*:\s*number/.test(pwcApi)
+  assert('PWC03f 静态：api 含 deleteRow(id)', pwc03f, pwc03f ? '已含' : '缺 deleteRow')
+
+  // PWC04 静态：6 端点 URL 路径与 5号位 函 §一~§五 对齐
+  const pwc04a = /['"`]\/api\/production-work-calendar['"`]/.test(pwcApi)
+  assert('PWC04a 静态：query URL = /api/production-work-calendar', pwc04a, pwc04a ? '已对齐' : '路径错')
+
+  const pwc04b = /['"`]\/api\/production-work-calendar\/weekly['"`]/.test(pwcApi)
+  assert('PWC04b 静态：upsertWeekly URL = /api/production-work-calendar/weekly', pwc04b, pwc04b ? '已对齐' : '路径错')
+
+  const pwc04c = /['"`]\/api\/production-work-calendar\/exception['"`]/.test(pwcApi)
+  assert('PWC04c 静态：createException URL = /api/production-work-calendar/exception', pwc04c, pwc04c ? '已对齐' : '路径错')
+
+  const pwc04d = /['"`]\/api\/production-work-calendar\/close['"`]/.test(pwcApi)
+  assert('PWC04d 静态：closeOpen URL = /api/production-work-calendar/close', pwc04d, pwc04d ? '已对齐' : '路径错')
+
+  const pwc04e = /\/api\/production-work-calendar\/rows\/\$\{id\}\/close/.test(pwcApi)
+  assert('PWC04e 静态：closeRow URL = /api/production-work-calendar/rows/${id}/close', pwc04e, pwc04e ? '已对齐' : '路径错')
+
+  const pwc04f = /\/api\/production-work-calendar\/rows\/\$\{id\}['"`]/.test(pwcApi)
+  assert('PWC04f 静态：deleteRow URL = /api/production-work-calendar/rows/${id}', pwc04f, pwc04f ? '已对齐' : '路径错')
+
+  // PWC05 静态：三态语义在 API 层有注释 / 元数据
+  const pwc05a = /MISSING/.test(pwcTypes) && /WORK/.test(pwcTypes) && /OFF/.test(pwcTypes)
+  assert(
+    'PWC05a 静态：types 含三态类型（WORK / OFF）+ MISSING 派生说明（MISSING 不存为虚拟行）',
+    pwc05a,
+    pwc05a ? '三态齐' : '三态缺失'
+  )
+
+  // PWC05b 静态：生产日历配置状态元数据覆盖 4 态
+  const pwc05b =
+    /WORK:\s*\{/.test(pwcTypes) &&
+    /OFF:\s*\{/.test(pwcTypes) &&
+    /MISSING:\s*\{/.test(pwcTypes) &&
+    /UNKNOWN:\s*\{/.test(pwcTypes)
+  assert('PWC05b 静态：PRODUCTION_CALENDAR_STATUS_META 覆盖 4 态（WORK/OFF/MISSING/UNKNOWN）', pwc05b, pwc05b ? '4 态齐' : '缺态')
+
+  // PWC06 静态：api/aps-v1/index.ts 已 re-export productionWorkCalendarApi
+  const pwcApsIndex = readSrc('api/aps-v1/index.ts')
+  const pwc06 = /export\s*\{\s*productionWorkCalendarApi\s*\}\s*from\s*['"]\.\/productionWorkCalendar['"]/.test(pwcApsIndex)
+  assert('PWC06 静态：api/aps-v1/index.ts re-export productionWorkCalendarApi', pwc06, pwc06 ? '已 re-export' : '缺 re-export')
+
+  // PWC07 静态：Pinia store 落地（5 ref + 6 action 范式）
+  const pwcStore = readSrc('store/modules/aps/productionWorkCalendar.ts')
+  const pwc07a = /export\s+const\s+useProductionWorkCalendarStore\s*=/.test(pwcStore)
+  assert('PWC07a 静态：store 含 useProductionWorkCalendarStore', pwc07a, pwc07a ? '已含' : '缺 store')
+
+  const pwc07b =
+    /async\s+function\s+load\s*\(/.test(pwcStore) &&
+    /async\s+function\s+upsertWeekly\s*\(/.test(pwcStore) &&
+    /async\s+function\s+createException\s*\(/.test(pwcStore) &&
+    /async\s+function\s+closeOpen\s*\(/.test(pwcStore) &&
+    /async\s+function\s+closeRow\s*\(/.test(pwcStore) &&
+    /async\s+function\s+deleteRow\s*\(/.test(pwcStore)
+  assert('PWC07b 静态：store 含 load/upsertWeekly/createException/closeOpen/closeRow/deleteRow 6 动作', pwc07b, pwc07b ? '6 动作齐' : '缺动作')
+
+  // PWC07c 静态：store 复用 aps.resource_calendar.{view,edit,delete}（5号位 函 §〇.2）
+  const pwc07c =
+    /RESOURCE_CALENDAR_PERMISSIONS\b/.test(pwcStore) &&
+    /canView[\s\S]*?\bview\b/.test(pwcStore) &&
+    /canEdit[\s\S]*?\bedit\b/.test(pwcStore) &&
+    /canDelete[\s\S]*?\bdelete\b/.test(pwcStore)
+  assert('PWC07c 静态：store 权限码复用 aps.resource_calendar.{view,edit,delete}（5号位 函 §〇.2）', pwc07c, pwc07c ? '复用' : '权限码错位')
+
+  // PWC08 静态：路由 + 页面
+  const pwcRouter = readSrc('router/modules/aps.ts')
+  const pwc08a = /path:\s*['"]production-work-calendar['"]/.test(pwcRouter)
+  assert('PWC08a 静态：router/modules/aps.ts 含 path=production-work-calendar', pwc08a, pwc08a ? '路由已占位' : '缺路由')
+
+  const pwc08b = /aps\.resource_calendar\.view/.test(pwcRouter)
+  assert('PWC08b 静态：PWC 路由 meta 复用 aps.resource_calendar.view 守卫', pwc08b, pwc08b ? '复用守卫码' : '守卫码错位')
+
+  const pwcPagePath = 'views/Aps/ProductionWorkCalendar.vue'
+  const pwc08c = existsSync(join(SRC_ROOT, pwcPagePath))
+  assert(`PWC08c 静态：${pwcPagePath} 存在`, pwc08c, pwc08c ? '页面已落地' : '缺页面')
+
+  // PWC08d 静态：页面 ElPagination + pageSizes 范式
+  const pwcPage = readSrc('views/Aps/ProductionWorkCalendar.vue')
+  const pwc08d = /ElPagination\b/.test(pwcPage) && /:page-sizes=("?)\[10,\s*20,\s*50,\s*100,\s*200\]\1/.test(pwcPage)
+  assert(
+    'PWC08d 静态：PWC 页面用 ElPagination + pageSizes=[10,20,50,100,200]（仿 TSRC 范式）',
+    pwc08d,
+    pwc08d ? '分页组件齐' : '分页组件/参数错'
+  )
+
+  // PWC09 静态：MISSING 永不造虚拟行（v1.4 §2 + 5号位 函 §七）
+  //  - types DTO 不暴露 MISSING-virtual-row 字段；UI 不展示"未配置=VISIBLE"
+  //  - 这是设计守卫：MISSING = 无行；UI 列表只展示真行
+  const pwc09 = !/MISSING:\s*\{[^}]*isVirtual:\s*true\b/.test(pwcTypes)
+  assert(
+    'PWC09 静态：MISSING 不暴露为可见虚拟行字段（v1.4 §2 + 5号位 函 §七）',
+    pwc09,
+    pwc09 ? '纯列表式守卫 OK' : '泄漏虚拟行字段（违反 MISSING 不存约定）'
+  )
+
+  // PWC10 动态：联调真实端点（dev 库 10-12 实测已有 ~55 行 SourceSystem=TEST 备料数据）
+  //  - 真实调 GET /api/production-work-calendar?pageIndex=1&pageSize=20
+  //  - 预期：r.ok=true 且 data 是 PageResult{ items, total, page, pageSize }
+  //  - 不可达兜底：r.code === 401/403/404/500 一律视为「端点未达」
+  const pwc10r = await call('GET', '/api/production-work-calendar', {
+    token,
+    query: { pageIndex: 1, pageSize: 20 }
+  })
+  const pwc10data = pwc10r.json?.data
+  const pwc10pageOk =
+    pwc10r.ok &&
+    pwc10data !== null &&
+    typeof pwc10data === 'object' &&
+    Array.isArray(pwc10data.items) &&
+    typeof pwc10data.total === 'number' &&
+    pwc10data.page === 1
+  assert(
+    'PWC10 动态：GET /api/production-work-calendar?pageIndex=1&pageSize=20（dev 库备料数据）',
+    pwc10pageOk,
+    pwc10pageOk
+      ? `total=${pwc10data.total}, page=${pwc10data.page}, items=${pwc10data.items.length}, sourceSystem=${pwc10data.items[0]?.sourceSystem ?? 'n/a'}`
+      : `code=${pwc10r.code}, message=${pwc10r.json?.message || pwc10r.text?.slice(0, 100) || '未知'}（可能 dev 库 schema 未跑迁移）`
+  )
+
+  // PWC11 动态：scopeType=FACTORY 过滤（5号位 函 §一参数）
+  if (pwc10pageOk) {
+    const pwc11r = await call('GET', '/api/production-work-calendar', {
+      token,
+      query: { scopeType: 'FACTORY', pageIndex: 1, pageSize: 50 }
+    })
+    const pwc11data = pwc11r.json?.data
+    const pwc11ok =
+      pwc11r.ok &&
+      Array.isArray(pwc11data?.items) &&
+      pwc11data.items.every((r) => r.scopeType === 'FACTORY')
+    assert(
+      'PWC11 动态：GET /api/production-work-calendar?scopeType=FACTORY 过滤生效（items 全为 FACTORY）',
+      pwc11ok,
+      pwc11ok ? `命中 ${pwc11data.items.length} 条 FACTORY` : `code=${pwc11r.code} 形态=${typeof pwc11data?.items}`
+    )
+  } else {
+    skip('PWC11 动态：scopeType=FACTORY 过滤（依赖 PWC10 联调可达）')
+  }
+
+  // PWC12 动态：pageIndex=1&pageSize=2 应 < total（PWC10 必达）
+  if (pwc10pageOk && pwc10data.total >= 2) {
+    const pwc12r = await call('GET', '/api/production-work-calendar', {
+      token,
+      query: { pageIndex: 1, pageSize: 2 }
+    })
+    const pwc12data = pwc12r.json?.data
+    const pwc12ok =
+      pwc12r.ok &&
+      Array.isArray(pwc12data?.items) &&
+      pwc12data.items.length <= 2 &&
+      pwc12data.pageSize <= 200 /* 函 §〇.3 上限 200 */
+    assert(
+      'PWC12 动态：pageSize=2 正常截断 + pageSize 上限=200 守住',
+      pwc12ok,
+      pwc12ok
+        ? `items=${pwc12data.items.length}, pageSize=${pwc12data.pageSize}, total=${pwc12data.total}`
+        : `code=${pwc12r.code} items=${pwc12data?.items?.length} pageSize=${pwc12data?.pageSize}`
+    )
+  } else {
+    skip('PWC12 动态：pageSize 截断 + 上限 200（依赖 PWC10 + total≥2）')
+  }
+
+  // PWC13 静态：5 个写 action 成功后都 resetPage=true（防"翻页后看不到新行"翻车）
+  //  - upsertWeekly / createException / closeOpen / closeRow / deleteRow
+  //  - 必须 await load({}, { resetPage: true })，不能 await load() 或 await load(someQuery)
+  const writeActions = [
+    { name: 'upsertWeekly', re: /async\s+function\s+upsertWeekly[\s\S]*?await\s+load\(\s*\{\s*\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/ },
+    { name: 'createException', re: /async\s+function\s+createException[\s\S]*?await\s+load\(\s*\{\s*\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/ },
+    { name: 'closeOpen', re: /async\s+function\s+closeOpen[\s\S]*?await\s+load\(\s*\{\s*\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/ },
+    { name: 'closeRow', re: /async\s+function\s+closeRow[\s\S]*?await\s+load\(\s*\{\s*\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/ },
+    { name: 'deleteRow', re: /async\s+function\s+deleteRow[\s\S]*?await\s+load\(\s*\{\s*\}\s*,\s*\{\s*resetPage:\s*true\s*\}\s*\)/ }
+  ]
+  const pwc13AllOk = writeActions.every((a) => a.re.test(pwcStore))
+  const pwc13Missing = writeActions.filter((a) => !a.re.test(pwcStore)).map((a) => a.name)
+  assert(
+    'PWC13 静态：5 个写 action 成功后 load({}, { resetPage: true }) 锁"翻页后能看到新行"',
+    pwc13AllOk,
+    pwc13AllOk
+      ? '5/5 写 action 全走 resetPage'
+      : `缺失：${pwc13Missing.join(', ')}（仍是 await load() 翻页会丢失新行）`
+  )
+
+  // PWC14 静态：3 弹窗 FactoryId/DepartmentId 用 ElSelect 名称下拉（不用 ElInputNumber）
+  //  - 锁"@see feedback_list_id_to_name：列表/筛选/弹窗展示名称"
+  //  - 不再要求"部门归属厂 hint"（10-13 用户要简洁，撤掉）
+  const pwcVue = readSrc('views/Aps/ProductionWorkCalendar.vue')
+  const noInputNumber = !/ElInputNumber/.test(pwcVue)
+  const threeFactorySelects =
+    (pwcVue.match(/<ElFormItem\s+label="工厂">/g) ?? []).length >= 3
+  const threeDeptSelects =
+    (pwcVue.match(/<ElFormItem[^>]*label="部门"/g) ?? []).length >= 3
+  const pwc14AllOk = noInputNumber && threeFactorySelects && threeDeptSelects
+  assert(
+    'PWC14 静态：3 弹窗 FactoryId/DepartmentId 改 ElSelect（不用 ElInputNumber）',
+    pwc14AllOk,
+    pwc14AllOk
+      ? `3×工厂+3×部门 ElSelect`
+      : `noInputNumber=${noInputNumber} factoryLabels=${threeFactorySelects} deptLabels=${threeDeptSelects}`
+  )
+
+  // PWC15 静态：业务用户不接触 sourceSystem/sourceReference（@see feedback_no_internal_notices_in_ui）
+  //  - 弹窗里不能有 label="数据来源" 或 label="数据来源系统" 的 ElFormItem
+  //  - exception 弹窗的 sourceReference 必须 v-if="isAuthorizedOverride"（override 才显示）
+  //  - weeklyDraft / exceptionDraft 默认 sourceSystem='MANUAL'（前端常驻）
+  const noSourceSystemLabel = !/label="数据来源"/.test(pwcVue)
+  const exceptionOverrideVIf =
+    /<ElFormItem\s+v-if="exceptionDraft\.isAuthorizedOverride"\s+label="加班依据/.test(pwcVue)
+  const weeklySourceSystemManual =
+    /const\s+weeklyDraft\s*=\s*ref[\s\S]{0,800}?sourceSystem:\s*['"]MANUAL['"]/.test(pwcVue)
+  const exceptionSourceSystemManual =
+    /const\s+exceptionDraft\s*=\s*ref[\s\S]{0,1200}?sourceSystem:\s*['"]MANUAL['"]/.test(pwcVue)
+  const pwc15AllOk =
+    noSourceSystemLabel &&
+    exceptionOverrideVIf &&
+    weeklySourceSystemManual &&
+    exceptionSourceSystemManual
+  assert(
+    'PWC15 静态：业务用户不接触数据来源（sourceSystem 前端常驻 MANUAL + sourceReference 仅 override 显示）',
+    pwc15AllOk,
+    pwc15AllOk
+      ? '无 label="数据来源" + override-v-if + 双 MANUAL 默认'
+      : `noLabel=${noSourceSystemLabel} overrideVIf=${exceptionOverrideVIf} weeklyMANUAL=${weeklySourceSystemManual} exceptionMANUAL=${exceptionSourceSystemManual}`
+  )
+
+  // PWC16 静态：3 处日期输入用 ElDatePicker（用户体验：日历选 vs 手输 yyyy-MM-dd）
+  //  - 工作周设置 effectiveFrom / 日期例外 workDate / 批量换版 newEffectiveFrom
+  //  - 日期例外的生效区间已从弹窗删除（例外天然只管 workDate 一天，effectiveFrom 提交时 = workDate）
+  //  - 模板里 ElDatePicker 必须配 type="date" + value-format="YYYY-MM-DD"
+  const dpPattern = /<ElDatePicker[\s\S]*?v-model="(\w+)\.(\w+)"[\s\S]*?type="date"[\s\S]*?value-format="YYYY-MM-DD"/g
+  const dpBindings = new Set()
+  for (const m of pwcVue.matchAll(dpPattern)) dpBindings.add(`${m[1]}.${m[2]}`)
+  const expectBindings = [
+    'weeklyDraft.effectiveFrom',
+    'exceptionDraft.workDate',
+    'closeOpenDraft.newEffectiveFrom'
+  ]
+  const allDpCovered = expectBindings.every((k) => dpBindings.has(k))
+  const noManualDateInput = expectBindings.every(
+    (k) => !new RegExp(`<ElInput[^>]*v-model="${k.replace('.', '\\.')}"[^>]*placeholder="yyyy-MM-dd"`).test(pwcVue)
+  )
+  const noExceptionEffectiveFields = !/exceptionDraft\.effectiveFrom/.test(pwcVue) && !/exceptionDraft\.effectiveTo/.test(pwcVue)
+  const exceptionUsesWorkDate =
+    /effectiveFrom:\s*exceptionDraft\.value\.workDate/.test(pwcVue)
+  const pwc16AllOk = allDpCovered && noManualDateInput && noExceptionEffectiveFields && exceptionUsesWorkDate
+  assert(
+    'PWC16 静态：3 处日期输入用 ElDatePicker + 日期例外生效区间不出现在弹窗',
+    pwc16AllOk,
+    pwc16AllOk
+      ? `${dpBindings.size} 处绑定 + 例外 effectiveFrom←workDate`
+      : `dpCovered=${allDpCovered} noManual=${noManualDateInput} noEffField=${noExceptionEffectiveFields} useWorkDate=${exceptionUsesWorkDate}`
+  )
+
+  // PWC17 静态：列表不渲染来源字段（sourceSystem / sourceReference）
+  //  - 与弹窗口径一致（@see feedback_no_internal_notices_in_ui：业务用户不接触内部协调字段）
+  //  - 加班授权列必须保留（AllowLowerOverride / IsAuthorizedOverride 是 v1.4 §四 三授权旗核心业务语义）
+  //  - 文案按冻结文档 v1.12 基线「授权加班必须有真实可追溯覆盖」用中文，不用 Alo/Aao 字段名
+  const noSourceColumn = !/label="来源"/.test(pwcVue)
+  const noSourceSystemRender = !/row\.sourceSystem/.test(pwcVue)
+  const noSourceReferenceRender = !/row\.sourceReference\s*\}/.test(pwcVue)
+  const authFlagsKept =
+    /label="加班授权"/.test(pwcVue) &&
+    /允许下级加班/.test(pwcVue) &&
+    /本行是授权加班/.test(pwcVue) &&
+    /row\.allowLowerOverride/.test(pwcVue) &&
+    /row\.isAuthorizedOverride/.test(pwcVue)
+  const noFieldNameLeak = !/label="Alo=1"/.test(pwcVue) && !/label="Aao=1"/.test(pwcVue)
+  const pwc17AllOk =
+    noSourceColumn && noSourceSystemRender && noSourceReferenceRender && authFlagsKept && noFieldNameLeak
+  assert(
+    'PWC17 静态：列表隐藏来源列 + 加班授权列中文文案（Alo/Aao 不露字段名）',
+    pwc17AllOk,
+    pwc17AllOk
+      ? '无来源列 + 加班授权（允许下级加班 / 本行是授权加班）'
+      : `noCol=${noSourceColumn} noSys=${noSourceSystemRender} noRef=${noSourceReferenceRender} authFlags=${authFlagsKept} noLeak=${noFieldNameLeak}`
+  )
+
+  // PWC18 静态：筛选区不暴露 includeInactive 开关（后端无路径产生 IsActive=0 行）
+  //  - Service.cs:239-242 CloseRow 只写 EffectiveTo；:213-220 CloseOpen 同；:276 INSERT 恒写 IsActive=1
+  //  - 无「含停用」文案 + 无 filterIncludeInactive 引用（防复现无效开关）
+  const noIncludeInactiveText = !/含停用/.test(pwcVue)
+  const noIncludeInactiveState = !/filterIncludeInactive/.test(pwcVue)
+  const pwc18AllOk = noIncludeInactiveText && noIncludeInactiveState
+  assert(
+    'PWC18 静态：筛选区无「含停用」开关（后端无 IsActive=0 产生路径）',
+    pwc18AllOk,
+    pwc18AllOk
+      ? '无「含停用」文案 + 无 filterIncludeInactive'
+      : `noText=${noIncludeInactiveText} noState=${noIncludeInactiveState}`
+  )
+
+  // PWC19 静态：UI 文案不露后端字段值（WORK/OFF/scopeType/Id/sourceReference 等）
+  //  - 列表状态列 + 2 弹窗状态选择 + 校验提示 + 弹窗标题全用中文
+  //  - types 层契约注释（PRODUCTION_CALENDAR_STATUS_META 等）不算 UI，不锁
+  const uiJargon = [
+    /<ElRadioButton value="WORK">WORK</,
+    /<ElRadioButton value="OFF">OFF</,
+    /<ElOption label="WORK" value="WORK"/,
+    /<ElOption label="OFF" value="OFF"/,
+    /ElMessage\.warning\('WORK /,
+    /ElMessage\.warning\('IsAuthorizedOverride/,
+    /ElMessage\.warning\('AllowLowerOverride/,
+    /ElMessage\.warning\('DEPARTMENT 范围/,
+    /'请至少添加一条 entry'/
+  ]
+  const leakedJargon = uiJargon.filter((re) => re.test(pwcVue))
+  const chineseStateLabels =
+    /<ElRadioButton value="WORK">要工作</.test(pwcVue) &&
+    /<ElRadioButton value="OFF">不工作</.test(pwcVue) &&
+    /<ElOption label="要工作" value="WORK"/.test(pwcVue) &&
+    /<ElOption label="不工作" value="OFF"/.test(pwcVue)
+  const pwc19AllOk = leakedJargon.length === 0 && chineseStateLabels
+  assert(
+    'PWC19 静态：UI 文案不露字段值（WORK/OFF → 要工作/不工作，校验提示全中文）',
+    pwc19AllOk,
+    pwc19AllOk
+      ? '状态选择 + 校验提示全中文'
+      : `leaked=${leakedJargon.length} (${leakedJargon.join(', ')}) chinese=${chineseStateLabels}`
+  )
+
+  // PWC20 静态：sortBy/sortDir 契约（5号位 2026-10-14 回执 R1-R4 全采纳）
+  const hasSortByType = /ProductionWorkCalendarSortBy\s*=/.test(pwcTypes)
+  const hasSortByWhiteList =
+    /'Id'\s*\|\s*'CreatedAt'\s*\|\s*'EffectiveFrom'\s*\|\s*'EffectiveTo'\s*\|\s*'UpdatedAt'/.test(
+      pwcTypes.replace(/\s*\n\s*/g, ' ')
+    )
+  const hasSortDirType = /sortDir\?:\s*'ASC'\s*\|\s*'DESC'/.test(pwcTypes)
+  const apiPassesSort =
+    /sortBy:\s*query\.sortBy/.test(pwcApi) && /sortDir:\s*query\.sortDir/.test(pwcApi)
+  const storeDefaultSort =
+    /DEFAULT_SORT[\s\S]{0,200}?sortBy:\s*'CreatedAt',\s*sortDir:\s*'DESC'/.test(
+      pwcStore.replace(/\s*\n\s*/g, ' ')
+    )
+  const storeLoadMerge =
+    /if \(nextQuery\) query\.value = \{ \.\.\.DEFAULT_SORT, \.\.\.nextQuery \}/.test(pwcStore)
+  const pwc20AllOk =
+    hasSortByType &&
+    hasSortByWhiteList &&
+    hasSortDirType &&
+    apiPassesSort &&
+    storeDefaultSort &&
+    storeLoadMerge
+  assert(
+    'PWC20 静态：sortBy/sortDir 契约已接（types 白名单 + api 透传 + store 默认 CreatedAt DESC）',
+    pwc20AllOk,
+    pwc20AllOk
+      ? '5 值白名单 + ASC/DESC + load() 兜底默认排序'
+      : `type=${hasSortByType} list=${hasSortByWhiteList} dir=${hasSortDirType} api=${apiPassesSort} storeDefault=${storeDefaultSort} loadMerge=${storeLoadMerge}`
+  )
+
+  // PWC21 动态：sortBy=CreatedAt&sortDir=DESC 首条即最新行（5号位 函 §二 实测 6/6）
+  if (token) {
+    const pSorted = await call('GET', '/api/production-work-calendar', {
+      token,
+      query: { pageIndex: 1, pageSize: 20, sortBy: 'CreatedAt', sortDir: 'DESC' }
+    })
+    const sItems = pSorted.json?.data?.items ?? []
+    const createdDescOk =
+      sItems.length >= 2 &&
+      sItems.every((it, i) => i === 0 || (sItems[i - 1].createdAt ?? '') >= (it.createdAt ?? ''))
+    assert(
+      'PWC21 动态：sortBy=CreatedAt&sortDir=DESC 列表按创建时间倒序（新增行居首）',
+      pSorted.ok && createdDescOk,
+      pSorted.ok && createdDescOk
+        ? `items=${sItems.length} 首行 createdAt=${sItems[0]?.createdAt}`
+        : `ok=${pSorted.ok} items=${sItems.length} 倒序=${createdDescOk}`
+    )
+
+    const pBad = await call('GET', '/api/production-work-calendar', {
+      token,
+      query: { sortBy: 'DropTable' }
+    })
+    assert(
+      'PWC21b 动态：非法 sortBy 返 400（白名单守门，非 500）',
+      pBad.code === 400,
+      pBad.code === 400 ? '400 ✓' : `code=${pBad.code}`
+    )
+  } else {
+    skip('PWC21 动态：sortBy=CreatedAt 倒序 + 非法值 400（需 adminToken）')
+  }
+
+  // PWC22 静态：工厂→部门联动（冻结 v5.1.12 line 2946 DEPARTMENT 行须校验 FactoryId 一致）
+  const pwc22Lookup = readSrc('api/aps-v1/departmentLookup.ts')
+  const pwc22a = /factoryId\?:\s*number\s*\|\s*null/.test(pwc22Lookup)
+  assert(
+    'PWC22a 静态：DepartmentLookupItem 带 factoryId（部门归属工厂，5号位 待补 lookup 投影）',
+    pwc22a,
+    pwc22a ? '可选字段已声明' : '缺 factoryId，页面无法按工厂收敛部门'
+  )
+
+  const pwc22b =
+    /function\s+deptOptionsFor\s*\(/.test(pwcVue) &&
+    /deptOptionsByFactory/.test(pwcVue) &&
+    /deptOptionsFor\(filterFactoryId\)/.test(pwcVue) &&
+    /deptOptionsFor\(weeklyDraft\.factoryId\)/.test(pwcVue) &&
+    /deptOptionsFor\(exceptionDraft\.factoryId\)/.test(pwcVue) &&
+    /deptOptionsFor\(closeOpenDraft\.factoryId\)/.test(pwcVue)
+  assert(
+    'PWC22b 静态：4 处部门下拉（筛选 + 3 弹窗）均走 deptOptionsFor(工厂) 联动',
+    pwc22b,
+    pwc22b ? '筛选/工作周/例外/换版 4 处全联动' : '存在未联动的 departmentOptions 全量下拉'
+  )
+
+  const pwc22c =
+    (pwcVue.match(/deptAfterFactoryChange\(/g) ?? []).length >= 5 &&
+    /:disabled="!filterFactoryId"/.test(pwcVue)
+  assert(
+    'PWC22c 静态：切工厂后收敛已选部门（4 处 watch）+ 筛选区未选工厂时禁用部门',
+    pwc22c,
+    pwc22c ? '4 watch 齐全 + 筛选部门 disabled' : 'watch/disabled 缺失'
+  )
+
+  // PWC23 动态：后端 lookup 是否已返 factoryId（3号位 A组 A1 10-14 已落地；需 dev 联调时开 VERIFY_PWC_DEPT_CASCADE=1）
+  if (token && process.env.VERIFY_PWC_DEPT_CASCADE === '1') {
+    const pDept = await call('GET', '/api/governance/lookups/departments', { token })
+    const dItems = pDept.json?.data ?? []
+    const withFactory = dItems.filter((d) => d.factoryId != null).length
+    assert(
+      'PWC23 动态：/api/governance/lookups/departments 返 factoryId（工厂→部门联动生效）',
+      dItems.length > 0 && withFactory > 0,
+      `total=${dItems.length} 带 factoryId=${withFactory}`
+    )
+  } else {
+    skip('PWC23 动态：lookup 返 factoryId（A1 已落地，开 VERIFY_PWC_DEPT_CASCADE=1 联调实测；未开时工厂→部门下拉按缺 key 退回全量）')
+  }
+
+  info('PWC 段：v1.4 §三/§九 + 5号位 2026-10-13 PWC 函前端联调备料版就位（G1 候选，G4 公告前联调/备料；v1.3 继续有效）')
+}
+
+/**
  * [DP] DemandProtection 冻结文档一致性核查（dp-freeze — 10-09 R1/R2/R3 闭环静态）
  * 验收依据：5号位致4号位_DemandProtection一致性核查回执_20261009.md
  *  - R1 PARTIALLY_RELEASED 派生态 5号位 接受（前端聚合层派生），stale 5号位 聚合注释已纠正 → DP01-DP03
@@ -4253,8 +6226,9 @@ async function verifyExplanationFreeze(adminToken) {
   // E24 探针：5号位 落地 PageResult + severity 排序后，动态验证
   //   - 期望：`GET /api/business-fact-issues?pageIndex=1&pageSize=1` 形如 `{code, message, data: {items: [...], total: N, page: 1, pageSize: 1}}`
   //   - 5号位 10-10 落地回执：字段名是 `page`（非 `pageIndex`），与 RBAC/TaskSplitRuleConfig/ManualETA 同源
-  //   - severity 排序期望：前 pageSize 条全为 ERROR（@see 5号位 回执实测：?pageIndex=1&pageSize=3 前 3 条全 ERROR）
+  //   - severity 排序期望：取 pageSize=50，前 N 条按 ERROR > WARN > INFO 顺序（@see 5号位 10-12 函确认已排序）
   if (process.env.VERIFY_E24 === '1' && adminToken) {
+    // E24a：PageResult{items,total,page,pageSize} 字段对齐
     const e24Resp = await call('GET', '/api/business-fact-issues', {
       token: adminToken,
       query: { pageIndex: 1, pageSize: 1 }
@@ -4270,15 +6244,43 @@ async function verifyExplanationFreeze(adminToken) {
       typeof total === 'number' &&
       page === 1 &&
       pageSize === 1
-    const allErrorSeverity =
-      Array.isArray(items) && items.length > 0 && items.every((it) => it.severity === 'ERROR')
     assert(
-      'E24 动态：/api/business-fact-issues?pageIndex/pageSize 返回 PageResult{items,total,page,pageSize}（5号位 10-10 落地后）',
+      'E24a 动态：/api/business-fact-issues?pageIndex=1&pageSize=1 返回 PageResult{items,total,page,pageSize}（5号位 10-10 已落地）',
       isPageResult,
       isPageResult
-        ? `total=${total} items=${items.length} page=${page} pageSize=${pageSize} severity=${allErrorSeverity ? '全 ERROR ✅' : '非全 ERROR'}`
+        ? `total=${total} items=${items.length} page=${page} pageSize=${pageSize}`
         : `status=${e24Resp.status} dataShape=${JSON.stringify(data).slice(0, 200)}`
     )
+
+    // E24b：severity 排序（ERROR > WARN > INFO）— 5号位 10-12 函确认已排序
+    if (isPageResult) {
+      const e24SortResp = await call('GET', '/api/business-fact-issues', {
+        token: adminToken,
+        query: { pageIndex: 1, pageSize: 50 }
+      })
+      const sortItems = e24SortResp.json?.data?.items ?? []
+      const severityOrder = { ERROR: 0, WARN: 1, INFO: 2 }
+      const severitySorted =
+        Array.isArray(sortItems) &&
+        sortItems.length > 0 &&
+        sortItems.every(
+          (it, i) =>
+            i === 0 ||
+            severityOrder[sortItems[i - 1].severity] <= severityOrder[it.severity]
+        )
+      const errCount = sortItems.filter((it) => it.severity === 'ERROR').length
+      const warnCount = sortItems.filter((it) => it.severity === 'WARN').length
+      const infoCount = sortItems.filter((it) => it.severity === 'INFO').length
+      assert(
+        'E24b 动态：business-fact-issues severity 排序（ERROR 优先，5号位 10-12 函确认已落地）',
+        severitySorted,
+        severitySorted
+          ? `共 ${sortItems.length} 条 ERROR=${errCount} WARN=${warnCount} INFO=${infoCount}（已排序）`
+          : `共 ${sortItems.length} 条 ERROR=${errCount} WARN=${warnCount} INFO=${infoCount}（未排序）`
+      )
+    } else {
+      skip('E24b 动态：severity 排序（E24a PageResult 失败则跳过排序验证）')
+    }
   } else {
     skip(
       'E24 动态：/api/business-fact-issues PageResult{total,items,page,pageSize}（设置 VERIFY_E24=1 等 5号位 落地 DTO 后执行）'
@@ -4316,7 +6318,49 @@ async function verifyExplanationFreeze(adminToken) {
       : `storeSetCurrent=${e25StoreHasSetCurrent} storeSelectVer=${e25StoreKeepsSelectVersion} storeNoFetch=${e25StoreSetCurrentNoFetch} explUsesSetCurrent=${e25ExplanationUsesSetCurrent}`
   )
 
-  info('E 段：5号位 2026-10-09 一致性核查回执 R1 闭环 + 10-10 option A 收口 + 10-10 business-fact-issues 端点查错库修复（E21 dev 绿）+ 10-10 样式简洁整齐（E22）+ 10-10 business-fact-issues 分页契约锁（E23 静态绿：后端字段 page + 替换式 fetchBizPage + 标准 ElPagination + v-model + [10,20,50]；E24 等 5号位 PageResult 落地）+ 10-10 懒加载契约锁（E25 静态绿；Gantt.vue 仍走 selectVersion 不退化）；R2/R3 跨号位等回执')
+  // E26 探针：10-12 字典漂移兜底（5号位 函 §二「未入字典的值不丢弃，按待核对展示」）
+  //   - store 暴露 unrecognizedObjectTypeFacts / unrecognizedRawObjectTypes getter（用 EXPLANATION_OBJECT_TYPES 字典过滤）
+  //   - factsByObjectType 仍只产 5 码（保持 5 码契约，避免 E07 等老探针回归）
+  //   - Explanation.vue 渲染 ElAlert type="info" 待核对面板 + 列出 raw ObjectType 值
+  //   - 反向探针自证可失败：把 store getter 重命名 / 把 ElAlert 删了 都会让 E26 由绿转红
+  //   - @see 5号位-2026-10-12-Explanation字典漂移-0号位答复转达回执-给4号位.md §二
+  const e26StoreHasUnrecognizedFacts = /unrecognizedObjectTypeFacts\s*=/.test(eStore)
+  const e26StoreHasUnrecognizedRaw = /unrecognizedRawObjectTypes\s*=/.test(eStore)
+  const e26StoreFilterUsesDict = /EXPLANATION_OBJECT_TYPES/.test(eStore)
+  const e26StoreKeepsFiveKeys =
+    /Record<ExplanationObjectType/.test(eStore) &&
+    /ORDER:\s*\[\]/.test(eStore) &&
+    /DOMAIN:\s*\[\]/.test(eStore)
+  const e26StoreExported = (() => {
+    // 取最后一处 return（composition API 末尾的暴露对象），不用 eStore.split('return')[1]（会拿到 reset 函数体内更早的 return）
+    const lastReturn = eStore.lastIndexOf('return')
+    if (lastReturn < 0) return false
+    const tail = eStore.slice(lastReturn)
+    return /unrecognizedObjectTypeFacts/.test(tail) && /unrecognizedRawObjectTypes/.test(tail)
+  })()
+  const e26ViewAlert = /ElAlert[\s\S]{0,200}?unrecognized-alert/.test(eVue) ||
+    /<ElAlert[\s\S]*?unrecognizedObjectTypeFacts/.test(eVue)
+  const e26ViewRawTypeBadge = /待核对·\{\{\s*f\.objectType\s*\}\}/.test(eVue) ||
+    /待核对[\s\S]{0,40}objectType/.test(eVue)
+  const e26ViewDestructured = /unrecognizedObjectTypeFacts/.test(eVue) && /unrecognizedRawObjectTypes/.test(eVue)
+  const e26All =
+    e26StoreHasUnrecognizedFacts &&
+    e26StoreHasUnrecognizedRaw &&
+    e26StoreFilterUsesDict &&
+    e26StoreKeepsFiveKeys &&
+    e26StoreExported &&
+    e26ViewAlert &&
+    e26ViewRawTypeBadge &&
+    e26ViewDestructured
+  assert(
+    'E26 静态：Explanation 字典漂移兜底（store 用 EXPLANATION_OBJECT_TYPES 过滤 + 5 码 keys 不变 + 暴露 unrecognized getter + view 渲染 ElAlert 待核对面板 + 列出 raw ObjectType）',
+    e26All,
+    e26All
+      ? '全齐'
+      : `storeFacts=${e26StoreHasUnrecognizedFacts} storeRaw=${e26StoreHasUnrecognizedRaw} storeFilter=${e26StoreFilterUsesDict} storeFiveKeys=${e26StoreKeepsFiveKeys} storeExported=${e26StoreExported} viewAlert=${e26ViewAlert} viewBadge=${e26ViewRawTypeBadge} viewDestruct=${e26ViewDestructured}`
+  )
+
+  info('E 段：5号位 2026-10-09 一致性核查回执 R1 闭环 + 10-10 option A 收口 + 10-10 business-fact-issues 端点查错库修复（E21 dev 绿）+ 10-10 样式简洁整齐（E22）+ 10-10 business-fact-issues 分页契约锁（E23 静态绿：后端字段 page + 替换式 fetchBizPage + 标准 ElPagination + v-model + [10,20,50]；E24 等 5号位 PageResult 落地）+ 10-10 懒加载契约锁（E25 静态绿；Gantt.vue 仍走 selectVersion 不退化）+ 10-12 字典漂移兜底（E26 静态绿：未入字典值按待核对中性展示，不冒充正式编码）；R2/R3 跨号位等回执')
 }
 
 /* ==================== main ==================== */
@@ -4329,6 +6373,969 @@ async function verifyExplanationFreeze(adminToken) {
  *              mocks/fixtures.ts mockOrderDetail basic 含 orderCanonicalId
  *  - M02 接受类（默认跳过）：VERIFY_ALLOW_WRITE=1 时执行；需 Order 页已选订单 + Dialog 自动带入 + 提交跳转 Candidate
  */
+/* ============================================================================
+ * [MN] 菜单分组「策略配置」（与「APS 排产」平级的顶级节点）+ 页面改名「策略包版本」
+ *   触发：2026-10-16 用户「这几个菜单能放在一起吗」→ 随后「把策略配置移动到 APS 排产平级菜单，移出来吧」
+ *   - M01 静态：分组是 apsV1Routes 的**顶级**节点（不在 /aps.children 内）+ 用 Layout 包裹
+ *   - M02 静态：7 个子路由全在分组内，且 path **全部绝对路径**（/aps/xxx），/aps 下无重复平铺
+ *   - M03 静态：7 个子路由的 name + apsRequiredPermissions 与基线一致（防搬动时丢 RBAC）
+ *   - M04 静态：分组名「策略配置」与页面名「策略包版本」不同名
+ *   - M05 静态：组内顺序 = 实际配置顺序
+ *   - M06 静态：StrategyProfiles.vue 页内标题同步改为「策略包版本」
+ *   - M07 静态：pathResolve 对绝对子路径**原样返回**（不拼父路径）——否则菜单 index / 面包屑
+ *              / TagsView 会拼成 /strategy-config/aps/rules，点菜单跳到不存在的地址
+ *   - M08~M12 静态：「角色与权限」顶级分组（4 页 /aps/rbac-* + 权限码齐 + 顺序）、
+ *              框架自带 10 个演示菜单（首页/文档/引导/组件/功能/hooks/多级菜单/综合示例/错误页面/权限管理）
+ *              父节点均已 hidden、两个父分组均不挂权限码
+ *   - M13 静态：「需求与供给」「排产执行」「基础数据与日历」是**与 /aps 平级的顶级分组**
+ *              （Layout + redirect + alwaysShow + 壳不挂权限码 + 不在 /aps.children 内）
+ *   - M14 静态：11 个页面全在三个顶级分组内、path 全为绝对路径（/aps/xxx）、全文件无重复平铺
+ *   - M15 静态：三个顶级分组的组内顺序 = 实际使用顺序
+ *   - M16 静态：「APS 排产」下只剩 排产总览/甘特图/异常与原因解释/审计日志 4 个相对路径页；
+ *              已撤销的「结果查看」组壳不得复活
+ *   - M17 静态：分组内 11 个页面仍挂着 RBAC 权限码（搬动不得丢）
+ *   - M18 静态：「APS 排产」下 4 个直达页仍挂着 RBAC 权限码
+ *   - M19 静态：登录/根路径默认落地 = 排产总览 /aps/overview；字面量只存在于 constants/index.ts，
+ *              根路由 redirect 与 LoginForm 两处 push 均引用该常量（不许回退到 /dashboard/分析页）
+ * ========================================================================== */
+function verifyMenuGroup() {
+  log('\n[MN] 菜单分组「策略配置」平级顶级节点 + 页面改名「策略包版本」（menu — 2026-16 归组）')
+
+  const routerSrc = readSrc('router/modules/aps.ts')
+
+  // 分组块：从 { path: 'strategy-config' 起，到其 children 数组结束
+  const groupStart = routerSrc.indexOf("path: '/strategy-config'")
+  const childrenStart = routerSrc.indexOf('children: [', groupStart)
+  // children 数组的闭合：找与 childrenStart 处 '[' 配对的 ']'
+  let depth = 0
+  let childrenEnd = -1
+  for (let i = routerSrc.indexOf('[', childrenStart); i < routerSrc.length; i++) {
+    const ch = routerSrc[i]
+    if (ch === '[') depth++
+    else if (ch === ']') {
+      depth--
+      if (depth === 0) {
+        childrenEnd = i
+        break
+      }
+    }
+  }
+  const groupBlock = groupStart >= 0 && childrenEnd > childrenStart
+    ? routerSrc.slice(groupStart, childrenEnd)
+    : ''
+  const childrenBlock = groupBlock.slice(groupBlock.indexOf('children: ['))
+
+  // M01 分组是顶级节点（不在 /aps 的 children 里）且用 Layout 包裹
+  //   /aps.children 的范围 = 「path: '/aps'」之后的第一个 children 数组闭合处
+  const apsIdx = routerSrc.indexOf("path: '/aps',")
+  let apsChildrenEnd = -1
+  {
+    let d = 0
+    const cs = routerSrc.indexOf('children: [', apsIdx)
+    for (let i = routerSrc.indexOf('[', cs); i < routerSrc.length; i++) {
+      if (routerSrc[i] === '[') d++
+      else if (routerSrc[i] === ']') {
+        d--
+        if (d === 0) {
+          apsChildrenEnd = i
+          break
+        }
+      }
+    }
+  }
+  const apsChildrenBlock =
+    apsIdx >= 0 && apsChildrenEnd > apsIdx
+      ? routerSrc.slice(apsIdx, apsChildrenEnd)
+      : ''
+  const m01 =
+    /name:\s*'ApsStrategyConfig'/.test(groupBlock) &&
+    /title:\s*'策略配置'/.test(groupBlock) &&
+    /component:\s*Layout/.test(groupBlock) &&
+    /redirect:\s*'\/aps\/strategy-profile'/.test(groupBlock) &&
+    // 关键：分组不得再出现在 /aps.children 里（移出来了）
+    apsChildrenBlock.length > 0 &&
+    !apsChildrenBlock.includes('ApsStrategyConfig') &&
+    // 且必须真的在数组里（顶级）：分组起点晚于 /aps 的 children 闭合处
+    groupStart > apsChildrenEnd
+  assert(
+    'M01 静态：「策略配置」是与 /aps 平级的顶级节点（Layout 包裹 + redirect + 不在 /aps.children 内）',
+    m01,
+    m01
+      ? '已是顶级平级节点'
+      : `name/title=${/ApsStrategyConfig/.test(groupBlock)}/${/title:\s*'策略配置'/.test(
+          groupBlock
+        )} layout=${/component:\s*Layout/.test(groupBlock)} 在Aps内=${apsChildrenBlock.includes(
+          'ApsStrategyConfig'
+        )} 顺序=${groupStart > apsChildrenEnd}`
+  )
+
+  // M02 7 个子路由全在分组内且**全部绝对路径**
+  const groupChildren = [
+    { name: 'ApsRules', path: '/aps/rules' },
+    { name: 'ApsTaskSplitRuleConfig', path: '/aps/task-split-rule-config' },
+    { name: 'ApsSetupExact', path: '/aps/setup/exact' },
+    { name: 'ApsSetupDefault', path: '/aps/setup/default' },
+    { name: 'ApsSetupUncovered', path: '/aps/setup/uncovered' },
+    { name: 'ApsSetupDiff', path: '/aps/setup/diff' },
+    { name: 'ApsStrategyProfiles', path: '/aps/strategy-profile' }
+  ]
+  const m02Missing = groupChildren.filter(
+    (c) => !new RegExp(`path:\\s*'${c.path}',[\\s\\S]{0,200}?name:\\s*'${c.name}'`).test(childrenBlock)
+  )
+  // 反向：7 条不得在分组外再平铺一份（重复 name 会导致 router 冲突）
+  const groupStartIdx = routerSrc.indexOf("path: '/strategy-config'")
+  const outsideBlock = routerSrc.slice(0, groupStartIdx) + routerSrc.slice(
+    routerSrc.indexOf('\n', childrenEnd > 0 ? childrenEnd : 0)
+  )
+  const m02Duplicated = groupChildren.filter(
+    (c) => new RegExp(`path:\\s*'${c.path.slice(5)}'`).test(outsideBlock)
+  )
+  const m02Ok = m02Missing.length === 0 && m02Duplicated.length === 0
+  assert(
+    'M02 静态：7 个子路由全在分组内、path 全为绝对路径（/aps/xxx）、分组外无重复平铺',
+    m02Ok,
+    m02Ok
+      ? '7 条齐全且均为绝对路径'
+      : `缺=${m02Missing.map((c) => c.name).join(',') || '-'} 重复平铺=${m02Duplicated
+          .map((c) => c.name)
+          .join(',') || '-'}`
+  )
+
+  // M03 name + 权限码基线（verify-rbac.mjs 按 path 断言，本条补 name/权限码侧）
+  const m03Baseline = [
+    { name: 'ApsRules', perms: "['aps.rule.edit', 'aps.rule.publish']" },
+    { name: 'ApsTaskSplitRuleConfig', perms: "['aps.rule.view', 'aps.rule.edit']" },
+    { name: 'ApsSetupExact', perms: "['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish']" },
+    { name: 'ApsSetupDefault', perms: "['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish']" },
+    { name: 'ApsSetupUncovered', perms: "['aps.setup.view']" },
+    { name: 'ApsSetupDiff', perms: "['aps.setup.view', 'aps.setup.publish']" },
+    {
+      name: 'ApsStrategyProfiles',
+      perms: "['aps.strategy.view', 'aps.strategy.edit', 'aps.strategy.publish']"
+    }
+  ]
+  // eslint --fix 会把超长权限码数组折成多行，故比对前先压掉所有空白
+  const m03Flat = childrenBlock.replace(/\s+/g, '')
+  const m03Bad = m03Baseline.filter((b) => {
+    const idx = m03Flat.indexOf(`name:'${b.name}'`)
+    if (idx < 0) return true
+    const seg = m03Flat.slice(idx, idx + 400)
+    return !seg.includes(`apsRequiredPermissions:${b.perms.replace(/\s+/g, '')}`)
+  })
+  assert(
+    'M03 静态：7 个子路由的 apsRequiredPermissions 与基线一致（搬家不得丢 RBAC 码）',
+    m03Bad.length === 0,
+    m03Bad.length === 0
+      ? `${m03Baseline.length} 条权限码齐全`
+      : `不符：${m03Bad.map((b) => b.name).join(',')}`
+  )
+
+  // M04 分组名与页面名不同名（防又出现两个「策略配置」）
+  const m04GroupTitle = /title:\s*'策略配置'/.test(groupBlock)
+  const m04PageTitle = /title:\s*'策略包版本'/.test(childrenBlock)
+  const m04NoDupTitle = !/title:\s*'策略配置',\s*\n\s*icon:\s*'vi-mdi:tune-variant',\s*\n\s*noCache/.test(
+    childrenBlock
+  )
+  const m04Ok = m04GroupTitle && m04PageTitle && m04NoDupTitle
+  assert(
+    'M04 静态：分组名「策略配置」与页面名「策略包版本」不同名',
+    m04Ok,
+    m04Ok ? '分组=策略配置 / 页面=策略包版本' : `group=${m04GroupTitle} page=${m04PageTitle}`
+  )
+
+  // M05 组内顺序 = 实际配置顺序
+  const orderKeys = [
+    'ApsRules',
+    'ApsTaskSplitRuleConfig',
+    'ApsSetupExact',
+    'ApsSetupDefault',
+    'ApsSetupUncovered',
+    'ApsSetupDiff',
+    'ApsStrategyProfiles'
+  ]
+  const positions = orderKeys.map((k) => childrenBlock.indexOf(`name: '${k}'`))
+  const m05Ok = positions.every((p) => p >= 0) && positions.every((p, i) => i === 0 || p > positions[i - 1])
+  assert(
+    'M05 静态：组内顺序 = 配置顺序（规则与参数维护→批策略→明确→默认→缺失→对比→策略包版本）',
+    m05Ok,
+    m05Ok ? '顺序正确' : `positions=${positions.join(',')}`
+  )
+
+  // 页面标题同步改名（view 侧）
+  const spView = readSrc('views/Aps/StrategyProfiles.vue')
+  const m06ViewOk = /<h2 class="page-title">策略包版本<\/h2>/.test(spView)
+  assert(
+    'M06 静态：StrategyProfiles.vue 页内标题同步改为「策略包版本」',
+    m06ViewOk,
+    m06ViewOk ? '已改' : '页内 h2 仍是旧名'
+  )
+
+  // M07 pathResolve 必须对绝对子路径原样返回（否则菜单 index / 面包屑 / TagsView 全错）
+  const pathResolveSrc = (() => {
+    const s = readSrc('utils/routerHelper.ts')
+    const i = s.indexOf('export const pathResolve')
+    return i >= 0 ? s.slice(i, s.indexOf('\n}', i) + 2) : ''
+  })()
+  const m07HasAbsoluteGuard = /if\s*\(path\.startsWith\(['"]\/['"]\)\)\s*return\s+path/.test(
+    pathResolveSrc
+  )
+  assert(
+    "M07 静态：pathResolve 对绝对子路径（/aps/xxx）原样返回，不拼父路径（10-16 顶级分组引入）",
+    m07HasAbsoluteGuard,
+    m07HasAbsoluteGuard
+      ? '绝对子路径已短路返回'
+      : 'pathResolve 会把 /aps/rules 拼成 /strategy-config/aps/rules —— 点侧边栏即跳到不存在的地址'
+  )
+
+  /* ---- 「角色与权限」分组（10-16 追加）---- */
+  const rbacIdx = routerSrc.indexOf("path: '/rbac',")
+  let rbacEnd = -1
+  {
+    let d = 0
+    const cs = routerSrc.indexOf('children: [', rbacIdx)
+    for (let i = routerSrc.indexOf('[', cs); i < routerSrc.length; i++) {
+      if (routerSrc[i] === '[') d++
+      else if (routerSrc[i] === ']') {
+        d--
+        if (d === 0) {
+          rbacEnd = i
+          break
+        }
+      }
+    }
+  }
+  const rbacBlock =
+    rbacIdx >= 0 && rbacEnd > rbacIdx ? routerSrc.slice(rbacIdx, rbacEnd) : ''
+  const rbacChildren = rbacBlock.slice(rbacBlock.indexOf('children: ['))
+
+  const m08 =
+    rbacIdx >= 0 &&
+    /name:\s*'ApsRbac'/.test(rbacBlock) &&
+    /title:\s*'角色与权限'/.test(rbacBlock) &&
+    /component:\s*Layout/.test(rbacBlock) &&
+    /redirect:\s*'\/aps\/rbac-users'/.test(rbacBlock) &&
+    // 顶级：不得出现在 /aps.children 内，且位于 /aps 之外
+    !apsChildrenBlock.includes('ApsRbac') &&
+    rbacIdx > apsChildrenEnd
+  assert(
+    "M08 静态：「角色与权限」是与 /aps 平级的顶级节点（Layout + redirect + 不在 /aps.children 内）",
+    m08,
+    m08
+      ? '已是顶级平级节点'
+      : `存在=${rbacIdx >= 0} layout=${/component:\s*Layout/.test(
+          rbacBlock
+        )} 在Aps内=${apsChildrenBlock.includes('ApsRbac')} 顺序=${rbacIdx > apsChildrenEnd}`
+  )
+
+  const rbacChildrenBaseline = [
+    { name: 'ApsRbacUsers', path: '/aps/rbac-users' },
+    { name: 'ApsRbacRoles', path: '/aps/rbac-roles' },
+    { name: 'ApsRbacPermissions', path: '/aps/rbac-permissions' },
+    { name: 'ApsRbacScopes', path: '/aps/rbac-scopes' }
+  ]
+  const rbacFlat = rbacChildren.replace(/\s+/g, '')
+  const m09Missing = rbacChildrenBaseline.filter(
+    (c) =>
+      !rbacFlat.includes(`path:'${c.path}',component:`) ||
+      !rbacFlat.includes(`name:'${c.name}'`)
+  )
+  const m09 =
+    m09Missing.length === 0 &&
+    // 权限码一条不能少（后端类级 AuthManage 码）
+    rbacFlat.match(/apsRequiredPermissions:\['aps\.auth\.user\.edit'\]/g)?.length === 4 &&
+    // 组外不得有重复平铺
+    !rbacChildrenBaseline.some((c) =>
+      new RegExp(`path:\\s*'${c.path.slice(5)}'`).test(
+        routerSrc.slice(0, rbacIdx) + routerSrc.slice(rbacEnd > 0 ? rbacEnd : 0)
+      )
+    )
+  assert(
+    'M09 静态：4 个 RBAC 页全在分组内、path 全为绝对路径（/aps/rbac-*）、权限码齐全、组外无重复平铺',
+    m09,
+    m09
+      ? '4 条齐全且均为绝对路径，权限码齐'
+      : `缺=${m09Missing.map((c) => c.name).join(',') || '-'} 权限码数=${
+          rbacFlat.match(/apsRequiredPermissions:\['aps\.auth\.user\.edit'\]/g)?.length ?? 0
+        }`
+  )
+
+  const rbacOrder = rbacChildrenBaseline.map((c) => rbacFlat.indexOf(`name:'${c.name}'`))
+  const m10 =
+    rbacOrder.every((p) => p >= 0) &&
+    rbacOrder.every((p, i) => i === 0 || p > rbacOrder[i - 1])
+  assert(
+    'M10 静态：组内顺序 = 配置顺序（用户 → 角色 → 权限码 → 业务范围维护）',
+    m10,
+    m10 ? '顺序正确' : `positions=${rbacOrder.join(',')}`
+  )
+
+  // M11 框架自带的 10 个演示菜单已 hidden（走 mock / 与 APS 无关，用户 10-16 裁决全部隐藏）
+  //   - /authorization：4 页走 mock 未接后端，与「角色与权限」组重复易误点
+  //   - 首页/文档/引导/组件/功能/hooks/多级菜单/综合示例/错误页面：纯框架示例，与业务无关
+  //   - 必须藏**父节点**：helper.ts 的 hasOneShowingChild 在子项全被藏时会回退渲染父节点自己的标题，
+  //     /guide 与 /external-link 各只有 1 个子项，藏子项会剩个空壳菜单项
+  const indexSrc = readSrc('router/index.ts')
+  const demoMenus = [
+    '/dashboard',
+    '/external-link',
+    '/guide',
+    '/components',
+    '/function',
+    '/hooks',
+    '/level',
+    '/example',
+    '/error',
+    '/authorization'
+  ]
+  const m11Missing = demoMenus.filter((p) => {
+    const i = indexSrc.indexOf(`path: '${p}',`)
+    if (i < 0) return true
+    const cs = indexSrc.indexOf('children: [', i)
+    const head = indexSrc.slice(i, cs >= 0 ? cs : i + 600)
+    return !/hidden:\s*true/.test(head)
+  })
+  const m11 = m11Missing.length === 0
+  assert(
+    'M11 静态：框架自带 10 个演示菜单（首页/文档/引导/组件/功能/hooks/多级菜单/综合示例/错误页面/权限管理）父节点均已 meta.hidden',
+    m11,
+    m11
+      ? '10 个全部 hidden（路由仍在表里，老链接可直达）'
+      : `未 hidden=${m11Missing.join(',') || '-'}`
+  )
+
+  // M12 两个分组都不能挂在父节点权限码上（挂了会导致无权限用户连菜单都看不到）
+  const m12 =
+    !/apsRequiredPermissions|apsRequiredRoles/.test(groupBlock.split('children: [')[0]) &&
+    !/apsRequiredPermissions|apsRequiredRoles/.test(rbacBlock.split('children: [')[0])
+  assert(
+    'M12 静态：「策略配置」「角色与权限」两个父分组均未挂权限码（菜单不按权限过滤，越权由子路由守卫拦）',
+    m12,
+    m12 ? '两个父分组均无权限码' : '父分组挂了权限码 ⇒ 无权限用户看不到菜单（现状是能看见、点进去才 403）'
+  )
+
+  /* ---- 三个**顶级**分组：需求与供给 / 排产执行 / 基础数据与日历（10-16 第二轮）----
+   * 第一轮把它们放在 /aps 内当子分组；用户看过侧边栏后要求「这几个放在与 APS 排产平级」，
+   * 同时撤销「结果查看」这层壳（它下面 2 页 —— 甘特图/资源计划、异常与原因解释 —— 直接挂回 /aps）。
+   */
+  const apsChildrenArray = apsChildrenBlock.slice(apsChildrenBlock.indexOf('children: ['))
+
+  // 数 /aps.children 里的**顶层**条目数，用于证明没有多余残留
+  const countTopLevel = (arrText) => {
+    let br = 0
+    let cb = 0
+    let n = 0
+    for (const ch of arrText) {
+      if (ch === '[') br++
+      else if (ch === ']') br--
+      else if (ch === '{') {
+        if (br === 1 && cb === 0) n++
+        cb++
+      } else if (ch === '}') cb--
+    }
+    return n
+  }
+
+  const apsGroupSpec = [
+    {
+      shell: '/aps-demand',
+      name: 'ApsGroupDemand',
+      title: '需求与供给',
+      redirect: '/aps/order',
+      leaves: [
+        { name: 'ApsOrder', path: '/aps/order' },
+        { name: 'ApsManualEta', path: '/aps/manual-eta' },
+        { name: 'ApsPi', path: '/aps/pi' },
+        { name: 'ApsDemandProtection', path: '/aps/demand-protection' }
+      ]
+    },
+    {
+      shell: '/aps-execution',
+      name: 'ApsGroupExecution',
+      title: '排产执行',
+      redirect: '/aps/ctp',
+      leaves: [
+        { name: 'ApsCtp', path: '/aps/ctp' },
+        { name: 'ApsCandidate', path: '/aps/candidate' },
+        { name: 'ApsRun', path: '/aps/run' }
+      ]
+    },
+    {
+      shell: '/aps-master-data',
+      name: 'ApsGroupMasterData',
+      title: '基础数据与日历',
+      redirect: '/aps/domain',
+      leaves: [
+        { name: 'ApsDomain', path: '/aps/domain' },
+        { name: 'ApsOperationPlanningMode', path: '/aps/operation-planning-mode' },
+        { name: 'ApsResourceCalendar', path: '/aps/resource-calendar' },
+        { name: 'ApsProductionWorkCalendar', path: '/aps/production-work-calendar' }
+      ]
+    }
+  ]
+
+  // 取组壳块：从 path: '<shell>', 回退到其 '{'，再按方括号配平找到 children 数组
+  const apsGroupOf = (spec) => {
+    const gi = routerSrc.indexOf(`path: '${spec.shell}',`)
+    if (gi < 0) return null
+    let b = gi
+    while (b >= 0 && routerSrc.slice(b, gi).trim().length > 240) b = routerSrc.lastIndexOf('{', b - 1)
+    const cs = routerSrc.indexOf('children: [', b)
+    if (cs < 0) return null
+    let d = 0
+    let end = -1
+    for (let i = routerSrc.indexOf('[', cs); i < routerSrc.length; i++) {
+      const ch = routerSrc[i]
+      if (ch === '[') d++
+      else if (ch === ']') {
+        d--
+        if (d === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    if (end < 0) return null
+    return {
+      idx: gi,
+      head: routerSrc.slice(b, cs),
+      children: routerSrc.slice(cs, end).replace(/\s+/g, '')
+    }
+  }
+  const apsGroups = apsGroupSpec.map((spec) => ({ spec, got: apsGroupOf(spec) }))
+
+  // M13 三个组壳齐备 + 确实是**顶级**（不在 /aps.children 内、位于 /aps 之后）+ 壳自身合法
+  const m13Bad = apsGroups.filter(({ spec, got }) => {
+    if (!got) return true
+    const h = got.head.replace(/\s+/g, ' ')
+    return !(
+      h.includes(`name: '${spec.name}'`) &&
+      h.includes(`title: '${spec.title}'`) &&
+      h.includes(`redirect: '${spec.redirect}'`) &&
+      h.includes('component: Layout') &&
+      h.includes('alwaysShow: true') &&
+      !/apsRequiredPermissions|apsRequiredRoles/.test(got.head) &&
+      !apsChildrenBlock.includes(spec.name) &&
+      got.idx > apsChildrenEnd
+    )
+  })
+  assert(
+    'M13 静态：「需求与供给」「排产执行」「基础数据与日历」是与 /aps 平级的顶级分组（Layout + redirect + 壳不挂权限码）',
+    m13Bad.length === 0,
+    m13Bad.length === 0
+      ? `${apsGroupSpec.map((g) => g.title).join(' / ')} 三组均为顶级`
+      : `不合规=${m13Bad.map(({ spec }) => spec.title).join(',') || '未找到'}`
+  )
+
+  // M14 11 个叶子页全在各自壳内、path 全绝对、且全文件只出现一次（防重复平铺导致 router 冲突）
+  const m14Bad = []
+  apsGroups.forEach(({ spec, got }) => {
+    if (!got) return
+    spec.leaves.forEach((l) => {
+      const inGroup =
+        got.children.includes(`path:'${l.path}',`) && got.children.includes(`name:'${l.name}'`)
+      const occurrences = routerSrc.split(`name: '${l.name}'`).length - 1
+      if (!inGroup || !l.path.startsWith('/aps/') || occurrences !== 1) {
+        m14Bad.push(`${l.name}(在组内=${inGroup},全局出现=${occurrences})`)
+      }
+    })
+  })
+  const m14LeafCount = apsGroupSpec.reduce((n, g) => n + g.leaves.length, 0)
+  assert(
+    'M14 静态：11 个页面全在三个顶级分组内、path 全为绝对路径（/aps/xxx）、全文件无重复平铺',
+    m14Bad.length === 0,
+    m14Bad.length === 0
+      ? `${m14LeafCount} 条齐全且均为绝对路径，无重复`
+      : `异常=${m14Bad.join(';')}`
+  )
+
+  // M15 组内顺序 = 使用顺序
+  const m15Bad = []
+  apsGroups.forEach(({ spec, got }) => {
+    if (!got) return
+    const pos = spec.leaves.map((l) => got.children.indexOf(`name:'${l.name}'`))
+    const asc = pos.every((p, i) => p >= 0 && (i === 0 || p > pos[i - 1]))
+    if (!asc) m15Bad.push(`${spec.title}[${pos.join(',')}]`)
+  })
+  assert(
+    'M15 静态：三个顶级分组的组内顺序 = 实际使用顺序',
+    m15Bad.length === 0,
+    m15Bad.length === 0 ? '3 组顺序均正确' : `顺序错=${m15Bad.join(';')}`
+  )
+
+  // M16 /aps 只剩 4 个直达页（全部相对路径），且已撤销的「结果查看」组壳不得复活
+  const apsDirectBaseline = [
+    { name: 'ApsOverview', path: 'overview' },
+    { name: 'ApsGantt', path: 'gantt' },
+    { name: 'ApsExplanation', path: 'explanation' },
+    { name: 'ApsAudit', path: 'audit' }
+  ]
+  const m16Direct = apsDirectBaseline.filter(
+    (d) =>
+      !new RegExp(`path:\\s*'${d.path}',[\\s\\S]{0,200}?name:\\s*'${d.name}'`).test(apsChildrenArray)
+  )
+  const m16TopCount = countTopLevel(apsChildrenArray)
+  const m16NoResultGroup =
+    !routerSrc.includes('ApsGroupResult') && !/title:\s*'结果查看'/.test(routerSrc)
+  const m16 =
+    m16Direct.length === 0 && m16TopCount === apsDirectBaseline.length && m16NoResultGroup
+  assert(
+    'M16 静态：「APS 排产」下只剩 排产总览/甘特图/异常与原因解释/审计日志 4 个相对路径页；「结果查看」分组已撤销',
+    m16,
+    m16
+      ? '4 个直达页齐备，无「结果查看」壳'
+      : `缺=${m16Direct.map((d) => d.name).join(',') || '-'} 顶层条数=${m16TopCount} 结果查看已撤=${m16NoResultGroup}`
+  )
+
+  // M17 分组内 11 页仍挂 RBAC 权限码（搬家不得丢；verify-rbac.mjs 按 path 断言，这边按组内归属）
+  const m17Bad = []
+  apsGroups.forEach(({ spec, got }) => {
+    if (!got) return
+    spec.leaves.forEach((l) => {
+      const idx = got.children.indexOf(`name:'${l.name}'`)
+      const next = got.children.indexOf("},name:'", idx)
+      const seg = idx >= 0 ? got.children.slice(idx, next > idx ? next : idx + 400) : ''
+      if (!/(apsRequiredPermissions|apsRequiredRoles):\[/.test(seg)) m17Bad.push(l.name)
+    })
+  })
+  assert(
+    'M17 静态：分组内 11 个页面仍挂着 RBAC 权限码（apsRequiredPermissions / apsRequiredRoles）',
+    m17Bad.length === 0,
+    m17Bad.length === 0 ? `${m14LeafCount} 条权限码齐全` : `缺权限码=${m17Bad.join(',')}`
+  )
+
+  // M18 /aps 下 4 个直达页仍挂 RBAC 权限码
+  const m18Bad = apsDirectBaseline.filter((d) => {
+    const i = apsChildrenArray.indexOf(`name: '${d.name}'`)
+    const seg = i >= 0 ? apsChildrenArray.slice(i, i + 500) : ''
+    return !/apsRequiredPermissions:\s*\[\s*'aps\./.test(seg)
+  })
+  assert(
+    'M18 静态：「APS 排产」下 4 个直达页仍挂着 RBAC 权限码',
+    m18Bad.length === 0,
+    m18Bad.length === 0 ? '4 条权限码齐全' : `缺权限码=${m18Bad.map((d) => d.name).join(',')}`
+  )
+
+  // M19 登录/根路径默认落地 = 排产总览，且只有 constants/index.ts 一处字面量
+  const constantsSrc = readSrc('constants/index.ts')
+  const routerIndexSrc = readSrc('router/index.ts')
+  const loginFormSrc = readSrc('views/Login/components/LoginForm.vue')
+  const m19Bad = []
+  // a) 常量本身
+  if (!/export const APS_HOME_PATH = '\/aps\/overview'/.test(constantsSrc)) m19Bad.push('constants 未定义 APS_HOME_PATH=/aps/overview')
+  // b) 常量不得在别处被重新定义
+  if ((routerIndexSrc + loginFormSrc).includes('APS_HOME_PATH =')) m19Bad.push('APS_HOME_PATH 被重复定义')
+  // c) 根路由 redirect 用常量，且不再是 /dashboard
+  const rootSeg = routerIndexSrc.slice(
+    routerIndexSrc.indexOf("path: '/',"),
+    routerIndexSrc.indexOf('name: \'Root\'')
+  )
+  if (!/redirect:\s*APS_HOME_PATH/.test(rootSeg)) m19Bad.push('router/index.ts 根路由 redirect 未用 APS_HOME_PATH')
+  // 只查根记录：/dashboard 自身仍 redirect 到 /dashboard/analysis 是有意的（该页 hidden 但老链接需可直达）
+  if (/redirect:\s*'\/(dashboard|aps-demand|aps-execution|aps-master-data|strategy-config|rbac)/.test(rootSeg)) m19Bad.push('根路由 redirect 仍指向框架演示页/分组壳')
+  // d) LoginForm 两处登录跳转都用常量，且不再用 addRouters[0]（那是 hidden 的 /dashboard）
+  const loginPush = loginFormSrc.match(/push\(\{\s*path:\s*([^)]+?)\s*\}\)/g) || []
+  if (loginPush.length !== 2) m19Bad.push(`LoginForm 登录跳转处数=${loginPush.length}(期望 2)`)
+  loginPush.forEach((p, i) => {
+    if (!/redirect\.value\s*\|\|\s*APS_HOME_PATH/.test(p)) m19Bad.push(`LoginForm 第 ${i + 1} 处未用 APS_HOME_PATH`)
+  })
+  if (loginFormSrc.includes('addRouters[0]')) m19Bad.push('LoginForm 仍用 addRouters[0]（指向 hidden 的 /dashboard）')
+  assert(
+    'M19 静态：登录/根路径默认落地 = 排产总览 /aps/overview（constants 一处字面量，根路由与 LoginForm 两处跳转均引用）',
+    m19Bad.length === 0,
+    m19Bad.length === 0
+      ? `常量 APS_HOME_PATH='/aps/overview'，根 redirect + LoginForm 2 处跳转全引用`
+      : m19Bad.join(';')
+  )
+
+  // M20 登录页只留 用户名/密码/记住我/登录；副标题、注册、忘记密码、其它登录方式均已下线
+  const zhLoginSrc = readSrc('locales/zh-CN.ts')
+  const loginVueSrc = readSrc('views/Login/Login.vue')
+  const loginFormFile = join(SRC_ROOT, 'views/Login/components/RegisterForm.vue')
+  const m20Bad = []
+  // a) 欢迎语
+  if (!/welcome:\s*'欢迎使用APS系统'/.test(zhLoginSrc)) m20Bad.push('欢迎语非「欢迎使用APS系统」')
+  // b) 副标题下线（文案与渲染一并去掉）
+  if (/message:\s*'开箱即用/.test(zhLoginSrc)) m20Bad.push('locales 仍有 login.message 副标题')
+  if (/login\.message/.test(loginVueSrc)) m20Bad.push('Login.vue 仍渲染 login.message 副标题')
+  // c) 登录框内不得再出现 忘记密码 / 注册 / 其它登录方式 / 四个第三方图标
+  const gone = [
+    ['forgetPassword', '忘记密码'],
+    ['register', '注册按钮'],
+    ['otherLogin', '其它登录方式']
+  ]
+  gone.forEach(([k, cn]) => {
+    if (loginFormSrc.includes(`login.${k}`)) m20Bad.push(`LoginForm 仍有${cn}`)
+    if (new RegExp(`\\b${k}:`).test(zhLoginSrc)) m20Bad.push(`locales 仍有 login.${k} 死键`)
+  })
+  if (/vi-ant-design:(github|wechat|alipay|weibo)/.test(loginFormSrc)) m20Bad.push('LoginForm 仍有第三方登录图标')
+  // d) 注册链路整体下线（组件删了，Login.vue 不得再引）
+  if (existsSync(loginFormFile)) m20Bad.push('RegisterForm.vue 仍存在（应为不可达死代码）')
+  if (/RegisterForm|to-register|toRegister|isLogin/.test(loginVueSrc)) m20Bad.push('Login.vue 仍挂注册表单/切换态')
+  assert(
+    'M20 静态：登录页欢迎语=「欢迎使用APS系统」、副标题已去；忘记密码/注册/其它登录方式（含第三方图标）与 RegisterForm 组件均已下线',
+    m20Bad.length === 0,
+    m20Bad.length === 0
+      ? '登录页只剩 用户名/密码/记住我/登录，注册链路已彻底移除'
+      : m20Bad.join(';')
+  )
+
+  // M21 菜单底色钉死为深色：app store 是 persist 的，设置抽屉里调过一次浅色就会
+  // 长期留在 localStorage，ConfigGlobal 挂载时的 setCssVarTheme() 会把它写回 CSS 变量
+  // ⇒ 每次刷新菜单都是白的（文字 #333、浅块同底色、选中项淡蓝底）。initTheme 必须重置。
+  const appStoreSrc = readSrc('store/modules/app.ts')
+  const m21Bad = []
+  if (!/export const MENU_BG_COLOR = '#001529'/.test(appStoreSrc)) {
+    m21Bad.push('app.ts 无 MENU_BG_COLOR = #001529 常量')
+  }
+  if (!/leftMenuBgColor:\s*MENU_BG_COLOR/.test(appStoreSrc)) {
+    m21Bad.push('state 默认 leftMenuBgColor 未引用 MENU_BG_COLOR（默认值与重置值会各自漂移）')
+  }
+  const initThemeSeg = appStoreSrc.slice(appStoreSrc.indexOf('initTheme()'))
+  if (!/setMenuTheme\(MENU_BG_COLOR\)/.test(initThemeSeg)) {
+    m21Bad.push('initTheme() 未调用 setMenuTheme(MENU_BG_COLOR)，localStorage 残留的浅色菜单底色会复活')
+  }
+  assert(
+    'M21 静态：菜单底色固定深色 #001529，initTheme() 强制重置（不受 localStorage 残留主题影响）',
+    m21Bad.length === 0,
+    m21Bad.length === 0
+      ? '菜单底色由 MENU_BG_COLOR 单点定义，启动时强制写回 CSS 变量'
+      : m21Bad.join(';')
+  )
+}
+
+/**
+ * ==========================================================================
+ * 排产总览（Overview）— GROUP=overview
+ *  2026-10-16 依据 5号位《Overview-R1更正与修复》函重接真实端点：
+ *   Overview 无聚合端点，5 个数据面各自独立调（active-plan / order-query-summary /
+ *   resource-bottleneck / candidate-summary / domain-status）。
+ *  - OV01~OV05 动态：真实端点可达 + 响应形状与前端类型一致
+ *  - OV06~OV10 静态：页面/类型/store 不再含 mock 复合体与旧词表
+ * ==========================================================================
+ */
+/**
+ * 候选版本确认页 — 按后端**已部署** DTO 对齐（candidate — 2026-10-16 代码级审计）
+ *
+ * 审计起因：本页此前的类型是 4号位 依据 §十二「17 字段」自拟的富对比契约，后端从未实现；
+ * 列表还绕道调 `/api/governance/runs?status=CANDIDATE`（返 ScheduleRun，字段无一匹配）。
+ * 本组锁定「只消费后端真给的东西」，防止自拟字段被再加回页面。
+ */
+async function verifyCandidate(token) {
+  const apiSrc = readSrc('api/aps-v1/candidate.ts')
+  const typeSrc = readSrc('api/aps-v1/types/candidate.ts')
+  const storeSrc = readSrc('store/modules/aps/candidate.ts')
+  const viewSrc = readSrc('views/Aps/Candidate.vue')
+  const stripComments = (s) =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/[^\n]*/g, '')
+  const apiCode = stripComments(apiSrc)
+  const viewCode = stripComments(viewSrc)
+  log('\n[CD] 候选版本确认 — 真实端点对齐 + 无假数据（candidate — 2026-10-16）')
+
+  // CD01 列表走 5号位正式端点，不再绕道 governance/runs
+  assert(
+    'CD01 静态：列表端点为 /api/overview/candidate-summary（绕道端点返回 ScheduleRun，与页面字段无一匹配）',
+    /url: '\/api\/overview\/candidate-summary'/.test(apiCode) &&
+      !/governance\/runs\?status=CANDIDATE/.test(apiCode),
+    '绕道端点一旦回退，列表会静默变空且拿不到 basePlanVersionId'
+  )
+
+  // CD02 compare-with 双参端点保留
+  assert(
+    'CD02 静态：对比走 compare-with 双参端点（candidatePlanVersionId + basePlanVersionId）',
+    /compare-with\/\$\{basePlanVersionId\}/.test(apiCode),
+    '双参端点是唯一能给汇总对比的入口'
+  )
+
+  // CD03 后端不提供的字段不得回到类型里（订单级明细 / 根因 / 共享资源 / 数量-时间切片）
+  const ghostFields = [
+    'newOrderDiffs',
+    'impactedOrders',
+    'reasons',
+    'sharedResourceOccupancies',
+    'quantityTimeSlices',
+    'sharedResourceOccupancyCount',
+    'quantityTimeSliceCount',
+    'externalDomainBlocksCount',
+    'sourceRefType',
+    'purpose'
+  ]
+  const ghosts = ghostFields.filter((f) => new RegExp(`\\b${f}\\b`).test(typeSrc))
+  assert(
+    `CD03 静态：类型层不得再出现后端未提供的字段（${ghostFields.length} 个已下线字段）`,
+    ghosts.length === 0,
+    ghosts.length ? `复活字段：${ghosts.join(', ')}` : '订单级明细/根因/共享资源/切片均已下线'
+  )
+
+  // CD04 页面模板不得再消费这些字段（假数据的最直接证据）
+  const viewGhosts = ghostFields.filter((f) => new RegExp(`\\b${f}\\b`).test(viewCode))
+  assert(
+    'CD04 静态：页面模板不再渲染后端不提供的区块',
+    viewGhosts.length === 0,
+    viewGhosts.length ? `页面仍在渲染：${viewGhosts.join(', ')}` : '使用说明/订单表/根因/共享资源/切片 5 块均已移除'
+  )
+
+  // CD05 mock 桩整体删除（VITE_USE_MOCK 四处皆 false，桩只会造成假绿）
+  const mockHits = [
+    /const candidate1\s*:/,
+    /candidateWhatif/,
+    /candidateInsertImpact/,
+    /mockCandidateList/,
+    /findMockActivatableCandidate/,
+    /if \(APS_USE_MOCK\)/,
+    /\b200[1-4]\b/
+  ].filter((re) => re.test(apiCode))
+  assert(
+    'CD05 静态：candidate.ts 不含任何 mock 分支与手写桩',
+    mockHits.length === 0,
+    mockHits.length ? `命中 ${mockHits.length} 处 mock 痕迹` : '4 份桩数据 + mock 分支已全部删除'
+  )
+
+  // CD06 写端点只回 message + 服务端时间，页面不得自造操作者/时间
+    const storeCode = stripComments(storeSrc)
+  const ackGhosts = ['lastConfirmResult', 'lastActivateResult', 'confirmedAt', 'activatedBy', 'actor']
+    .filter((f) => new RegExp(`\\b${f}\\b`).test(viewCode + storeCode))
+  assert(
+    'CD06 静态：确认/采用回执只展示后端给的 message + 服务端时间，不自造 actor/时间',
+    ackGhosts.length === 0,
+    ackGhosts.length ? `仍有前端自造字段：${ackGhosts.join(', ')}` : '后端 data=null，页面只展示 message'
+  )
+
+  // CD07 estimatedOnlyCount 后端返 null，页面必须显示 '-' 而不是 0
+  assert(
+    "CD07 静态：仅估算订单后端返 null 时显示 '-'，不按 0 处理",
+    /estimatedOnlyCount \?\? '-'/.test(viewCode),
+    "null 被当成 0 展示会把「后端未对齐」伪装成「确实为 0」"
+  )
+
+  // CD08 canActivate 一律取后端值，页面不得自行按 runType 推断
+  assert(
+    'CD08 静态：可激活性取自后端 CandidateBriefDto.canActivate',
+    /canActivate: brief\.canActivate/.test(stripComments(storeSrc)),
+    '前端按 runType 推断可激活性会与后端 §12.3 激活红线判定不一致'
+  )
+
+  // CD09 动态：candidate-summary 真实返回
+  const sum = await call('GET', '/api/overview/candidate-summary', { token })
+  const d = sum.json?.data
+  const cand = d?.candidates
+  const shapeOk =
+    sum.code === 200 &&
+    d &&
+    typeof d.pendingCount === 'number' &&
+    (cand === null || Array.isArray(cand))
+  assert(
+    'CD09 动态：/api/overview/candidate-summary 可达且返回 { pendingCount, candidates[] }',
+    shapeOk,
+    `code=${sum.code} pendingCount=${d?.pendingCount} candidates=${Array.isArray(cand) ? cand.length : cand}`
+  )
+
+  // CD10 动态：候选列表每一项都必须带 compare-with 需要的 basePlanVersionId 与 canActivate
+  const first = Array.isArray(cand) ? cand[0] : null
+  if (!first) {
+    skip('CD10 动态', 'dev 无候选版本（CANDIDATE 数为 0），无法校验列表项字段')
+  } else {
+    const ok =
+      typeof first.planVersionId === 'number' &&
+      'basePlanVersionId' in first &&
+      typeof first.canActivate === 'boolean' &&
+      'runType' in first
+    assert(
+      'CD10 动态：候选列表项含 planVersionId / basePlanVersionId / canActivate / runType',
+      ok,
+      `实际键：${Object.keys(first).join(', ')}`
+    )
+  }
+
+  // CD11 动态：compare-with 对不存在的版本返 404（证明端点已部署且双参路径正确）
+  const cmp = await call('GET', '/api/governance/plan-version/999999999/compare-with/999999998', {
+    token
+  })
+  assert(
+    'CD11 动态：compare-with 端点已部署（不存在版本返 404）',
+    cmp.code === 404 || cmp.status === 404,
+    `code=${cmp.code} message=${cmp.json?.message ?? '-'}`
+  )
+}
+
+async function verifyOverview(token) {
+  /** 去掉 // 与 /* *\/ 注释后再做「是否仍含 X」断言。
+   *  否则文件头「已撤 PlanOverviewDto」「已删仅估算订单」这类**说明性注释**会被误判成残留代码
+   *  （本组 OV06 / OV08 首次运行即踩此坑）。 */
+  const stripComments = (s) =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/[^\n]*/g, '')
+  log('\n[OV] 排产总览 — 真实端点对接 + 词表收敛（overview — 2026-10-16 5号位 R1 函）')
+
+  // ---- 取一个真实 planVersionId（dev 可能无 ACTIVE，用 schedule/versions 兜底）----
+  const versions = await call('GET', '/api/schedule/versions', { token })
+  const versionRows = versions.json?.data ?? []
+  const activePlan = await call('GET', '/api/overview/active-plan', { token })
+
+  // OV01 active-plan 形状（§四：新契约=裸数组；旧契约=单对象/null —— 三种都算「前端可解析」）
+  const raw = activePlan.json?.data
+  const shape = raw === null || raw === undefined ? 'null' : Array.isArray(raw) ? 'array' : 'object'
+  const ov01Shapes = ['null', 'array', 'object']
+  assert(
+    'OV01 动态：/api/overview/active-plan 可达，且形状 ∈ {裸数组(新) / 单对象(旧) / null(无ACTIVE)}',
+    activePlan.code === 200 && ov01Shapes.includes(shape),
+    `code=${activePlan.code} shape=${shape}（前端 normalizeActivePlans 三种都吃得下）`
+  )
+
+  // OV02 order-query/summary 用真实 planVersionId 调，且 planVersionId 回填（§五 R5 已修）
+  const someId = versionRows[0]?.id
+  if (!someId) {
+    skip('OV02 动态', 'dev 无任何 PlanVersion（/api/schedule/versions 返空），无法验证订单摘要入参回填')
+  } else {
+    const sum = await call('GET', `/api/order-query/summary?planVersionId=${someId}`, { token })
+    const d = sum.json?.data
+    const ok =
+      sum.code === 200 &&
+      d &&
+      d.planVersionId === someId &&
+      ['totalCount', 'onTimeCount', 'delayedCount', 'riskCount', 'unscheduledCount'].every(
+        (k) => typeof d[k] === 'number'
+      )
+    assert(
+      `OV02 动态：/api/order-query/summary?planVersionId=${someId} 回填该 id 且 5 个计数字段齐全（R5）`,
+      !!ok,
+      ok ? `planVersionId=${d.planVersionId} total=${d.totalCount}` : `code=${sum.code} data=${JSON.stringify(d)}`
+    )
+  }
+
+  // OV03 resource-bottleneck 可达；有行时核对字段名（后端可能省 unavailableWindows/utilizationRate，前端已容缺）
+  const res = await call('GET', `/api/overview/resource-bottleneck?planVersionId=${someId ?? 1}&topN=5`, {
+    token
+  })
+  const resRows = res.json?.data ?? []
+  const ov03Fields = ['resourceId', 'resourceCode', 'resourceName', 'isBottleneck']
+  const ov03Ok =
+    res.code === 200 &&
+    Array.isArray(resRows) &&
+    (resRows.length === 0 || ov03Fields.every((f) => f in resRows[0]))
+  assert(
+    'OV03 动态：/api/overview/resource-bottleneck 可达且元素字段名与前端类型一致（有行时核对）',
+    ov03Ok,
+    ov03Ok
+      ? `code=200 rows=${resRows.length}${resRows.length ? ' 字段齐' : '（dev 暂无资源数据）'}`
+      : `code=${res.code} 首行=${JSON.stringify(resRows[0] ?? null).slice(0, 160)}`
+  )
+
+  // OV04 candidate-summary 形状
+  const cand = await call('GET', '/api/overview/candidate-summary', { token })
+  const cd = cand.json?.data
+  const ov04Ok = cand.code === 200 && cd && typeof cd.pendingCount === 'number' && Array.isArray(cd.candidates)
+  assert(
+    'OV04 动态：/api/overview/candidate-summary 返回 { pendingCount:number, candidates:[] }',
+    !!ov04Ok,
+    ov04Ok ? `pendingCount=${cd.pendingCount} candidates=${cd.candidates.length}` : `code=${cand.code} data=${JSON.stringify(cd)}`
+  )
+
+  // OV05 domain-status 路由存在（§7.1：走 5号位 /api/domain-status/{runId}；404 = 路径选错）
+  const runId = versionRows.find((v) => v.sourceScheduleRunId)?.sourceScheduleRunId
+  if (!runId) {
+    skip('OV05 动态', 'dev 无带 SourceScheduleRunId 的 PlanVersion，无法验证 /api/domain-status/{runId}')
+  } else {
+    const ds = await call('GET', `/api/domain-status/${runId}`, { token })
+    assert(
+      `OV05 动态：/api/domain-status/${runId} 路由存在（非 404；500=该 run 缺 ExpectedDomainKeysJson 属数据问题）`,
+      ds.code !== 404,
+      `code=${ds.code}${ds.code === 500 ? '（端点存在，dev 该 run 无 ExpectedDomainKeysJson）' : ''}`
+    )
+  }
+
+  // OV06 静态：types/overview.ts 已删 mock 复合体与旧四分类
+  const ovTypes = stripComments(readSrc('api/aps-v1/types/overview.ts'))
+  const ov06Bad = []
+  if (/PlanOverviewDto/.test(ovTypes)) ov06Bad.push('仍有 PlanOverviewDto 复合体')
+  if (/estimatedOnlyOrderCount/.test(ovTypes)) ov06Bad.push('仍有 estimatedOnlyOrderCount')
+  if (/BLOCKED_BY_UPSTREAM|PI_POSITION_ISSUE|ODS_CONTRACT_FAILED/.test(ovTypes)) {
+    ov06Bad.push('仍有旧四分类域状态')
+  }
+  if (!/RUN_DOMAIN_STATUSES/.test(ovTypes)) ov06Bad.push('缺 6 值 RUN_DOMAIN_STATUSES')
+  assert(
+    'OV06 静态：types/overview.ts 已撤 mock 复合体 / 仅估算订单 / 旧四分类域状态，域名状态收敛为 6 值',
+    ov06Bad.length === 0,
+    ov06Bad.length === 0 ? '复合体与旧词表已清' : ov06Bad.join(';')
+  )
+
+  // OV07 静态：api/overview.ts 接 4 个真实端点，且不再有 mockOverview 兜底
+  const ovApi = stripComments(readSrc('api/aps-v1/overview.ts'))
+  const ov07Miss = ['/api/overview/active-plan', '/api/overview/resource-bottleneck', '/api/overview/candidate-summary', '/api/domain-status/'].filter(
+    (u) => !ovApi.includes(u)
+  )
+  const ov07Mock = /mockOverview|APS_USE_MOCK/.test(ovApi)
+  assert(
+    'OV07 静态：api/aps-v1/overview.ts 接 4 个真实端点，且无 mockOverview / APS_USE_MOCK 兜底',
+    ov07Miss.length === 0 && !ov07Mock,
+    ov07Miss.length === 0 && !ov07Mock
+      ? '4 端点齐全且无 mock 兜底'
+      : `缺端点=${ov07Miss.join(',') || '-'} mock兜底=${ov07Mock}`
+  )
+
+  // OV08 静态：Overview.vue 不再有「仅估算」卡片（§十 (A) 删除）
+  const ovVue = stripComments(readSrc('views/Aps/Overview.vue'))
+  const ov08Bad = []
+  if (/仅估算订单/.test(ovVue)) ov08Bad.push('仍有「仅估算订单」卡片')
+  if (/ESTIMATED_BADGE_TEXT/.test(ovVue)) ov08Bad.push('仍引 ESTIMATED_BADGE_TEXT')
+  if (/estimatedOnlyOrderCount/.test(ovVue)) ov08Bad.push('仍读 estimatedOnlyOrderCount')
+  assert(
+    'OV08 静态：Overview.vue 已删「仅估算订单」卡片（5号位 §十 (A)：该事实仅内存不建表，事后读模型给不出）',
+    ov08Bad.length === 0,
+    ov08Bad.length === 0 ? '已删净' : ov08Bad.join(';')
+  )
+
+  // OV09 静态：全仓已无 Computed / ComputeFailed 死分支（§九 词表收敛）
+  const ov09Files = [
+    'api/aps-v1/types/common.ts',
+    'store/modules/aps/schedule.ts'
+  ]
+  const ov09Bad = ov09Files.filter((f) => {
+    const s = readSrc(f)
+    return /'Computed'|'ComputeFailed'|Computed:\s*'|ComputeFailed:/.test(s)
+  })
+  const ov09HasComputing = /'Computing'/.test(readSrc('api/aps-v1/types/common.ts'))
+  assert(
+    'OV09 静态：PlanVersion 词表无 Computed/ComputeFailed 死分支，且已补 Computing（§九）',
+    ov09Bad.length === 0 && ov09HasComputing,
+    ov09Bad.length === 0 && ov09HasComputing
+      ? '旧词表已清 + Computing 已补'
+      : `残留=${ov09Bad.join(',') || '-'} Computing=${ov09HasComputing}`
+  )
+
+  // OV10 静态：store 在 runId 为 null 时不请求 domain-status（§7.3）
+  const ovStore = readSrc('store/modules/aps/overview.ts')
+  const ov10Ok = /if\s*\(!scheduleRunId\)/.test(ovStore) && /if\s*\(!planVersionId\)/.test(ovStore)
+  assert(
+    'OV10 静态：store 在无 planVersionId / 无 sourceScheduleRunId 时跳过对应请求（不拿假数）',
+    ov10Ok,
+    ov10Ok ? '两个 null 短路均在' : '缺 planVersionId 或缺 scheduleRunId 的短路'
+  )
+
+  // OV11 静态：task-summary 已由 5号位下线，前端不得再有残留调用/类型
+  const ov11Files = [
+    'api/aps-v1/overview.ts',
+    'api/aps-v1/types/overview.ts',
+    'store/modules/aps/overview.ts',
+    'views/Aps/Overview.vue'
+  ]
+  const ov11Bad = ov11Files.filter((f) => /overview\/task-summary|OverviewTaskSummaryDto/.test(readSrc(f)))
+  assert(
+    'OV11 静态：/api/overview/task-summary 已下线（5号位 2026-10-16 删除 OverviewTaskSummaryDto + 端点），前端无残留调用/类型',
+    ov11Bad.length === 0,
+    ov11Bad.length === 0 ? '4 文件均无残留' : `残留=${ov11Bad.join(',')}`
+  )
+
+  // OV12 动态：已下线端点确实 404；若仍 200 = 分批部署的中间态（如实跳过，不误判为回归）
+  const ts = await call('GET', `/api/overview/task-summary?planVersionId=${someId ?? 1}`, { token })
+  if (ts.code === 404) {
+    assert('OV12 动态：/api/overview/task-summary 已下线（404）', true, `code=${ts.code}`)
+  } else {
+    skip(
+      'OV12 动态',
+      `task-summary 仍返 ${ts.code}（5号位 2026-10-16 §二：分批部署中间态，以最新一次部署为准；前端已无调用，不受影响）`
+    )
+  }
+}
+
 function readSrc(relPath) {
   try {
     return readFileSync(join(SRC_ROOT, relPath), 'utf-8')
@@ -4472,7 +7479,10 @@ async function main() {
   log(`API Base: ${API_BASE}`)
   log(`Group:    ${GROUP}`)
 
-  const adminToken = await loginAsAdmin()
+  // 纯静态组不登录：dev 登录有频控（HTTP 429 登录尝试过于频繁），
+  // 静态组拿不到 token 也会在第一步就整段中止，白白浪费一次配额。
+  const STATIC_ONLY_GROUPS = new Set(['menu'])
+  const adminToken = STATIC_ONLY_GROUPS.has(GROUP) ? '' : await loginAsAdmin()
 
   if (GROUP === 'all' || GROUP === 'interfaces') {
     await verifyInterfaces(adminToken)
@@ -4519,6 +7529,12 @@ async function main() {
   if (GROUP === 'all' || GROUP === 't-tsrc') {
     await verifyTaskSplitRuleConfig(adminToken)
   }
+  if (GROUP === 'all' || GROUP === 'setup') {
+    await verifySetupPages()
+  }
+  if (GROUP === 'all' || GROUP === 'pwc') {
+    await verifyProductionWorkCalendar(adminToken)
+  }
   if (GROUP === 'all' || GROUP === 'dp-freeze') {
     await verifyDemandProtectionFreeze()
   }
@@ -4527,6 +7543,15 @@ async function main() {
   }
   if (GROUP === 'all' || GROUP === 'e-freeze') {
     await verifyExplanationFreeze(adminToken)
+  }
+  if (GROUP === 'all' || GROUP === 'menu') {
+    verifyMenuGroup()
+  }
+  if (GROUP === 'all' || GROUP === 'overview') {
+    await verifyOverview(adminToken)
+  }
+  if (GROUP === 'all' || GROUP === 'candidate') {
+    await verifyCandidate(adminToken)
   }
 
   log(`\n========== 结果 ==========`)

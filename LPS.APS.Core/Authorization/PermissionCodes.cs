@@ -50,6 +50,8 @@ public static class PermissionCodes
     public const string ParameterView = "aps.parameter.view";
     /// <summary>编辑参数</summary>
     public const string ParameterEdit = "aps.parameter.edit";
+    /// <summary>发布参数（D-1 新增，0号位 终裁独立授权——不因具有规则发布权限自动获得参数发布能力）</summary>
+    public const string ParameterPublish = "aps.parameter.publish";
     /// <summary>查看策略</summary>
     public const string StrategyView = "aps.strategy.view";
     /// <summary>编辑策略</summary>
@@ -119,14 +121,14 @@ public static class PermissionCodes
     /// <summary>查看审计日志</summary>
     public const string AuditView = "aps.audit.view";
 
-    /// <summary>全部 V1 功能权限点（43 码，供策略注册遍历；34 码基线 + Setup 换型 3 码 + ResourceCalendar 3 码 + ManualCapacity 3 码，后两者为 5号位 权限码申请 2026-09-24 新增）</summary>
+    /// <summary>全部 V1 功能权限点（44 码，供策略注册遍历；43 码基线 + ParameterPublish 参数发布 1 码（D-1，0号位 终裁独立授权））</summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
         PlanView, PlanRun, PlanCompare, PlanExport,
         CtpView, PlanCtp, OrderInsertImpact, ReschedulePartial, RescheduleManual,
         CandidateView, CandidateConfirm, CandidateActivate,
         RuleView, RuleMaintain, RulePublish,
-        ParameterView, ParameterEdit,
+        ParameterView, ParameterEdit, ParameterPublish,
         StrategyView, StrategyEdit, StrategyPublish,
         ManualEtaView, ManualEtaMaintain, ManualEtaCancel,
         DemandProtectionView, DemandProtectionRelease,

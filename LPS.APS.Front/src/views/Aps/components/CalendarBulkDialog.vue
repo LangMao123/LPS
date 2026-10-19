@@ -2,7 +2,8 @@
   APS V1 4号位 — 批量铺窗 Dialog（设备资源日历 / 人工槽日历 共用）
 
   依据：
-    - 冻结文档 v1.3《Resource Calendar 资源日历能力补充冻结方案 v1.3》§三/§五/§九
+    - 冻结文档 v1.4《Resource Calendar 资源日历能力补充冻结方案 v1.4》§三/§五/§九
+      + §21 合并原则「相同级别重叠矛盾拒绝发布」（10-14 收：提交前拦截本级重叠）
     - 5号位 2026-09-24《ResourceCalendar与ManualCapacity接口对接函》§二.1 / §二.5
 
   契约（两模块同构，仅键不同）：
@@ -11,8 +12,17 @@
     - days 1..370（后端 400 校验）；days=1 即"逐条加一天"
     - endTime 须 > startTime（后端 400 校验）
 
-  ⚠️ 追加语义（发函 D2 未决）：后端 BulkCreate 只 INSERT，不删同资源同区间旧窗口
-    → 本 Dialog 显式列出"现有窗口"并提示"本次为追加，不覆盖已有 N 条"
+  2026-10-14 精简（用户反馈弹窗啰嗦）：
+    - 撤「键 = xxx」内部Id外露、撤「本次将生成」重复摘要、撤「追加语义（不覆盖）」长提示、
+      撤「现有窗口」表格（365 行与弹窗背后的页面表完全重复，还挤占视野）
+    - 保留：必填项 + 时段预设 + 一条「覆盖不是追加」的说明（这是会删数据的语义，必须让用户看见）
+
+  2026-10-14 撤除本级重叠拦截（自纠）：
+    - 原拦截建立在「后端只追加不覆盖」的旧认知上，与实际相反 —— ResourceCalendarService.cs:51-59
+      / ManualCapacityService.cs:154 起手即 DELETE 该区间旧窗再逐天 INSERT，注释明写
+      「覆盖式铺窗…保证无重叠且重复铺窗幂等（D2 回执口径）」
+    - 既然后端已保证结果无重叠且可幂等重铺，前端再拦 = 凭空阻止合法的「改时段重铺」，属功能倒退
+    - 冻结 v1.4 §21「相同级别重叠矛盾拒绝发布」由后端删除语义天然满足
 -->
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
@@ -27,21 +37,11 @@ import {
   ElInputNumber,
   ElMessage,
   ElSwitch,
-  ElTable,
-  ElTableColumn,
   ElTag
 } from 'element-plus'
 import { BULK_DAYS_MAX, BULK_DAYS_MIN } from '@/api/aps-v1'
 import type { BulkWindowDraft } from '@/api/aps-v1'
 import type { FormRules } from 'element-plus'
-
-interface ExistingWindow {
-  id: number
-  startTime: string
-  endTime: string
-  availableFlag: boolean
-  remark?: string
-}
 
 const props = defineProps<{
   visible: boolean
@@ -52,9 +52,6 @@ const props = defineProps<{
   targetId: number | null
   /** 对象展示名（如 "MC01 注塑机-01" / "精修01（精修）"） */
   targetLabel?: string
-  /** 已加载的现有窗口（未查证时为空数组，配合 existingWindowsLoaded 区分） */
-  existingWindows: ExistingWindow[]
-  existingWindowsLoaded: boolean
 }>()
 
 const emit = defineEmits<{
@@ -145,11 +142,12 @@ const rules = computed<FormRules>(() => ({
 
 const modeLabel = computed(() => (props.mode === 'DEVICE' ? '设备资源日历' : '人工能力槽日历'))
 
-const dateHint = computed(() =>
-  form.value.days > 1 && form.value.startDate
-    ? `将生成 ${form.value.days} 条窗口：${form.value.startDate} 起连续 ${form.value.days} 天，每天 ${form.value.startTime} ~ ${form.value.endTime}`
-    : `将生成 1 条窗口：${form.value.startDate || '（未选日期）'} ${form.value.startTime} ~ ${form.value.endTime}`
-)
+/* 10-14 撤除本级重叠拦截 —— 原实现基于「后端只追加不覆盖」的旧认知，与实际相反：
+ *   ResourceCalendarService.cs:51-59 / ManualCapacityService.cs:154 起手就是
+ *   DELETE ... WHERE ResourceId=@Id AND StartTime >= @StartDate AND StartTime < @StartDate+Days
+ *   再逐天 INSERT，注释明写「覆盖式铺窗…保证无重叠且重复铺窗幂等（D2 回执口径）」。
+ *   既然后端已保证结果无重叠且可幂等重铺，前端再拦就是凭空阻止合法的「改时段重铺」，属功能倒退。
+ *   冻结 v1.4 §21「相同级别重叠矛盾拒绝发布」由后端删除语义天然满足。 */
 
 function applyPreset(preset: (typeof TIME_PRESETS)[number]): void {
   form.value.startTime = preset.start
@@ -188,6 +186,7 @@ async function onSubmit(): Promise<void> {
     ElMessage.warning('表单未通过校验，请检查红色提示项')
     return
   }
+  // 覆盖语义由后端保证（先删该区间旧窗再逐天 INSERT），前端不再做重叠拦截
   emit('submit', {
     startDate: form.value.startDate,
     days: Number(form.value.days),
@@ -213,7 +212,6 @@ async function onSubmit(): Promise<void> {
         <ElTag type="primary" effect="plain">
           {{ targetLabel || '（未选择）' }}
         </ElTag>
-        <span class="field-hint">键 = {{ targetId ?? '—' }}</span>
       </ElFormItem>
 
       <ElFormItem label="起始日期" prop="startDate" required>
@@ -257,9 +255,6 @@ async function onSubmit(): Promise<void> {
 
       <ElFormItem label="可用标记">
         <ElSwitch v-model="form.availableFlag" active-text="可用" inactive-text="禁用" />
-        <span class="field-hint">
-          禁用窗口（availableFlag=false）不参与排程；仅用于显式表达停机
-        </span>
       </ElFormItem>
 
       <ElFormItem label="备注">
@@ -272,56 +267,12 @@ async function onSubmit(): Promise<void> {
         />
       </ElFormItem>
 
-      <ElAlert type="info" :closable="false" show-icon class="d-alert">
-        <template #title>本次将生成</template>
-        {{ dateHint }}
-      </ElAlert>
-
       <ElAlert type="warning" :closable="false" show-icon class="d-alert">
-        <template #title>追加语义（不覆盖）</template>
-        后端铺窗<strong>只追加、不删除已有窗口</strong>。
-        同一对象重复铺窗会产生<strong>重叠窗口</strong>；如需替换，请先在列表中删除旧窗口再铺。
+        <template #title>这段日期是「覆盖」，不是「追加」</template>
+        提交后，该对象在
+        <strong>{{ form.startDate || '起始日期' }} 起 {{ form.days }} 天</strong>
+        内原有的窗口会<strong>全部删掉</strong>，再按你填的时间重新生成。
       </ElAlert>
-
-      <ElFormItem label="现有窗口" v-if="existingWindowsLoaded">
-        <div style="width: 100%">
-          <div class="field-hint" style="margin-left: 0">
-            当前已有 <strong>{{ existingWindows.length }}</strong> 条窗口（铺窗后为
-            {{ existingWindows.length + Number(form.days || 0) }} 条）
-          </div>
-          <ElTable
-            v-if="existingWindows.length > 0"
-            :data="existingWindows"
-            size="small"
-            border
-            max-height="200"
-            style="width: 100%"
-          >
-            <ElTableColumn prop="id" label="窗口 Id" width="110" />
-            <ElTableColumn label="开始" min-width="180">
-              <template #default="{ row }">{{
-                row.startTime?.replace('T', ' ').slice(0, 16)
-              }}</template>
-            </ElTableColumn>
-            <ElTableColumn label="结束" min-width="180">
-              <template #default="{ row }">{{
-                row.endTime?.replace('T', ' ').slice(0, 16)
-              }}</template>
-            </ElTableColumn>
-            <ElTableColumn label="可用" width="80" align="center">
-              <template #default="{ row }">
-                <ElTag :type="row.availableFlag ? 'success' : 'danger'" size="small">
-                  {{ row.availableFlag ? '可用' : '禁用' }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn prop="remark" label="备注" min-width="140" show-overflow-tooltip />
-          </ElTable>
-          <span v-else class="field-hint" style="margin-left: 0">
-            尚无窗口 —— 该对象当前 <strong>未配日历 = 不可排</strong>
-          </span>
-        </div>
-      </ElFormItem>
     </ElForm>
 
     <template #footer>

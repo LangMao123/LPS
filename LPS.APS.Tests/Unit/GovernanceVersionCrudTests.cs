@@ -4,6 +4,7 @@ using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
 using ParameterSetVersion = LPS.APS.Core.Entities.APS.ParameterSetVersion;
 using LPS.APS.Core.Enum;
 using LPS.APS.Core.Interfaces;
+using LPS.APS.Core.DTOs.Governance;
 using Moq;
 using Xunit;
 
@@ -231,6 +232,89 @@ public class GovernanceVersionCrudTests
         captured.Status.Should().Be(GovernanceVersionStatus.Draft);
     }
 
+    // ==================== Q2（4号位 2026-10-15 预警）：Update 读改写回传 null 快照不得清空独立子块 ====================
+
+    [Fact]
+    public async Task UpdateRuleSet_前端读改写回传null快照_换型子块保留()
+    {
+        // Q2：rule-set 同族置空读路径后，前端 PUT 回传 ContentSnapshotJson=null。
+        // 若 Update 不回填 existing，EnsureRuleSetNormalized 重建快照时 SetupTransitionRules 子块（仅存于该列）被丢弃。
+        // Arrange —— 既有快照含 DemandPriority + SetupTransitionRules 两子块
+        var existing = new RuleSetVersion
+        {
+            Id = 1,
+            RuleSetId = 10,
+            VersionCode = "V1",
+            Status = GovernanceVersionStatus.Draft,
+            ContentSnapshotJson = "{\"DemandPriority\":{\"Segments\":[]},\"SetupTransitionRules\":[{\"Id\":1,\"OperationCode\":\"OP10\"}]}"
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(existing);
+        RuleSetVersion? captured = null;
+        _ruleSetRepo.Setup(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()))
+            .Callback<RuleSetVersion, CancellationToken>((v, _) => captured = v)
+            .Returns(Task.CompletedTask);
+
+        // 前端读改写：DemandPriorityJson 非空（投影回传）、ContentSnapshotJson=null（置空后回传）
+        var update = new RuleSetVersion
+        {
+            Id = 1,
+            RuleSetId = 10,
+            VersionCode = "V1",
+            DemandPriorityJson = ValidDemandPriorityJson(),
+            ContentSnapshotJson = null
+        };
+
+        // Act
+        await _service.UpdateRuleSetVersionAsync(1, update, ActorUserId, default);
+
+        // Assert —— 重建快照仍保留 SetupTransitionRules 子块（换型规则不被清空）
+        captured.Should().NotBeNull();
+        using var doc = System.Text.Json.JsonDocument.Parse(captured!.ContentSnapshotJson!);
+        doc.RootElement.TryGetProperty("DemandPriority", out _).Should().BeTrue();
+        doc.RootElement.TryGetProperty("SetupTransitionRules", out var setup).Should().BeTrue();
+        setup.GetArrayLength().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task UpdateParameterSet_前端读改写回传null快照_BatchPolicy子块保留()
+    {
+        // Q2：参数集读路径 R2 已置空 → 前端 PUT 回传 ContentSnapshotJson=null；Update 不回填则 BatchPolicy 子块被清空（现存隐患）。
+        // Arrange —— 既有快照含 Lock + BatchPolicy 两子块
+        var existing = new ParameterSetVersion
+        {
+            Id = 2,
+            ParameterSetId = 20,
+            VersionCode = "P1",
+            Status = GovernanceVersionStatus.Draft,
+            ContentSnapshotJson = "{\"Lock\":{\"Trigger\":{}},\"BatchPolicy\":[{\"Key\":1}]}"
+        };
+        _paramRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(existing);
+        ParameterSetVersion? captured = null;
+        _paramRepo.Setup(r => r.UpdateAsync(It.IsAny<ParameterSetVersion>(), It.IsAny<CancellationToken>()))
+            .Callback<ParameterSetVersion, CancellationToken>((v, _) => captured = v)
+            .Returns(Task.CompletedTask);
+
+        // 前端读改写：LockJson 非空（投影回传）、ContentSnapshotJson=null
+        var update = new ParameterSetVersion
+        {
+            Id = 2,
+            ParameterSetId = 20,
+            VersionCode = "P1",
+            LockJson = "{\"Trigger\":{}}",
+            ContentSnapshotJson = null
+        };
+
+        // Act
+        await _service.UpdateParameterSetVersionAsync(2, update, ActorUserId, default);
+
+        // Assert —— 重建快照仍保留 BatchPolicy 子块
+        captured.Should().NotBeNull();
+        using var doc = System.Text.Json.JsonDocument.Parse(captured!.ContentSnapshotJson!);
+        doc.RootElement.TryGetProperty("Lock", out _).Should().BeTrue();
+        doc.RootElement.TryGetProperty("BatchPolicy", out var bp).Should().BeTrue();
+        bp.GetArrayLength().Should().Be(1);
+    }
+
     [Fact]
     public async Task CompareRuleSet_Diff基于ContentSnapshotJson子块()
     {
@@ -420,5 +504,325 @@ public class GovernanceVersionCrudTests
                         }
                     ]
                 }))
+        });
+
+    // ==================== R2（2026-10-14）：parameter-set 读端点大 JSON 载体裁剪 ====================
+
+    /// <summary>参数集 published-version 读路径：投影五主题子块后置空 ContentSnapshotJson（防 PSV 1985 序列化 500）</summary>
+    [Fact]
+    public async Task GetPublishedParameterSet_投影后置空快照载体_保留五主题子块()
+    {
+        // Arrange —— 方案 A（2026-10-16）：仓储 DB 侧 OPENJSON 已按块提取五主题，mock 返回「已提取」实体（ContentSnapshotJson 不读回）
+        var version = new ParameterSetVersion
+        {
+            Id = 1985,
+            ParameterSetId = 1305,
+            VersionCode = "PS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            EffectiveFrom = DateTime.Now.AddDays(-1),
+            LockJson = "{\"MinBatchQty\":1}",
+            SupplyJson = "{\"SafetyStock\":0}",
+            ProcurementJson = "{\"PlanningYield\":1}",
+            SolverStrategyJson = "{\"Mode\":\"NORMAL\"}",
+            CandidateGuardrailJson = "{\"Guardrail\":\"NORMAL\"}"
+        };
+        _paramRepo.Setup(r => r.GetDetailByParameterSetIdAsync(1305, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { version });
+
+        // Act
+        var published = await _service.GetPublishedParameterSetVersionAsync(1305, default);
+
+        // Assert —— 载体置空、五主题子块投影保留
+        published.Should().NotBeNull();
+        published!.Id.Should().Be(1985);
+        published.ContentSnapshotJson.Should().BeNull();
+        published.LockJson.Should().Contain("MinBatchQty");
+        published.SupplyJson.Should().Contain("SafetyStock");
+        published.ProcurementJson.Should().Contain("PlanningYield");
+        published.SolverStrategyJson.Should().Contain("NORMAL");
+        published.CandidateGuardrailJson.Should().Contain("Guardrail");
+    }
+
+    /// <summary>参数集详情读路径（A10）：投影五主题子块后置空快照载体（同族 500 修复）</summary>
+    [Fact]
+    public async Task GetParameterSetVersion_详情投影后置空快照载体()
+    {
+        // Arrange —— 方案 A（2026-10-16）：mock 返回「DB 侧已提取」实体（LockJson 已提取，ContentSnapshotJson 不读回）
+        var version = new ParameterSetVersion
+        {
+            Id = 1985,
+            ParameterSetId = 1305,
+            VersionCode = "PS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            LockJson = "{\"MinBatchQty\":1}"
+        };
+        _paramRepo.Setup(r => r.GetDetailByIdAsync(1985, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(version);
+
+        // Act
+        var detail = await _service.GetParameterSetVersionAsync(1985, default);
+
+        // Assert —— 详情投影后载体置空，子块可消费
+        detail.Should().NotBeNull();
+        detail!.ContentSnapshotJson.Should().BeNull();
+        detail.LockJson.Should().NotBeNullOrWhiteSpace();
+    }
+
+    /// <summary>版本列表摘要 DTO：映射元数据且排除全部 JSON 载体列（R2 列表端点裁剪基准）</summary>
+    [Fact]
+    public void ParameterSetVersionSummaryDto_From_映射元数据且排除JSON载体()
+    {
+        // Arrange
+        var v = new ParameterSetVersion
+        {
+            Id = 1985,
+            ParameterSetId = 1305,
+            VersionCode = "PS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            EffectiveFrom = new DateTime(2026, 10, 1),
+            PublishedAt = new DateTime(2026, 10, 14),
+            PublishedBy = "wangpeng",
+            CreatedBy = "wangpeng",
+            Remarks = "R2 测试",
+            ContentSnapshotJson = "{\"Lock\":{}}",
+            LockJson = "{}",
+            SupplyJson = "{}",
+            ProcurementJson = "{}",
+            SolverStrategyJson = "{}",
+            CandidateGuardrailJson = "{}"
+        };
+
+        // Act
+        var dto = ParameterSetVersionSummaryDto.From(v);
+
+        // Assert —— 元数据全映射
+        dto.Id.Should().Be(1985);
+        dto.ParameterSetId.Should().Be(1305);
+        dto.VersionCode.Should().Be("PS-PROD-V1.0");
+        dto.Status.Should().Be(GovernanceVersionStatus.Published);
+        dto.EffectiveFrom.Should().Be(new DateTime(2026, 10, 1));
+        dto.PublishedAt.Should().Be(new DateTime(2026, 10, 14));
+        dto.PublishedBy.Should().Be("wangpeng");
+        dto.CreatedBy.Should().Be("wangpeng");
+        dto.Remarks.Should().Be("R2 测试");
+
+        // Assert —— 6 个 JSON 载体属性不暴露
+        foreach (var carrier in new[] { "ContentSnapshotJson", "LockJson", "SupplyJson", "ProcurementJson", "SolverStrategyJson", "CandidateGuardrailJson" })
+        {
+            typeof(ParameterSetVersionSummaryDto).GetProperty(carrier).Should().BeNull();
+        }
+    }
+
+    // ==================== rule-set 同族（2026-10-15）：读端点 JSON 载体置空 + 版本列表摘要 DTO ====================
+
+    /// <summary>规则集 published-version 读路径：投影 DemandPriority 子块后置空 ContentSnapshotJson（rule-set 同族，镜像参数集 R2 修复）</summary>
+    [Fact]
+    public async Task GetPublishedRuleSet_投影后置空快照载体_保留DemandPriority子块()
+    {
+        // Arrange
+        var version = new RuleSetVersion
+        {
+            Id = 1986,
+            RuleSetId = 1310,
+            VersionCode = "RS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            EffectiveFrom = DateTime.Now.AddDays(-1),
+            EffectiveTo = DateTime.Now.AddDays(1),
+            ContentSnapshotJson = SnapshotWithDemandPriority("同族-发布")
+        };
+        _ruleSetRepo.Setup(r => r.GetByRuleSetIdAsync(1310, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { version });
+
+        // Act
+        var published = await _service.GetPublishedRuleSetVersionAsync(1310, default);
+
+        // Assert —— 载体置空、DemandPriority 子块投影保留
+        published.Should().NotBeNull();
+        published!.Id.Should().Be(1986);
+        published.ContentSnapshotJson.Should().BeNull();
+        published.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
+    }
+
+    /// <summary>规则集详情读路径：投影 DemandPriority 子块后置空快照载体（rule-set 同族 500 修复）</summary>
+    [Fact]
+    public async Task GetRuleSetVersion_详情投影后置空快照载体()
+    {
+        // Arrange
+        var version = new RuleSetVersion
+        {
+            Id = 1986,
+            RuleSetId = 1310,
+            VersionCode = "RS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            ContentSnapshotJson = SnapshotWithDemandPriority("同族-详情")
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1986, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(version);
+
+        // Act
+        var detail = await _service.GetRuleSetVersionAsync(1986, default);
+
+        // Assert —— 详情投影后载体置空，子块可消费
+        detail.Should().NotBeNull();
+        detail!.ContentSnapshotJson.Should().BeNull();
+        detail.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
+    }
+
+    /// <summary>
+    /// C-2（2026-10-17）：规则集详情读路径补 SetupTransitionRules 子块投影——
+    /// 0号位 复核 7.3「详情接口应能返回版本对应的 Setup 主题内容」；镜像 DemandPriority 投影，
+    /// 从 ContentSnapshotJson.SetupTransitionRules 子块提取填充 SetupTransitionRulesJson，载体仍置空。
+    /// </summary>
+    [Fact]
+    public async Task GetRuleSetVersion_详情投影_补SetupTransitionRules子块提取()
+    {
+        // Arrange —— 快照含 DemandPriority + SetupTransitionRules 两子块（真实持久化载体形态）
+        var snapshotJson = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["DemandPriority"] = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(
+                System.Text.Json.JsonSerializer.Serialize(new LPS.APS.Core.Dto.DemandPriorityBlock
+                {
+                    Segments =
+                    [
+                        new LPS.APS.Core.Dto.PrioritySegment
+                        {
+                            SegmentOrder = 1,
+                            SegmentName = "C-2-详情",
+                            IsEnabled = true,
+                            SortFields =
+                            [
+                                new LPS.APS.Core.Dto.SegmentSortField
+                                {
+                                    Field = LPS.APS.Core.Dto.DemandField.DueDate,
+                                    Direction = LPS.APS.Core.Dto.SortDirection.Asc
+                                }
+                            ]
+                        }
+                    ]
+                })),
+            ["SetupTransitionRules"] = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(
+                System.Text.Json.JsonSerializer.Serialize(new[]
+                {
+                    new
+                    {
+                        Id = 19_860_000_001L, // ruleSetVersionId 1986 * 10_000_000 + seq 1（BuildRuleId 口径）
+                        RuleSetVersionId = 1986,
+                        ProductionDepartmentId = 12,
+                        StageCode = "STG-01",
+                        OperationCode = "OP10",
+                        ResourceId = 101,
+                        FromMaterialId = (int?)null,
+                        ToMaterialId = 205,
+                        RuleType = "DEFAULT",
+                        SetupMinutes = 30m,
+                        IsActive = true
+                    }
+                }))
+        });
+
+        var version = new RuleSetVersion
+        {
+            Id = 1986,
+            RuleSetId = 1310,
+            VersionCode = "RS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            ContentSnapshotJson = snapshotJson
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1986, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(version);
+
+        // Act
+        var detail = await _service.GetRuleSetVersionAsync(1986, default);
+
+        // Assert —— SetupTransitionRules 子块被投影填充，载体置空，DemandPriority 仍保留
+        detail.Should().NotBeNull();
+        detail!.ContentSnapshotJson.Should().BeNull();
+        detail.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
+        detail.SetupTransitionRulesJson.Should().NotBeNullOrWhiteSpace("C-2：详情接口应能返回版本对应的 Setup 主题内容");
+        using var setupDoc = System.Text.Json.JsonDocument.Parse(detail.SetupTransitionRulesJson!);
+        setupDoc.RootElement.GetArrayLength().Should().Be(1);
+        setupDoc.RootElement[0].TryGetProperty("OperationCode", out var op).Should().BeTrue();
+        op.GetString().Should().Be("OP10");
+    }
+
+    /// <summary>
+    /// C-2（2026-10-17）：规则集无 SetupTransitionRules 子块时，SetupTransitionRulesJson 投影为 null——
+    /// 版本可不配置换型规则（合法未配置，S-7）；不得把缺子块当作损坏（ProjectFromSnapshot 三态语义同轨）。
+    /// </summary>
+    [Fact]
+    public async Task GetRuleSetVersion_详情投影_无Setup子块时SetupTransitionRulesJson为null()
+    {
+        // Arrange —— 仅 DemandPriority 子块（既有兼容形态，如 SnapshotWithDemandPriority）
+        var version = new RuleSetVersion
+        {
+            Id = 1987,
+            RuleSetId = 1311,
+            VersionCode = "RS-NO-SETUP-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            ContentSnapshotJson = SnapshotWithDemandPriority("无Setup-详情")
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1987, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(version);
+
+        // Act
+        var detail = await _service.GetRuleSetVersionAsync(1987, default);
+
+        // Assert —— Setup 未配置则投影为 null（合法未配置），DemandPriority 正常，载体置空
+        detail.Should().NotBeNull();
+        detail!.ContentSnapshotJson.Should().BeNull();
+        detail.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
+        detail.SetupTransitionRulesJson.Should().BeNull();
+    }
+
+    /// <summary>规则集版本列表摘要 DTO：映射元数据且排除 JSON 载体列（rule-set 同族版本列表裁剪基准）</summary>
+    [Fact]
+    public void RuleSetVersionSummaryDto_From_映射元数据且排除JSON载体()
+    {
+        // Arrange
+        var v = new RuleSetVersion
+        {
+            Id = 1986,
+            RuleSetId = 1310,
+            VersionCode = "RS-PROD-V1.0",
+            Status = GovernanceVersionStatus.Published,
+            EffectiveFrom = new DateTime(2026, 10, 1),
+            PublishedAt = new DateTime(2026, 10, 14),
+            PublishedBy = "wangpeng",
+            CreatedBy = "wangpeng",
+            Remarks = "rule-set 同族测试",
+            ContentSnapshotJson = "{\"DemandPriority\":{}}",
+            DemandPriorityJson = "{}"
+        };
+
+        // Act
+        var dto = RuleSetVersionSummaryDto.From(v);
+
+        // Assert —— 元数据全映射
+        dto.Id.Should().Be(1986);
+        dto.RuleSetId.Should().Be(1310);
+        dto.VersionCode.Should().Be("RS-PROD-V1.0");
+        dto.Status.Should().Be(GovernanceVersionStatus.Published);
+        dto.EffectiveFrom.Should().Be(new DateTime(2026, 10, 1));
+        dto.PublishedAt.Should().Be(new DateTime(2026, 10, 14));
+        dto.PublishedBy.Should().Be("wangpeng");
+        dto.CreatedBy.Should().Be("wangpeng");
+        dto.Remarks.Should().Be("rule-set 同族测试");
+
+        // Assert —— 2 个 JSON 载体属性不暴露
+        foreach (var carrier in new[] { "ContentSnapshotJson", "DemandPriorityJson" })
+        {
+            typeof(RuleSetVersionSummaryDto).GetProperty(carrier).Should().BeNull();
+        }
+    }
+
+    /// <summary>合法五主题 ContentSnapshotJson（真实 DB 持久化载体形态）</summary>
+    private static string ValidParameterSnapshotJson() =>
+        System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["Lock"] = new { MinBatchQty = 1 },
+            ["Supply"] = new { SafetyStock = 0 },
+            ["Procurement"] = new { PlanningYield = 1 },
+            ["SolverStrategy"] = new { Mode = "NORMAL" },
+            ["CandidateGuardrail"] = new { Guardrail = "NORMAL" }
         });
 }

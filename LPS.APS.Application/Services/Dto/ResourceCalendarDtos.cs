@@ -100,6 +100,71 @@ public sealed class ManualSlotCalendarBulkRequest
 }
 
 /// <summary>
+/// 设备日历单条窗口追加请求（方向2；2026-10-14 放开"一天多条"）：
+/// 只插不删；与同日已有窗口重叠 → 409 拒绝；批量端点覆盖语义不变。
+/// </summary>
+public sealed class ResourceCalendarSingleRequest
+{
+    /// <summary>设备 Resource.Id</summary>
+    public int ResourceId { get; set; }
+
+    /// <summary>窗口开始（含；须与 EndTime 同日）</summary>
+    public DateTime StartTime { get; set; }
+
+    /// <summary>窗口结束（不含；须与 StartTime 同日）</summary>
+    public DateTime EndTime { get; set; }
+
+    /// <summary>1=可用 / 0=禁用停机</summary>
+    public bool AvailableFlag { get; set; } = true;
+
+    public string? Remark { get; set; }
+}
+
+/// <summary>
+/// 人工槽日历单条窗口追加请求（同设备日历语义）
+/// </summary>
+public sealed class ManualSlotCalendarSingleRequest
+{
+    /// <summary>人工槽 ManualSlotId</summary>
+    public int ManualSlotId { get; set; }
+
+    public DateTime StartTime { get; set; }
+    public DateTime EndTime { get; set; }
+
+    /// <summary>1=可用 / 0=禁用停机</summary>
+    public bool AvailableFlag { get; set; } = true;
+
+    public string? Remark { get; set; }
+}
+
+/// <summary>
+/// 三级合并解析预览结果（4号位 10-14 函 R1；接线 ResourceCalendarResolver，只读不写库）
+/// </summary>
+public sealed class ResourceCalendarResolvePreviewDto
+{
+    public int ResourceId { get; set; }
+
+    /// <summary>三级合并后最终有没有可排窗口</summary>
+    public bool HasAnyWindow { get; set; }
+
+    /// <summary>WORK（可排）/ OFF（本级明确停机）/ MISSING（本级没登记，未解析出窗口）</summary>
+    public string Status { get; set; } = "MISSING";
+
+    /// <summary>最终合法窗口（含来源层级）</summary>
+    public List<ResolvedWindowDto> Windows { get; set; } = new();
+}
+
+/// <summary>解析后的一片合法窗口</summary>
+public sealed class ResolvedWindowDto
+{
+    public DateTime Start { get; set; }
+    public DateTime End { get; set; }
+
+    /// <summary>本片由哪一级 WORK 决定：Factory / Department / Resource</summary>
+    public string Source { get; set; } = string.Empty;
+}
+
+/// <summary>
 /// 资源主表列表项 DTO（G1：设备下拉数据源；含日历状态）
 /// 数据源：dbo.Resource（资源主表）
 /// </summary>

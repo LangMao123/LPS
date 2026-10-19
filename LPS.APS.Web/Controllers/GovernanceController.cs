@@ -79,14 +79,17 @@ public class GovernanceController : ControllerBase
 
     #region RuleSetVersion CRUD
 
-    /// <summary>获取规则集的所有版本</summary>
+    /// <summary>
+    /// 获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；
+    /// 2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）
+    /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.RuleView)]
     [HttpGet("rule-set/{ruleSetId}/versions")]
     public async Task<IActionResult> GetRuleSetVersions(long ruleSetId, CancellationToken ct)
     {
-        var versions = await _ruleSetVersionRepo.GetByRuleSetIdAsync(ruleSetId, ct);
-        return Ok(ApiResponse<IReadOnlyList<RuleSetVersion>>.Success(versions));
+        var summaries = await _ruleSetVersionRepo.GetSummariesByRuleSetIdAsync(ruleSetId, ct);
+        return Ok(ApiResponse<IReadOnlyList<RuleSetVersionSummaryDto>>.Success(summaries));
     }
 
     /// <summary>获取规则集版本详情（P0-01：ContentSnapshotJson 投影回 DemandPriorityJson，前端 API 兼容）</summary>
@@ -135,14 +138,17 @@ public class GovernanceController : ControllerBase
 
     #region ParameterSetVersion CRUD
 
-    /// <summary>获取参数集的所有版本</summary>
+    /// <summary>
+    /// 获取参数集的所有版本（R2 修复：摘要 DTO，不含 ContentSnapshotJson 大 JSON 载体，防 PSV 1305 序列化 500；
+    /// 2026-10-15 4号位 来文：加补传输层——改调摘要查询，不再 SELECT * 整列搬 ContentSnapshotJson 大 LOB，PSV 1305 37s → 摘要列 10ms 级）
+    /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.ParameterView)]
     [HttpGet("parameter-set/{parameterSetId}/versions")]
     public async Task<IActionResult> GetParameterSetVersions(long parameterSetId, CancellationToken ct)
     {
-        var versions = await _parameterSetVersionRepo.GetByParameterSetIdAsync(parameterSetId, ct);
-        return Ok(ApiResponse<IReadOnlyList<ParameterSetVersion>>.Success(versions));
+        var summaries = await _parameterSetVersionRepo.GetSummariesByParameterSetIdAsync(parameterSetId, ct);
+        return Ok(ApiResponse<IReadOnlyList<ParameterSetVersionSummaryDto>>.Success(summaries));
     }
 
     /// <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块投影回五主题 JSON，前端 API 兼容）</summary>
@@ -216,9 +222,10 @@ public class GovernanceController : ControllerBase
     /// <summary>
     /// 发布参数集版本（六态状态机 R02 验收）
     /// 红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。
+    /// 授权：D-1 独立权限 ParameterPublish（0号位 §3.2 参数发布 aps.parameter.publish，不因规则发布自动获得）
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RulePublish)]
+    [Authorize(Policy = PermissionCodes.ParameterPublish)]
     [HttpPost("parameter-set/version/{versionId}/publish")]
     public async Task<IActionResult> PublishParameterSetVersion(long versionId, [FromBody] PublishRequest request, CancellationToken ct)
     {
@@ -264,9 +271,10 @@ public class GovernanceController : ControllerBase
     /// <summary>
     /// 停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
     /// 红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+    /// 授权：C-5/D-1 参数停用改挂 ParameterEdit（0号位 §3.2 参数停用操作授权 aps.parameter.edit）
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
     [HttpPost("parameter-set/version/{versionId}/disable")]
     public async Task<IActionResult> DisableParameterSetVersion(long versionId, [FromBody] DisableRequest request, CancellationToken ct)
     {
@@ -289,7 +297,7 @@ public class GovernanceController : ControllerBase
     /// IsDefault=1 停用时自动清默认标志（避免 DISABLED 默认残留于 ResolveDefault 范围）。
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPost("strategy-profile/version/{versionId}/disable")]
     public async Task<IActionResult> DisableStrategyProfileVersion(long versionId, [FromBody] DisableRequest request, CancellationToken ct)
     {
@@ -398,8 +406,9 @@ public class GovernanceController : ControllerBase
     [HttpGet("strategy-profile/{strategyProfileId}/versions")]
     public async Task<IActionResult> GetStrategyProfileVersions(long strategyProfileId, CancellationToken ct)
     {
-        var versions = await _strategyProfileVersionRepo.GetByStrategyProfileIdAsync(strategyProfileId, ct);
-        return Ok(ApiResponse<IReadOnlyList<StrategyProfileVersion>>.Success(versions));
+        // 4号位 2026-10-14 审计 R2/R3：列表投影带版本编码与父级主表 Id（前端直显编码 + 编辑定位父级，消除 N+1）
+        var versions = await _strategyProfileVersionRepo.GetByStrategyProfileIdWithCodesAsync(strategyProfileId, ct);
+        return Ok(ApiResponse<IReadOnlyList<StrategyProfileVersionListItem>>.Success(versions));
     }
 
     /// <summary>获取策略包版本详情</summary>
@@ -418,7 +427,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>创建策略包版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPost("strategy-profile/version")]
     public async Task<IActionResult> CreateStrategyProfileVersion([FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
@@ -428,7 +437,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPut("strategy-profile/version/{versionId}")]
     public async Task<IActionResult> UpdateStrategyProfileVersion(long versionId, [FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
@@ -446,7 +455,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>发布策略包版本（P0-06：DRAFT/SUBMITTED/APPROVED → PUBLISHED；发布前强制校验）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RulePublish)]
+    [Authorize(Policy = PermissionCodes.StrategyPublish)]
     [HttpPost("strategy-profile/version/{versionId}/publish")]
     public async Task<IActionResult> PublishStrategyProfileVersion(long versionId, [FromBody] PublishRequest request, CancellationToken ct)
     {
@@ -697,8 +706,8 @@ public class GovernanceController : ControllerBase
         CancellationToken ct = default)
     {
         var (skip, take) = ResolvePaging(page, pageSize);
-        var result = await _parameterSetRepo.GetListAsync(activeOnly, keyword, skip, take, ct);
-        return Ok(ApiResponse<IReadOnlyList<ParameterSet>>.Success(result));
+        var result = await _parameterSetRepo.GetListWithVersionAsync(activeOnly, keyword, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<ParameterSetListItemDto>>.Success(result));
     }
 
     /// <summary>策略包主表列表（G1/A12：4号位策略包列表页）</summary>
@@ -738,7 +747,7 @@ public class GovernanceController : ControllerBase
         }
     }
 
-    /// <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2）</summary>
+    /// <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2；R2 修复：快照载体经投影置空不外泄，五主题子块保留）</summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.ParameterView)]
     [HttpGet("parameter-set/{parameterSetId}/published-version")]

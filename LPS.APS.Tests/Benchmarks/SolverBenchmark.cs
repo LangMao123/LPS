@@ -60,6 +60,15 @@ public class SolverBenchmark
 {
     private readonly ITestOutputHelper _output;
 
+    /// <summary>
+    /// 2026-10-19 **实测**标定的求解耗时增长指数（ΣPhase ∝ N^α）。**不是理论值，是量出来的**：
+    ///   `正式基准_规模扫描_热点定位` 实测 FinalTask 5,634→11,124（×1.974）时 ΣPhase 9,643→46,300 ms（×4.80）
+    ///   ⇒ α = log(4.80)/log(1.974) ≈ 2.31。
+    /// ⚠ 只用于**外推提示**（把「10 万 Task」红线按实测斜率折算），**不得**用于任何业务判定。
+    ///   跨轮噪声约 ±10%，该指数是**量级指示**而非精确常数；要更准需在 20k/40k 档补点重标。
+    /// </summary>
+    private const double MeasuredGrowthExponent = 2.31;
+
     public SolverBenchmark(ITestOutputHelper output)
     {
         _output = output;
@@ -185,6 +194,41 @@ public class SolverBenchmark
     }
 
     /// <summary>
+    /// **Phase4 传播路径专项规模扫描**（2026-10-19 新增）。
+    ///
+    /// 存在理由：旧「规模扫描」`RunScope` 恒 null ⇒ `PhaseFourLocalRepair.Repair` 走
+    /// `RepairUnscheduledDemands` 分支（`PhaseFourLocalRepair.cs:50-58`）⇒ **`RepairWithPropagation`
+    /// 从未被压测覆盖**。而该分支在**生产 FULL 跑批**同样会进：只要
+    /// `RunScope.ChangedResourceIds`（资源停机/加班/维修）或 `TaskTargetOverrides` 非空即可。
+    ///
+    /// 本用例注入 `ChangedResourceIds = 1..5`（占 200 资源的 2.5% ⇒ 影响集远低于 §13.4 的 30% 警戒线
+    /// ⇒ 不进 Fallback，**真正跑传播内层循环**），观察 `Phase4Ms` / `Phase4传播Task` / `Phase4Propagation`
+    /// 热点随 N 的增长是否超线性。
+    /// </summary>
+    [BenchmarkFact]
+    public async Task 正式基准_Phase4传播_变化种子扫描()
+    {
+        var targets = (Environment.GetEnvironmentVariable("LPS_BENCH_P4_TARGETS") ?? "2000,5000,10000")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(int.Parse)
+            .ToArray();
+
+        int fixedResources = EnvInt("LPS_BENCH_SCAN_RESOURCES", 200);
+
+        foreach (int target in targets)
+        {
+            var request = BuildRealisticScenario(
+                finalTaskTarget: target,
+                resources: fixedResources,
+                seed: 20261008,
+                maxBatchQty: EnvInt("LPS_BENCH_MAX_BATCH_QTY", 2),
+                runScope: new RunScope { ChangedResourceIds = new[] { 1, 2, 3, 4, 5 } });
+
+            await RunProfile($"Phase4传播 FinalTask≈{target:N0} (changedRes=1..5)", request);
+        }
+    }
+
+    /// <summary>
     /// **简化趋势基准**（保留作纯算法趋势对照；**禁止**用于 15 分钟验收，§十一 明文）。
     /// </summary>
     [BenchmarkFact]
@@ -206,6 +250,8 @@ public class SolverBenchmark
         var totalSw = Stopwatch.StartNew();
         long allocBefore = GC.GetTotalAllocatedBytes(precise: false);
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
+        // 2026-10-19：GC **暂停总时长**基线（.NET 7+ 的 GC.GetTotalPauseDuration）。
+        TimeSpan gcPauseBefore = GC.GetTotalPauseDuration();
         DomainSolveResult result;
         SolverDiagnostics.Counters counters;
         // 计数作用域必须在 SolveAsync **之前**建立（ExecutionContext 在 async 入口捕获引用）。
@@ -217,6 +263,7 @@ public class SolverBenchmark
         totalSw.Stop();
         long allocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
+        TimeSpan gcPause = GC.GetTotalPauseDuration() - gcPauseBefore;
 
         long phaseSum = counters.Phase1Ms + counters.Phase2Ms + counters.Phase3Ms
                       + counters.Phase4Ms + counters.Phase5Ms;
@@ -241,6 +288,27 @@ public class SolverBenchmark
                         + $"  CloneShares={counters.CloneShares:N0}");
         _output.WriteLine($"        SlotSearch={counters.SlotSearches:N0}"
                         + $"  Phase4传播Task={counters.Phase4PropagatedTasks:N0}");
+        // 2026-10-19 性能定位：摘除段的「形状」—— 每次调用摘几个 Task（Σk/次数）、列表多长（Σn/次数）。
+        long detachCalls = counters.HotspotCallCount(SolverDiagnostics.Hotspot.MergeBatchDetach);
+        _output.WriteLine($"        摘除段形状: Σk={counters.DetachTaskCount:N0}"
+                        + $"  Σn={counters.DetachListLen:N0}"
+                        + $"  MergeBatchDetach次数={detachCalls:N0}"
+                        + $"  平均k={(detachCalls > 0 ? (double)counters.DetachTaskCount / detachCalls : 0):F1}"
+                        + $"  平均n={(detachCalls > 0 ? (double)counters.DetachListLen / detachCalls : 0):N0}");
+        // 2026-10-19 二次定位：**预建下标表命中率** —— 回落全表扫描的次数 / 总次数。
+        //   命中率低 ⇒ 「O(|锚批|) 定位」优化没吃到，`DetachIndexBuild` 的高读数其实是 O(n) 扫描。
+        _output.WriteLine($"        摘除定位: 回落全表扫描={counters.DetachFallbackCount:N0} 次"
+                        + $"  / 总={detachCalls:N0} 次"
+                        + $"  ⇒ 命中率={(detachCalls > 0 ? (1.0 - (double)counters.DetachFallbackCount / detachCalls) * 100.0 : 0):F1}%");
+        _output.WriteLine($"        回落原因: 无下标表={counters.DetachFallbackNoIndex:N0}"
+                        + $"  id为null={counters.DetachFallbackNullId:N0}"
+                        + $"  查不到/不符={counters.DetachFallbackMissing:N0}"
+                        + $"  下标重复={counters.DetachFallbackDupPos:N0}");
+        _output.WriteLine($"        下标表: 建表次数={counters.TaskIndexBuilds:N0}"
+                        + $"  其中返回null={counters.TaskIndexNullResults:N0}"
+                        + $"  RunBatchPlan总次数={counters.RunBatchPlanInvocations:N0}"
+                        + $"  (计热点={counters.HotspotCallCount(SolverDiagnostics.Hotspot.BatchPlanTrial):N0})");
+        _output.WriteLine($"        Stage合批入口: 无索引进入={counters.MergeStageEnteredWithNullIndex:N0} 次");
         // V1_3 F-04：本 Run **实际生效**的技术预算快照（版本 / 取源 / 生效值）—— 逐 Run 可复现的证据。
         _output.WriteLine($"  技术预算快照: version={counters.SolverBatchBudgetVersion ?? "(未登记)"}"
                         + $"  source={counters.SolverBatchBudgetSource ?? "(未登记)"}"
@@ -251,28 +319,59 @@ public class SolverBenchmark
                         + $"  F-01回滚未命中={counters.OccupancyRollbackUnmatched:N0}");
 
         // ── **热点耗时排行**（谁最慢；含嵌套，故各项之和 > ΣPhase）──
-        var hotspots = new (string Name, double Ms)[]
+        var hotspots = new (string Name, int Slot)[]
         {
-            ("TimelineClone", counters.HotspotMs(SolverDiagnostics.Hotspot.TimelineClone)),
-            ("CloneOccupancy", counters.HotspotMs(SolverDiagnostics.Hotspot.CloneOccupancy)),
-            ("CloneTaskList", counters.HotspotMs(SolverDiagnostics.Hotspot.CloneTaskList)),
-            ("CloneShares", counters.HotspotMs(SolverDiagnostics.Hotspot.CloneShares)),
-            ("SlotSearch", counters.HotspotMs(SolverDiagnostics.Hotspot.SlotSearch)),
-            ("BatchPlanTrial(含嵌套)", counters.HotspotMs(SolverDiagnostics.Hotspot.BatchPlanTrial)),
-            ("DemandSchedule(含嵌套)", counters.HotspotMs(SolverDiagnostics.Hotspot.DemandSchedule)),
-            ("Phase4Propagation", counters.HotspotMs(SolverDiagnostics.Hotspot.Phase4Propagation)),
+            ("TimelineClone", SolverDiagnostics.Hotspot.TimelineClone),
+            ("CloneOccupancy", SolverDiagnostics.Hotspot.CloneOccupancy),
+            ("CloneTaskList", SolverDiagnostics.Hotspot.CloneTaskList),
+            ("CloneShares", SolverDiagnostics.Hotspot.CloneShares),
+            ("SlotSearch", SolverDiagnostics.Hotspot.SlotSearch),
+            ("BatchPlanTrial(含嵌套)", SolverDiagnostics.Hotspot.BatchPlanTrial),
+            ("DemandSchedule(含嵌套)", SolverDiagnostics.Hotspot.DemandSchedule),
+            ("Phase4Propagation", SolverDiagnostics.Hotspot.Phase4Propagation),
+            ("BatchGroupIndex", SolverDiagnostics.Hotspot.BatchGroupIndex),
+            ("ScheduleDemandOps", SolverDiagnostics.Hotspot.ScheduleDemandOps),
+            ("TryMergeStageBatch", SolverDiagnostics.Hotspot.TryMergeStageBatch),
+            ("MergeBatchDetach", SolverDiagnostics.Hotspot.MergeBatchDetach),
+            ("  └DetachIndexBuild", SolverDiagnostics.Hotspot.DetachIndexBuild),
+            ("    └DetachRemoveAt", SolverDiagnostics.Hotspot.DetachRemoveAt),
+            ("  └DetachTail", SolverDiagnostics.Hotspot.DetachTail),
         };
-        foreach (var (name, ms) in hotspots.OrderByDescending(h => h.Ms))
+        foreach (var (name, slot, _) in hotspots.Select(h => (h.Name, h.Slot, Ms: counters.HotspotMs(h.Slot)))
+                                                .OrderByDescending(h => h.Ms))
         {
-            double pct = phaseSum > 0 ? ms / phaseSum * 100.0 : 0;
-            _output.WriteLine($"        [{name,-24}] {ms,12:N0} ms  ({pct,5:F1}% of ΣPhase)");
+            double pct = phaseSum > 0 ? counters.HotspotMs(slot) / phaseSum * 100.0 : 0;
+            long calls = counters.HotspotCallCount(slot);
+            double perCallUs = calls > 0 ? counters.HotspotMs(slot) * 1000.0 / calls : 0;
+            _output.WriteLine($"        [{name,-24}] {counters.HotspotMs(slot),12:N0} ms  ({pct,5:F1}% of ΣPhase)"
+                            + $"  次数={calls,10:N0}  每次={perCallUs,9:F2} µs");
         }
         _output.WriteLine($"  业务签名: {BusinessSignature(result)}");
         _output.WriteLine($"  内存/GC: 分配={allocatedBytes / 1024.0 / 1024.0:N1} MB"
                         + $"  Gen0={gc0:N0}  Gen1={gc1:N0}  Gen2={gc2:N0}"
                         + $"  分配/单条={(result.FinalTasks.Count == 0 ? 0 : (double)allocatedBytes / result.FinalTasks.Count / 1024.0):N1} KB");
-        _output.WriteLine($"  15分钟红线(900000ms): {(totalSw.ElapsedMilliseconds <= 900_000 ? "✅ 达标" : "❌ 超时")}"
-                        + $"   单条成本={(result.FinalTasks.Count == 0 ? 0 : (double)totalSw.ElapsedMilliseconds / result.FinalTasks.Count):F2} ms/Task");
+        // 2026-10-19：**GC 暂停总时长** —— 判断「分配量大 ≠ GC 慢」的关键量。
+        //   Gen0 回收只扫**存活**对象 ⇒ 大量朝生夕死的垃圾可能很便宜；不看这一项就会误把分配量当耗时。
+        _output.WriteLine($"  GC暂停总时长: {gcPause.TotalMilliseconds:N0} ms"
+                        + $"  （占 ΣPhase 的 {(phaseSum > 0 ? gcPause.TotalMilliseconds / phaseSum * 100.0 : 0):F1}%）");
+        // ── 2026-10-19 **更正**：本行原先直接比较「本次墙钟 ≤ 900,000 ms ⇒ ✅ 达标」，这是**假安心** ——
+        //   8k 档只需 46 s，恒判「达标」，与「10 万 Task」毫无关系。
+        //   冻结红线（PM 冻结文档 `20261016/03_...业务说明_v2.0.md:221`）是：
+        //     「**约 10 万 Task** / 夜间 FULL / **约 15 分钟**收敛」⇒ 判据必须在**10 万 Task 规模**上取。
+        //   ⚠ 实测增长为**超线性**：FinalTask 5,634→11,124（×1.974）时 ΣPhase 9,643→46,300 ms（×4.80）
+        //     ⇒ 拟合指数 = log(4.80)/log(1.974) ≈ **2.31**（`正式基准_规模扫描_热点定位` 实测，非理论值）。
+        //   ⇒ **线性外推（单条成本 × 任务数）不成立**，会把 2 小时说成 7 分钟。本行**两种外推并列**，
+        //     并标明哪一种是实测标定的 —— 免得又被拿去当「达标」结论。
+        double n = result.FinalTasks.Count;
+        double perTaskMs = n == 0 ? 0 : (double)totalSw.ElapsedMilliseconds / n;
+        double linearTo100k = perTaskMs * 100_000;
+        double superlinearTo100k = n > 0 ? totalSw.ElapsedMilliseconds * Math.Pow(100_000.0 / n, MeasuredGrowthExponent) : 0;
+        _output.WriteLine($"  本档墙钟: {totalSw.ElapsedMilliseconds:N0} ms"
+                        + $"   单条成本={perTaskMs:F2} ms/Task");
+        _output.WriteLine($"  ⚠ 10万Task外推（**不是**本档实测，本档 N={n:N0}）:"
+                        + $"  线性={linearTo100k / 900_000:F1}× 红线"
+                        + $"   按实测 N^{MeasuredGrowthExponent:F2}={superlinearTo100k / 900_000:F1}× 红线"
+                        + "   ⇒ 线性外推**不成立**，以实测指数为准");
         _output.WriteLine("");
 
         Assert.True(result.Success, result.ErrorMessage);
@@ -507,6 +606,9 @@ public class SolverBenchmark
     /// <param name="preferredRatio">带 `PreferredResourceCode` 软偏好的需求占比（仅 C 桶）。</param>
     /// <param name="materialPool">物料池大小（同产品重复度 = Setup 序列优化增益来源）。</param>
     /// <param name="ruleDensity">Setup EXACT 规则密度。</param>
+    /// <param name="runScope">可选 Run 级局部重排范围投影。**非 null 且 `ChangedResourceIds` 非空 ⇒
+    ///   `PhaseFourLocalRepair.Repair` 走 `RepairWithPropagation` 分支**（`PhaseFourLocalRepair.cs:50`）；
+    ///   旧规模扫描恒传 null ⇒ 走 `RepairUnscheduledDemands` ⇒ **传播路径从未被压测覆盖**。</param>
     public static DomainSolveRequest BuildRealisticScenario(
         int finalTaskTarget,
         int resources,
@@ -515,7 +617,8 @@ public class SolverBenchmark
         double continuationRatio = 0.30,
         double preferredRatio = 0.20,
         int materialPool = 500,
-        double ruleDensity = 0.01)
+        double ruleDensity = 0.01,
+        RunScope? runScope = null)
     {
         var rng = new DeterministicRandom(seed);
         var planningStart = new DateTime(2026, 10, 1);
@@ -679,6 +782,7 @@ public class SolverBenchmark
             OperationResourceEligibility = els,
             MaterialStageDepartmentContexts = deptContexts,
             ExecutionConstraints = Array.Empty<ExecutionConstraint>(),
+            RunScope = runScope,
             Resources = resourceDefs,
             CalendarSlots = calendarSlots,
             StrategySnapshot = new SolverStrategySnapshot

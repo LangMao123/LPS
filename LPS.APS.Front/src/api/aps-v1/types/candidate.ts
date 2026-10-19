@@ -1,229 +1,139 @@
 /**
- * Candidate 对比与确认 DTO（占位）
+ * Candidate 列表 / 对比 / 确认 DTO —— 2026-10-16 按后端**已部署** DTO 逐字段重写
  *
- * @see 4号位文档第 9 节（页面 5：Candidate 对比与确认）
- * 后端未实现，等 3 号位落地后对齐。
- *
- * 验收场景参考：
- *  - U10（Candidate 影响既有订单，Base/Candidate 差异正确）
- *  - U11（CTP Purpose 无激活按钮）
- *  - U12（INSERT_IMPACT_ANALYSIS 无激活按钮）
- *  - U13（Candidate 采用，Actor/Time 可追溯）
- *  - U14（外 Domain 共享设备阻挡，页面显示阻挡原因）
- *
- * v1.2 Domain专项扩展（§10/§11/§13/§15）：
- *  - SharedResourceOccupancyDto  共享 Resource 占用明细
- *  - QuantityTimeSliceDto         跨域 Quantity-Time 切片（必须保留分段）
- *  - CandidateReasonCode          根因 reasonCode 字面量联合
+ * 本文件此前的类型是 4号位 依据 §十二「17 字段」自拟的富对比契约，后端从未实现；
+ * 页面据此渲染的订单级差异表、根因列表、共享资源占用、数量-时间切片四块均无端点供给，
+ * 属假数据，已整体下线。以下字段全部可在 dev Swagger 与 lps/ 源文件中核对：
+ *  - GET  /api/overview/candidate-summary → OverviewCandidateSummaryDto
+ *      源：lps/LPS.APS.Core/Dto/OverviewDtos.cs:100-153
+ *      列表**刻意不含** diff 统计（DTO 注释明写「不在列表项内承载 diff/平均完成时间等统计字段」），
+ *      所以页面列表不再显示「影响订单/新增延期」，那两项只在对比详情里出现。
+ *  - GET  /api/governance/plan-version/{cid}/compare-with/{bid} → CandidateComparisonDto
+ *      源：lps/LPS.APS.Application/Services/Query/Dto/CandidateComparisonDto.cs
+ *  - POST .../confirm-candidate、POST .../activate-candidate
+ *      源：lps/LPS.APS.Web/Controllers/GovernanceController.cs:544-588
+ *      两个写端点都返回 `ApiResponse.Ok(提示语)`，**data 恒为 null**，没有 actor/时间等回执字段。
  */
 
-import type { DomainKey, FactType, IsoDateTime, PlanVersionStatus } from './common'
-import type { ScheduleRunDto } from './run'
+import type { IsoDateTime } from './common'
 
-/**
- * 共享 Resource 占用（v1.2 §10/§13）
- *  - 其它 Domain 当前 ACTIVE 在共享 Resource 上的占用
- *  - 作为不可移动 `ExternalDomainResourceBlocks` 传给 1 号位
- *  - Candidate 不得跨域借资源；只能识别并提示
- */
-export interface SharedResourceOccupancyDto {
-  /** 共享资源 ID（如 MC01、测试台） */
-  resourceRefId: number
-  /** 资源代码（可选；UI 显示用） */
-  resourceCode?: string
-  /** 占用方 Domain */
-  domainKey: DomainKey
-  /** 占用时间窗起点（ISO8601） */
-  occupiedFrom: IsoDateTime
-  /** 占用时间窗终点（ISO8601） */
-  occupiedTo: IsoDateTime
-  /** 占用来源 PlanVersion（后续 Domain 不得修改） */
-  sourcePlanVersionId: number
-}
+/* ===== 列表：GET /api/overview/candidate-summary ===== */
 
-/**
- * Quantity-Time 切片（v1.2 §11）
- *  - 跨域依赖必须传递真实的 Material + Quantity + AvailableTime
- *  - **必须保留分段**（"40件@15日 / 60件@17日"），禁止压平为 100件
- *  - 通过内存上下文/DTO 传递；不建 VirtualInventoryBalance 持久化表
- */
-export interface QuantityTimeSliceDto {
-  materialCode: string
-  /** 该切片数量（必须分多片保留，禁止合并） */
-  quantity: number
-  /** 该切片可用时间（ISO8601） */
-  availableTime: IsoDateTime
-  /** 来自哪个 Domain */
-  sourceDomainKey: DomainKey
-}
-
-/**
- * Candidate 根因 reasonCode 字面量联合（v1.2 新增 SHARED_RESOURCE_/EXTERNAL_DOMAIN_/QUANTITY_TIME_SLICE）
- *  - 旧 reasonCode 是 string 类型；收紧为联合以编译期约束 mock 与 UI 渲染
- */
-export type CandidateReasonCode =
-  | 'CAPACITY_REALLOCATE'
-  | 'CROSS_DOMAIN_BLOCK'
-  | 'CTP_WHATIF'
-  | 'INSERT_IMPACT_WHATIF'
-  | 'SHARED_RESOURCE_OCCUPANCY'
-  | 'EXTERNAL_DOMAIN_BLOCK'
-  | 'QUANTITY_TIME_SLICE'
-
-/** Candidate 头部（基础信息）
- * 审核报告 P0-05（WHATIF Candidate 语义）：
- *  - canActivate 区分"可激活"与"纯试算WHATIF"
- *  - runType + purpose 由 3 号位后端返回，前端只展示和禁用按钮
- *  - sourceRefType 保留兼容老接口（'CTP'/'MANUAL_RESCHEDULE'），新数据请用 canActivate
- */
-
-/** UI 层用：候选来源类型中文映射（未知值原样展示） */
-export const CANDIDATE_SOURCE_REF_TYPE_LABELS: Record<string, string> = {
-  CTP: '可靠交期判断',
-  MANUAL_RESCHEDULE: '手工重排',
-  INSERT_ORDER_WHATIF: '插单试算'
-}
-
-/** UI 层用：候选业务用途中文映射（未知值原样展示） */
-export const CANDIDATE_PURPOSE_LABELS: Record<string, string> = {
-  CTP: '可靠交期判断',
-  INSERT_IMPACT_ANALYSIS: '插单影响分析'
-}
-export interface CandidateHeader {
-  candidatePlanVersionId: number
-  candidateVersionCode: string
-  basePlanVersionId: number
-  baseVersionCode: string
-  domainKey: DomainKey
-  status: PlanVersionStatus
+/** Candidate 简要信息（5号位 Overview 列表项） */
+export interface CandidateBriefDto {
+  planVersionId: number
+  versionCode: string | null
+  domainKey: string | null
   createdAt: IsoDateTime
-  /** 关联的 CTP / Manual 调度输入 ID */
-  sourceRefId?: number
-  sourceRefType?: 'CTP' | 'MANUAL_RESCHEDULE' | 'INSERT_ORDER_WHATIF'
-  /** P0-05：是否允许激活为 ACTIVE（后端依据 RunType+Purpose+规则判定）
-   *  - LOCAL_RESCHEDULE / MANUAL_RESCHEDULE → true
-   *  - INSERT_ORDER_WHATIF（CTP/INSERT_IMPACT_ANALYSIS 产生） → false（仅试算）
-   */
+  createdByUserName: string | null
+  /** PlanVersion.Status（CANDIDATE / ACTIVE / …） */
+  status: string | null
+  /** 候选来源 ScheduleRunId */
+  sourceScheduleRunId: number | null
+  /** 候选来源 RunType（FULL_SCHEDULE / LOCAL_RESCHEDULE / MANUAL_RESCHEDULE / INSERT_ORDER_WHATIF） */
+  runType: string | null
+  /** 候选冻结的 Base 计划版本；compare-with 端点的第二个路径参数 */
+  basePlanVersionId: number | null
+  /** Base 是否仍为该 Domain 当前 ACTIVE（后端 §12.3 激活红线前置校验结果） */
   canActivate: boolean
-  /** P0-05：触发本次候选的 Run Type（与 ScheduleRun.runType 同源） */
-  runType?: ScheduleRunDto['runType']
-  /** P0-05：业务用途（仅 INSERT_ORDER_WHATIF 时填充） */
-  purpose?: 'CTP' | 'INSERT_IMPACT_ANALYSIS'
-  /** v1.2 §13：受外部 Domain 阻挡次数（≥1 说明跨域共享资源传递） */
-  externalDomainBlocksCount?: number
-  /** v1.2 §11：上游 Domain 传入的 Quantity-Time 切片（必须保留分段，禁止压平） */
-  quantityTimeSlices?: QuantityTimeSliceDto[]
 }
 
-/** 新订单完成情况对比 */
-export interface CandidateNewOrderDiff {
-  orderId: number
-  orderNo: string
-  requestedDueDate: IsoDateTime
-  baseCompletion?: IsoDateTime
-  candidateCompletion: IsoDateTime
-  /** 是否按期（基于 candidateCompletion） */
-  onTime: boolean
-  /** 是否 Estimated */
-  isEstimated: boolean
+/** Candidate 待处理摘要 */
+export interface OverviewCandidateSummaryDto {
+  pendingCount: number
+  candidates: CandidateBriefDto[] | null
 }
 
-/** 既有订单影响 */
-export interface CandidateImpactedOrder {
-  orderId: number
-  orderNo: string
-  baseCompletion: IsoDateTime
-  candidateCompletion: IsoDateTime
-  /** 差值（小时） */
-  deltaHours: number
-  /** 是否从 On-time 变 Delayed */
-  becomesDelayed: boolean
-  /** Protection 冲突 */
-  hasProtectionConflict: boolean
-  /** v1.2 §13：受影响订单若被共享资源阻挡，引用 SharedResourceOccupancy.resourceRefId */
-  blockedBySharedResourceRefId?: number
-}
+/* ===== 对比：GET /api/governance/plan-version/{cid}/compare-with/{bid} ===== */
 
-/** Task 变化摘要（不要求 V1 复杂 Diff Graph） */
-export interface CandidateTaskChangeSummary {
-  /** 新增 Task 数 */
+export interface TaskChangeSummaryDto {
+  /** 候选有、基础无的 Task 数 */
   added: number
-  /** 删除 Task 数 */
+  /** 基础有、候选无的 Task 数 */
   removed: number
-  /** 时间移动的 Task 数 */
+  /** 计划起止时间变化的 Task 数（与 resourceChanged 可重叠） */
   timeShifted: number
-  /** Resource 变更的 Task 数 */
+  /** 资源变化的 Task 数（与 timeShifted 可重叠） */
   resourceChanged: number
-  /** U14：外 Domain 共享设备阻挡的 Task 数 */
+  /** 跨域阻挡 Task 数 —— 后端当前保守返 0（任务级跨域判定未落盘，待 2号位） */
   crossDomainBlocked: number
-  /** v1.2 §10/§13：共享 Resource 占用列表（其它 Domain ACTIVE 在共享 Resource 上的占用）
-   *  - 默认空数组（向后兼容 v1.0/v1.1）
-   */
-  sharedResourceOccupancies?: SharedResourceOccupancyDto[]
 }
 
-/** 影响摘要（用于最小人工确认 Modal） */
-export interface CandidateImpactSummary {
+export interface ImpactSummaryDto {
+  /** 发生新增/移除/时间平移/资源变更的去重订单数 */
   impactedOrderCount: number
+  /** 候选延期且基础同主键任务未延期的 Task 数 */
   newDelayCount: number
-  estimatedOnlyCount: number
-  crossDomainImpacted: boolean
-  /** v1.2 §10：共享资源占用总数（≥1 说明跨域共享资源传递）— 默认 0 */
-  sharedResourceOccupancyCount?: number
-  /** v1.2 §11：Quantity-Time 切片总数（≥1 说明跨域 Quantity-Time 传递）— 默认 0 */
-  quantityTimeSliceCount?: number
+  /** 跨域影响数 —— 后端当前保守返 0（同 crossDomainBlocked） */
+  crossDomainImpacted: number
+  /** 订单级估算数 —— 归 2号位 边界，后端返 null 时前端显示 '-'，不按 0 处理 */
+  estimatedOnlyCount: number | null
 }
 
-/** Candidate 确认输入（前端只展示按钮 + 上送用户输入，不直接改 PlanVersion） */
+/** 计划版本概要（对比双方各一份） */
+export interface PlanVersionBriefDto {
+  planVersionId: number
+  versionCode: string
+  /** CANDIDATE / ACTIVE / …（PlanVersion.VersionCategory） */
+  versionCategory: string
+  status: string
+  computedAt: IsoDateTime | null
+}
+
+/** 后端 compare-with 原样返回体 */
+export interface CandidateComparisonDto {
+  taskChangeSummary: TaskChangeSummaryDto
+  impactSummary: ImpactSummaryDto
+  baseSummary: PlanVersionBriefDto
+  candidateSummary: PlanVersionBriefDto
+}
+
+/**
+ * 页面视图模型 = 列表项（CandidateBriefDto）+ 对比结果 合并
+ *  - header 的 domainKey / createdAt / runType / canActivate 只有列表端点给；
+ *    对比端点只给双方版本概要，故必须由 store 合并，不能各自单读。
+ */
+export interface CandidateComparisonView {
+  header: {
+    candidatePlanVersionId: number
+    candidateVersionCode: string
+    basePlanVersionId: number | null
+    baseVersionCode: string
+    domainKey: string | null
+    status: string
+    createdAt: IsoDateTime
+    createdByUserName: string | null
+    sourceScheduleRunId: number | null
+    runType: string | null
+    /** 后端判定的可激活性，页面不自行推断 */
+    canActivate: boolean
+    /** 候选版本计算完成时间 */
+    computedAt: IsoDateTime | null
+  }
+  taskChangeSummary: TaskChangeSummaryDto
+  impactSummary: ImpactSummaryDto
+}
+
+/* ===== 写端点回执 ===== */
+
+/** confirm-candidate / activate-candidate 的入参（后端只取 path 上的 planVersionId） */
 export interface CandidateConfirmInput {
   candidatePlanVersionId: number
-  basePlanVersionId: number
-  /** 当前操作者（来自 JWT） */
-  actor: string
-  /** 用户备注 */
+  /** 确认备注；后端 ConfirmCandidateRequest 仅此一个字段 */
   remark?: string
 }
 
-/** Candidate 确认结果 */
-export interface CandidateConfirmResult {
-  candidatePlanVersionId: number
-  basePlanVersionId: number
-  actor: string
-  confirmedAt: IsoDateTime
-  remark?: string
-}
-
-/** Candidate 激活输入（v1.2 §十三 P0-08）
- *  - CANDIDATE → ACTIVE：每域单一正式采用版本
- *  - 后端 ActivateCandidateRequest 是空 body（仅 path 上的 planVersionId）
- *  - 前端 DTO 留空壳以匹配 future 扩展（如激活原因 / 关联 RunId）
- */
 export interface CandidateActivateInput {
   candidatePlanVersionId: number
 }
 
-/** Candidate 激活结果（v1.2 §十三 P0-08）*/
-export interface CandidateActivateResult {
-  candidatePlanVersionId: number
-  /** 激活人（来自 JWT）*/
-  activatedBy: string
-  /** 激活时间（ISO8601）*/
-  activatedAt: IsoDateTime
-  /** 该 Candidate 转 ACTIVE 后覆盖的旧 ACTIVE PlanVersionId（若有）*/
-  replacedActivePlanVersionId?: number
-}
-
-/** CandidateComparisonDto — Candidate 对比（页面 5） */
-export interface CandidateComparisonDto {
-  header: CandidateHeader
-  newOrderDiffs: CandidateNewOrderDiff[]
-  impactedOrders: CandidateImpactedOrder[]
-  taskChangeSummary: CandidateTaskChangeSummary
-  impactSummary: CandidateImpactSummary
-  /** 4号位文档第 11 节：根因提示 */
-  reasons: Array<{
-    reasonCode: CandidateReasonCode
-    description: string
-    factType: FactType
-  }>
+/**
+ * 写端点回执：后端返回 `ApiResponse.Ok("候选版本 N 已确认（待激活）")`，
+ * data 恒为 null —— 能拿到的真实信息只有 message 与服务端 timestamp，
+ * 拿不到 actor / activatedAt / replacedActivePlanVersionId，页面不得补。
+ */
+export interface CandidateActionAck {
+  message: string
+  /** ApiResponse.Timestamp（服务端时间，用于确认动作留痕） */
+  serverTime: IsoDateTime | null
 }

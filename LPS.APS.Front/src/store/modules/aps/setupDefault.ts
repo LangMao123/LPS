@@ -1,5 +1,5 @@
 /**
- * APS V1 4号位 — Setup DEFAULT 规则 Pinia store（v1.5 Setup 专项 §4）
+ * APS V1 4号位 — 默认换型（DEFAULT）规则 Pinia store（Setup 专项指导 v1.2 §四）
  *
  * 状态：
  *  - rules：DEFAULT 规则列表（当前 RuleSetVersion 下）
@@ -12,12 +12,12 @@
  *  - aps.setup.edit     → 编辑（创建 / 更新 / 删除 DEFAULT 规则）
  *  - aps.setup.publish  → 发布（POST /rule-set-versions/{id}/publish）
  *
- * 红线（§7.1 + §7.2）：
- *  - 仅 DRAFT 状态的 RuleSetVersion 可编辑（PUBLISHED/ACTIVE 不可改）
+ * 红线：
+ *  - 仅 DRAFT 状态的 RuleSetVersion 可编辑（其余治理状态不可改）
  *  - SetupMinutes > 0
  *  - FromMaterialCode/ToMaterialCode 都必须为空（与 EXACT 互斥）
  *
- * 与 EXACT 的区别（§4.2）：
+ * 与 EXACT 的区别：
  *  - DEFAULT 5 元组：Department/Stage/Operation/Resource + RuleSetVersionId
  *  - EXACT 7 元组：+ FromMaterial/ToMaterial
  *  - DEFAULT 不需要共同合法设备推荐（无前后产品）
@@ -108,7 +108,7 @@ export const useSetupDefaultStore = defineStore('aps.setupDefault', () => {
       return null
     }
     if (!canEdit.value) {
-      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion（§7.2 业务红线）'
+      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion'
       return null
     }
     actionRunning.value = true
@@ -134,7 +134,7 @@ export const useSetupDefaultStore = defineStore('aps.setupDefault', () => {
       return false
     }
     if (!canEdit.value) {
-      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion（§7.2 业务红线）'
+      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion'
       return false
     }
     actionRunning.value = true
@@ -160,7 +160,7 @@ export const useSetupDefaultStore = defineStore('aps.setupDefault', () => {
       return false
     }
     if (!canEdit.value) {
-      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion（§7.2 业务红线）'
+      error.value = '只能编辑 DRAFT 状态的 RuleSetVersion'
       return false
     }
     actionRunning.value = true

@@ -48,6 +48,17 @@ export interface OrderQuery {
   pageSize: number
 }
 
+/** 订单列表分页响应（10-12 收：与后端 PageResult<Page> 字段对齐，模块级本地包装）
+ *  - 字段名用 `page`（不是 pageIndex），与 TaskSplitRuleConfig / ManualETA / business-fact-issues 同款
+ *  - 替代此前通用 PageResult<T>（types/common.ts:62-67 已删）
+ */
+export interface OrderListPageResult<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 /** 订单基本信息（详情第一块） */
 export interface OrderBasicInfo {
   orderId: number

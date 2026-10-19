@@ -5,8 +5,8 @@ namespace LPS.APS.Application.Services;
 
 /// <summary>
 /// 执行批拆分规则（Batch Policy）治理服务接口（0号位 2026-10-07 裁决：本轮落码，归 3号位 治理）。
-/// 载体「两级承接」：主题表 CRUD + 发布时投影进 FrozenStrategySnapshot.BatchPolicy（第⑧块）。
-/// 主题表 TaskSplitRuleConfig 为直接生效物理表（非版本化 JSON），靠 IsActive + EffectiveFrom/EffectiveTo 控生效。
+/// 载体：主题表 TaskSplitRuleConfig 为直接生效物理表（非版本化 JSON），靠 IsActive + EffectiveFrom/EffectiveTo 控生效。
+/// 发布侧已退出旧⑧块注入（0号位 2026-10-15 终裁；2026-10-17 清理死链）；装载改由 2号位 按 <c>TaskSplitRuleConfig</c> 表直读（同批受控切换，本接口不再提供快照投影方法）。
 /// 红线 #5：本接口为新建治理契约，不改动既有冻结签名。
 /// </summary>
 public interface ITaskSplitRuleConfigGovernanceService
@@ -52,11 +52,4 @@ public interface ITaskSplitRuleConfigGovernanceService
         int actorUserId,
         string actorUserCode,
         CancellationToken ct = default);
-
-    /// <summary>
-    /// 取 active + 生效区间内规则并投影为第⑧块快照（BatchPolicyRuleSnapshot）。
-    /// 供 GovernanceVersionService 发布参数集版本时注入 ContentSnapshotJson.BatchPolicy 子块。
-    /// 去审计/兼容字段；缺规则 = 空列表（fail-closed 属消费侧，本方法不抛）。
-    /// </summary>
-    Task<IReadOnlyList<BatchPolicyRuleSnapshot>> GetActiveRulesForSnapshotAsync(CancellationToken ct = default);
 }

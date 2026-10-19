@@ -28,17 +28,20 @@ public class PeggingTraceService
         string? commitmentStatus = null,
         string? orderNo = null,
         string? supplyDocumentNo = null,
+        long? rootOrderId = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
-        if (take <= 0 || take > 500) take = 100;
+        // 越界不静默回落（同 PI/订单页 R3 修法）：非正→默认 100；超上限→夹 500。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAsync(
             planVersionId, materialCode, supplyType, commitmentStatus,
-            orderNo, supplyDocumentNo, skip, take, ct, allowedFactories);
+            orderNo, supplyDocumentNo, rootOrderId, skip, take, ct, allowedFactories);
     }
 
     /// <summary>

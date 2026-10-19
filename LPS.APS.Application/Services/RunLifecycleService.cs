@@ -25,20 +25,34 @@ public class RunLifecycleService : IRunLifecycleService
     private const string ScheduleRunFailedStatus = "FAILED";
     /// <summary>运行状态：RUNNING</summary>
     private const string ScheduleRunRunningStatus = "RUNNING";
-    /// <summary>计划版本状态：CANDIDATE</summary>
-    private const string PlanVersionCandidateStatus = "CANDIDATE";
-    private const string PlanVersionCreatedStatus = "Created";      // D7：候选壳初始状态（替代旧 BUILDING，2号位 执行词表）
-    private const string PlanVersionComputedStatus = "Computed";    // D7：候选执行完成终态（2号位 ExecuteDomainAsync 写）
-    /// <summary>计划版本状态：ACTIVE（每域单一正式采用版本）</summary>
+    // ══ PlanVersion 两个字段的取值常量（**2026-10-15 按冻结文档对齐词表**，详见台账 §T-1037）══
+    //   VersionCategory = **身份**（出生即定、终身不变）：DAILY_BASELINE / CANDIDATE / RECOVERY …
+    //   Status          = **进度/生命周期**（冻结 07 §4.2:3532）：BUILDING / CANDIDATE / ACTIVE / ARCHIVED / FAILED
+    //   ⚠️ 两者各有一个 "CANDIDATE"，**同值不同义**（前者=候选类计划，后者=算完待采用），故常量分开命名。
+    //   原 D7 词表 Created / Computed / ComputeFailed 已改名为 BUILDING / CANDIDATE / FAILED；
+    //   `Computing` 保留（冻结未细分，但它是发令枪的领取闸门，见 SchedulingOrchestrator.RunSchedulingAutoAsync）。
+    /// <summary>版本类别（VersionCategory）：CANDIDATE —— 候选类计划。**身份**，出生即定、终身不变。</summary>
+    private const string PlanVersionCategoryCandidate = "CANDIDATE";
+    /// <summary>计划版本状态（Status）：BUILDING —— 壳已建、待发令枪领取。</summary>
+    private const string PlanVersionBuildingStatus = "BUILDING";
+    /// <summary>计划版本状态（Status）：Computing —— 本域已被领取、正在计算（BUILDING 的子状态，冻结词表未细分）。</summary>
+    private const string PlanVersionComputingStatus = "Computing";
+    /// <summary>计划版本状态（Status）：CANDIDATE —— 计算成功、待人工确认采用（白天候选终态；夜间全量成功直接是 ACTIVE）。</summary>
+    private const string PlanVersionReadyStatus = "CANDIDATE";
+    /// <summary>计划版本状态：ACTIVE（每域单一正式采用版本）—— 正式采用记在 Status，与冻结 DDL 08:4057 唯一索引谓词同列</summary>
     private const string PlanVersionActiveStatus = "ACTIVE";
+    /// <summary>计划版本状态：ARCHIVED（被同域新版本顶替）</summary>
+    private const string PlanVersionArchivedStatus = "ARCHIVED";
     /// <summary>INSERT_ORDER_WHATIF RunType：仅组合 CTP / INSERT_IMPACT_ANALYSIS，永远不得激活（实施包十九）</summary>
     private const string InsertOrderWhatifRunType = "INSERT_ORDER_WHATIF";
     /// <summary>最小人工确认审计操作类型（P0-04 激活硬前置）</summary>
     private const string ConfirmCandidateOperation = "ConfirmCandidate";
-    /// <summary>计划版本状态：FAILED（G8 域级状态判定）</summary>
+    /// <summary>
+    /// 计划版本状态（Status）：FAILED（G8 域级状态判定）。
+    /// 与 <c>SchedulingOrchestrator</c> 的失败写点**同值** —— 2026-10-15 之前写点写 `ComputeFailed`、这里读 `FAILED`，
+    /// 导致失败域永远判不出来（落到 `_ => RUNNING`）；词表对齐后该 bug 自愈。
+    /// </summary>
     private const string PlanVersionFailedStatus = "FAILED";
-    /// <summary>计划版本状态：BUILDING（G8 域级状态判定）</summary>
-    // D7 废弃：候选壳初始 Status 改用 Created（PlanVersionCreatedStatus）；BUILDING 词表不再使用
     /// <summary>运行状态：COMPLETED（G8 终态判定）</summary>
     private const string ScheduleRunCompletedStatus = "COMPLETED";
     /// <summary>运行状态：PARTIAL_SUCCESS（G8 终态判定）</summary>
@@ -202,8 +216,8 @@ public class RunLifecycleService : IRunLifecycleService
             ActionCode = ConfirmCandidateOperation,
             EntityType = "PlanVersion",
             EntityId = planVersionId.ToString(),
-            OldValue = PlanVersionComputedStatus,
-            NewValue = PlanVersionComputedStatus,
+            OldValue = PlanVersionReadyStatus,
+            NewValue = PlanVersionReadyStatus,
             UserId = actorUserId,
             UserCode = actor,
             OccurredAt = DateTime.Now,
@@ -244,6 +258,9 @@ public class RunLifecycleService : IRunLifecycleService
         await EnsureSourceRunActivatableAsync(version, ct);
 
         var activatedAt = DateTime.Now;
+        // 口径回退（2026-10-15，B）：激活写的是 **Status** —— 冻结字段说明 07 §4.2「正式采用=ACTIVE」、
+        // 冻结 DDL 08:8723 逐字／08:4057 唯一索引谓词 `WHERE Status = 'ACTIVE'`、我方 2026-09-03 词表件 §一.2 四处同口径。
+        // VersionCategory 是**出生即定的版本类别**，激活**不得翻转它**（A 正是翻它，故作废）。
         version.Status = PlanVersionActiveStatus;
         version.ActivatedAt = activatedAt;
         version.ActivatedBy = actor;
@@ -261,7 +278,7 @@ public class RunLifecycleService : IRunLifecycleService
             ActionCode = "ActivateCandidate",
             EntityType = "PlanVersion",
             EntityId = planVersionId.ToString(),
-            OldValue = PlanVersionComputedStatus,
+            OldValue = PlanVersionReadyStatus,
             NewValue = PlanVersionActiveStatus,
             UserId = actorUserId,
             UserCode = actor,
@@ -304,21 +321,21 @@ public class RunLifecycleService : IRunLifecycleService
     }
 
     /// <summary>
-    /// 候选确认/激活前置校验（D7 词表：候选身份在 VersionCategory，Status 走 2号位 执行词表）。
-    /// 门禁：VersionCategory 必须 CANDIDATE，且 Status 必须排程完成（Computed）才可确认/激活；DomainKey 非空（V1 必填语义）。
+    /// 候选确认/激活前置校验（2026-10-15 词表对齐后：候选身份在 VersionCategory，Status 走冻结词表）。
+    /// 门禁：VersionCategory 必须 CANDIDATE，且 Status 必须为 CANDIDATE（算完待采用）才可确认/激活；DomainKey 非空（V1 必填语义）。
     /// </summary>
     private static void EnsureCandidateConfirmable(PlanVersion version)
     {
-        if (version.VersionCategory != PlanVersionCandidateStatus)
+        if (version.VersionCategory != PlanVersionCategoryCandidate)
         {
             throw new InvalidOperationException(
                 $"计划版本 {version.Id} 的 VersionCategory 为 {version.VersionCategory}，仅 CANDIDATE 可确认/激活");
         }
 
-        if (version.Status != PlanVersionComputedStatus)
+        if (version.Status != PlanVersionReadyStatus)
         {
             throw new InvalidOperationException(
-                $"计划版本 {version.Id} 状态为 {version.Status}（D7 执行词表），仅排程完成（Computed）可确认/激活");
+                $"计划版本 {version.Id} 状态为 {version.Status}，仅排程完成（Status=CANDIDATE，即算完待采用）可确认/激活");
         }
 
         if (string.IsNullOrWhiteSpace(version.DomainKey))
@@ -482,7 +499,7 @@ public class RunLifecycleService : IRunLifecycleService
             if (baseVersion.Status != PlanVersionActiveStatus)
             {
                 throw new InvalidOperationException(
-                    $"Base 计划版本 {baseVersion.Id} 状态为 {baseVersion.Status}，白天候选必须基于 ACTIVE（Base 只读）");
+                    $"Base 计划版本 {baseVersion.Id} 状态为 {baseVersion.Status}（需 Status=ACTIVE），白天候选必须基于 ACTIVE（Base 只读）");
             }
 
             if (!string.Equals(baseVersion.DomainKey, spec.DomainKey, StringComparison.Ordinal))
@@ -726,15 +743,23 @@ public class RunLifecycleService : IRunLifecycleService
             dto.ComputedAt = pv.ComputedAt;
             dto.ActivatedAt = pv.ActivatedAt;
 
-            // D7：候选身份在 VersionCategory（执行词表 Status 不写 CANDIDATE），域级候选待确认按 VersionCategory 判定
-            dto.Status = pv.VersionCategory == PlanVersionCandidateStatus
-                ? RunDomainCandidateStatus
-                : pv.Status switch
-                {
-                    PlanVersionActiveStatus => RunDomainCompletedStatus,
-                    PlanVersionFailedStatus => RunDomainFailedStatus,
-                    _ => RunDomainRunningStatus,
-                };
+            // 口径（2026-10-15，B + 词表对齐）：**只看 Status，不再拿 VersionCategory 兜底**。
+            //   · 原 bug：先判 VersionCategory=='CANDIDATE'，而每一行已采用的 VersionCategory 恒为 CANDIDATE
+            //     ⇒ 「ACTIVE ⇒ COMPLETED」分支永不可达，激活后域级视图永远显示「候选待确认」。
+            //   · 词表对齐后 Status 自己就能表达「算完待采用」（CANDIDATE），兜底不仅多余，
+            //     还会把夜间「算完但尚未采用」的 DAILY_BASELINE 误判成候选 —— 故整条删掉。
+            //   · 身份（VersionCategory）仍用于激活门禁 EnsureCandidateConfirmable，只是不再参与本判定。
+            dto.Status = pv.Status switch
+            {
+                // 已正式采用（ACTIVE）或被同域新版本顶替（ARCHIVED）：该域本次已完成并落定
+                PlanVersionActiveStatus or PlanVersionArchivedStatus => RunDomainCompletedStatus,
+                // 域级计算失败（与 SchedulingOrchestrator 的失败写点同值）
+                PlanVersionFailedStatus => RunDomainFailedStatus,
+                // 算完但尚未采用 ⇒ 待人工确认
+                PlanVersionReadyStatus => RunDomainCandidateStatus,
+                // 其余（BUILDING 待领 / Computing 在算）：仍在进行
+                _ => RunDomainRunningStatus,
+            };
 
             if (pv.Status == PlanVersionFailedStatus)
             {

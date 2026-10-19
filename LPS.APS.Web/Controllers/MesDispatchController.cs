@@ -9,10 +9,12 @@ using LPS.APS.Shared.Models;
 namespace LPS.APS.Web.Controllers;
 
 /// <summary>
-/// MES 受控操作下发接口（骨架）。
-/// 3号位 职责：挂权限码 + F-G4 业务范围（Factories）二次校验；核心下发能力归 2号位，接入前返回 501。
+/// MES 受控操作下发接口（中转端点）。
+/// 归属：**端点/受控操作中转层归 5号位**（冻结 06 v1.38 §7.4、05 v1.48:379,390-391、13 v1.8 §十：4号位 → 5号位 API → 权限校 → 2号位 Application）。
+/// 5号位 职责：中转承载 + F-G4 业务范围（Factories）二次校验。
+/// 权限码（MesControlledOperation）由 3号位 落；核心下发能力归 2号位，接入前返回 501，属预期。
 /// </summary>
-/// <remarks>开发者：3号位</remarks>
+/// <remarks>骨架：3号位；归属归一（10-17）后中转承载：5号位；业务判定/下发：2号位</remarks>
 [ApiController]
 [Route("api/mes")]
 public class MesDispatchController : ControllerBase
@@ -30,8 +32,8 @@ public class MesDispatchController : ControllerBase
     private int GetCurrentUserId()
         => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
-    /// <summary>发起 MES 受控操作下发——骨架：仅 scope 二次校验，核心下发待 2号位 接入</summary>
-    /// <remarks>开发者：3号位（编排骨架）；核心下发能力归 2号位</remarks>
+    /// <summary>发起 MES 受控操作下发——中转：权限/Scope 校验 + 透传 2号位 判定，接入前返回 501（预期）</summary>
+    /// <remarks>中转承载：5号位；判定/下发能力：2号位（接入前 501，前端不接线）</remarks>
     [Authorize(Policy = PermissionCodes.MesControlledOperation)]
     [HttpPost("dispatch")]
     public async Task<IActionResult> Dispatch([FromBody] MesDispatchRequest request, CancellationToken ct)

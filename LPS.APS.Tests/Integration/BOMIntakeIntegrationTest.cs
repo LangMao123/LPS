@@ -67,8 +67,8 @@ public class BOMIntakeIntegrationTest
         Console.WriteLine($"[PlanVersion] 动态解析到 {planVersionIds.Count} 个: {string.Join(", ", planVersionIds)}");
         Skip.If(planVersionIds.Count == 0, "PlanVersion 表无当次 DAILY_BASELINE 版本，无法生成 OrderBomRequestLink —— 环境态。");
 
-        Console.WriteLine($"触发独立接货 IntakeLatestReadyBatchAsync([{string.Join(",", planVersionIds)}]) ...");
-        var result = await puller.IntakeLatestReadyBatchAsync(planVersionIds, CancellationToken.None);
+        Console.WriteLine($"触发独立接货 IntakeNightBatchAsync([{string.Join(",", planVersionIds)}]) ...");
+        var result = await puller.IntakeNightBatchAsync(planVersionIds, cancellationToken: CancellationToken.None);
         Console.WriteLine(
             $"[接货] IntakePerformed={result.IntakePerformed}, BatchNo={result.BatchNo ?? "<无READY批次>"}, PulledCount={result.PulledCount}");
 

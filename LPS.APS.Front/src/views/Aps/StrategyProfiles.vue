@@ -1,5 +1,7 @@
 <!--
-  APS V1 4号位 — 策略配置独立维护页（v1.6 4号位 补登，待 0号位 拍板；历史引用 v1.4 §十八.10）
+  APS V1 4号位 — 策略包版本独立维护页（v1.6 4号位 补登，待 0号位 拍板；历史引用 v1.4 §十八.10）
+  页面名取冻结文档 07 v5.1.10 §5.6「StrategyProfileVersion（策略包版本表）」的原词，
+  与同组的「规则集版本」「参数集版本」对齐；10-16 起归入菜单分组「策略配置」。
 
   @see frontNew/docs/project_strategy_profile_audit.md（10-10 审查报告 + 7 项问题）
   @see lps/LPS.APS.Web/Controllers/GovernanceController.cs（12 端点全在 3号位 控制器）
@@ -11,7 +13,7 @@
   布局：
     左侧 Profile 列表（卡片式，含 RunType + IsActive）
     右侧 选中 Profile 后：
-      顶部 KPI（6 态分布 + 已发布数 + 默认数）
+      顶部 KPI（V1 可达状态分布：草稿 / 已发布 / 已退役；预留的提交/批准/归档无写入路径，不展示）
       版本表格（6 态 Tag + 操作列）
       版本详情（Descriptions）
       Diff 面板（选 base + target → loadDiff）
@@ -49,6 +51,8 @@ import {
 } from 'element-plus'
 import {
   STRATEGY_STATUS_META,
+  STRATEGY_VERSION_STATUSES,
+  STRATEGY_V1_REACHABLE_STATUSES,
   type StrategyProfileVersionDto,
   type StrategyVersionDraftInput,
   type StrategyVersionStatus
@@ -314,6 +318,22 @@ const profileRunTypeLabel = computed<string>(() => {
   return map[rt] ?? rt
 })
 
+/**
+ * KPI 只展示 V1 够得着的状态；万一库里真出现了预留状态（手工 SQL / 后端将来补齐审批流），
+ * 仍按实际计数显示，不把真实数据藏起来。
+ */
+const kpiStatuses = computed<StrategyVersionStatus[]>(() => {
+  const reachable = STRATEGY_VERSION_STATUSES.filter((s) =>
+    STRATEGY_V1_REACHABLE_STATUSES.includes(s)
+  )
+  const unexpected = STRATEGY_VERSION_STATUSES.filter(
+    (s) => !STRATEGY_V1_REACHABLE_STATUSES.includes(s) && statusCounts.value[s] > 0
+  )
+  return [...reachable, ...unexpected]
+})
+
+const kpiSpan = computed<number>(() => Math.max(4, Math.floor(24 / kpiStatuses.value.length)))
+
 function formatDateTime(s: string | null | undefined): string {
   return s ? dayjs(s).format('YYYY-MM-DD HH:mm:ss') : '—'
 }
@@ -332,7 +352,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
     <!-- 顶部 Header -->
     <div class="page-header">
       <div>
-        <h2 class="page-title">策略配置</h2>
+        <h2 class="page-title">策略包版本</h2>
         <span class="page-subtitle">策略包与版本维护（草稿 / 发布 / 默认版本 / 版本对比）</span>
       </div>
       <ElButton @click="loadAll" :loading="listLoading">刷新求解器策略列表</ElButton>
@@ -432,12 +452,12 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
             </ElDescriptions>
           </ElCard>
 
-          <!-- KPI 行 -->
+          <!-- KPI 行：只展示 V1 够得着的状态（草稿/已发布/已退役） -->
           <ElRow :gutter="12" class="kpi-row">
-            <ElCol v-for="(meta, key) in STRATEGY_STATUS_META" :key="key" :span="4">
+            <ElCol v-for="key in kpiStatuses" :key="key" :span="kpiSpan">
               <ElCard shadow="never" class="kpi-card">
-                <div class="kpi-label">{{ meta.label }}</div>
-                <div class="kpi-value">{{ statusCounts[key as StrategyVersionStatus] }}</div>
+                <div class="kpi-label">{{ STRATEGY_STATUS_META[key].label }}</div>
+                <div class="kpi-value">{{ statusCounts[key] }}</div>
               </ElCard>
             </ElCol>
           </ElRow>
@@ -488,8 +508,16 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                   <span v-else>—</span>
                 </template>
               </ElTableColumn>
-              <ElTableColumn prop="ruleSetVersionId" label="规则集版本" width="100" />
-              <ElTableColumn prop="parameterSetVersionId" label="参数集版本" width="100" />
+              <ElTableColumn label="规则集版本" width="160">
+                <template #default="{ row }: { row: StrategyProfileVersionDto }">
+                  {{ row.ruleSetVersionCode ?? '—' }}
+                </template>
+              </ElTableColumn>
+              <ElTableColumn label="参数集版本" width="160">
+                <template #default="{ row }: { row: StrategyProfileVersionDto }">
+                  {{ row.parameterSetVersionCode ?? '—' }}
+                </template>
+              </ElTableColumn>
               <ElTableColumn label="发布时间" width="160">
                 <template #default="{ row }: { row: StrategyProfileVersionDto }">
                   {{ formatDateTime(row.publishedAt) }}
@@ -586,11 +614,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                 >
                 <span v-else>—</span>
               </ElDescriptionsItem>
-              <ElDescriptionsItem label="规则集版本 ID">{{
-                currentVersion.ruleSetVersionId
+              <ElDescriptionsItem label="规则集版本">{{
+                currentVersion.ruleSetVersionCode ?? '—'
               }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="参数集版本 ID">{{
-                currentVersion.parameterSetVersionId
+              <ElDescriptionsItem label="参数集版本">{{
+                currentVersion.parameterSetVersionCode ?? '—'
               }}</ElDescriptionsItem>
               <ElDescriptionsItem label="生效窗口">
                 {{ formatDateTime(currentVersion.effectiveFrom) }} ~
@@ -697,11 +725,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                     {{ STRATEGY_STATUS_META[runTrace.status].label }}
                   </ElTag>
                 </ElDescriptionsItem>
-                <ElDescriptionsItem label="规则集版本 ID">{{
-                  runTrace.ruleSetVersionId
+                <ElDescriptionsItem label="规则集版本">{{
+                  runTrace.ruleSetVersionCode ?? '—'
                 }}</ElDescriptionsItem>
-                <ElDescriptionsItem label="参数集版本 ID">{{
-                  runTrace.parameterSetVersionId
+                <ElDescriptionsItem label="参数集版本">{{
+                  runTrace.parameterSetVersionCode ?? '—'
                 }}</ElDescriptionsItem>
               </ElDescriptions>
               <div class="trace-runs">

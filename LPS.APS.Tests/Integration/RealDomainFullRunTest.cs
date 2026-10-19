@@ -57,8 +57,20 @@ public class RealDomainFullRunTest
     /// <summary>生产默认策略包版本 SP-DEMO-V3.0（IsDefault=1）。实际以库为准并断言，不盲信常量。</summary>
     private const long ExpectedStrategyProfileVersionId = 811L;
 
-    /// <summary>本次跑批的 PlanVersion.VersionCode（**精确值，非 LIKE**，按日期一天一发）。</summary>
-    private static string VersionCode => $"MANUAL_{DateTime.Today:yyyyMMdd}_{DomainKey}";
+    /// <summary>
+    /// 本次跑批的 PlanVersion.VersionCode（**精确值，非 LIKE**，按日期一天一发）。
+    ///
+    /// <para><b>2026-10-14 增：可用环境变量 <c>APS_REAL_DOMAIN_VERSION_CODE</c> 指向**既有** PlanVersion</b>
+    /// （例：<c>NIGHTLY_20261008_FAMILY_X</c>），从而**复用它的 Run**。这是唯一能读到真实 MES 快照的跑法：
+    /// MES 三张快照（<c>MESWorkOrderSnapshot</c> / <c>OperationProgressSnapshot</c> / <c>StageProgressSnapshot</c>）
+    /// 只挂在 <c>ScheduleRunId=1</c> 下，而 <see cref="SnapshotRunResolver"/> 要求该 Run 在
+    /// <c>APS_ETL_Log</c> 上三个快照 Step 均有 <c>SUCCESS</c> 终态 —— **新建 Run 必然 fail-closed**
+    /// （新 Run 没有 ETL 成功证据）。默认值（当天 <c>MANUAL_</c>）只适用于不看 MES 快照的场景。</para>
+    /// </summary>
+    private static string VersionCode =>
+        Environment.GetEnvironmentVariable("APS_REAL_DOMAIN_VERSION_CODE") is { Length: > 0 } overridden
+            ? overridden
+            : $"MANUAL_{DateTime.Today:yyyyMMdd}_{DomainKey}";
 
     private const string TriggeredBy = "2号位-真实域全量跑通留痕";
 
@@ -110,6 +122,11 @@ public class RealDomainFullRunTest
     /// 本测试会往 APS_Production 写真实域的全量结果并跑满主链（分钟级、重资源），
     /// 绝不能因为一次宽泛的 <c>dotnet test</c> 被误触发。要跑必须显式开门：
     /// <code>APS_REAL_DOMAIN_RUN=1 dotnet test --filter FullyQualifiedName~RealDomainFullRunTest</code>
+    ///
+    /// ⚠️ 本入口建的 <c>MANUAL_*</c> 壳**没有** <c>OrderBomRequestLink</c>（OBRL 由夜间接货按 PV 生成）。
+    ///   自 2026-10-17 起 Pegging 对「无关联批」**Fail-Closed**（不再回落 `APS_BOM_RAW` 最新批），
+    ///   故直接跑本入口会在步骤 3 得到 <c>IsSuccess=false</c> / <c>ErrorMessage=BOM 输入不可用…</c>。
+    ///   要跑**带 BOM 的真实口径**，请改用 <see cref="RunExistingPlanVersionAsync"/> 点名夜间 PV。
     /// </summary>
     private const string GateEnvVar = "APS_REAL_DOMAIN_RUN";
 
@@ -261,11 +278,11 @@ public class RealDomainFullRunTest
         var (runId, planVersionId, reused) = await EnsureRunAndPlanVersionAsync(strategyVersionId, ct, versionCode);
         _output.WriteLine($"[1] ScheduleRunId={runId}, PlanVersionId={planVersionId} ({(reused ? "复用既有" : "新建")})");
 
-        // 复用既有 Run/PV 时把 PV 打回 'Created' —— 否则上一次留下的 'Computed' 会让**第 1 次**调用
+        // 复用既有 Run/PV 时把 PV 打回 'BUILDING' —— 否则上一次留下的终态会让**第 1 次**调用
         // 直接命中重入守卫（守卫行为正确，但本测试要验的是「首跑真的跑」，会被自己绊倒）。
         // Run 侧由 EnsureRunAndPlanVersionAsync 的复用分支打回 RUNNING。
         await _connectionManager.ExecuteAsync(
-            "UPDATE PlanVersion SET Status = 'Created', ComputedAt = NULL WHERE Id = @Id",
+            "UPDATE PlanVersion SET Status = 'BUILDING', ComputedAt = NULL WHERE Id = @Id",
             new { Id = planVersionId }, db: DatabaseId.APS);
 
         var loaded = await orderLoadingService.LoadOrdersToPartitionTableAsync(planVersionId, ct);
@@ -289,7 +306,9 @@ public class RealDomainFullRunTest
         var runStatusAfterFirst = await _connectionManager.QueryFirstOrDefaultAsync<string>(
             "SELECT Status FROM ScheduleRun WHERE Id = @Id", new { Id = runId }, db: DatabaseId.APS);
         _output.WriteLine($"[4] 首跑终态: PlanVersion.Status={pvStatusAfterFirst}, ScheduleRun.Status={runStatusAfterFirst}");
-        Assert.Equal("Computed", pvStatusAfterFirst);
+        // 本测试用的是 FULL_SCHEDULE（夜间全量）Run ⇒ 域成功即**自动正式采用**（Status=ACTIVE）。
+        // 白天候选（MANUAL_RESCHEDULE 等）才停在 CANDIDATE 等人工确认。
+        Assert.Equal("ACTIVE", pvStatusAfterFirst);
         Assert.Equal("COMPLETED", runStatusAfterFirst);
 
         // ── 调用 2：重入 —— 必须命中守卫、不重跑 ──────────────────────────
@@ -319,6 +338,18 @@ public class RealDomainFullRunTest
     /// </summary>
     private async Task<long> ResolveDefaultStrategyVersionIdAsync(CancellationToken ct)
     {
+        // 【2026-10-14 增·2号位】环境变量点名策略包版本。
+        // 起因：3号位 于 2026-10-14 13:07 发布 `SP-MR-V1.0`(Id=1969, StrategyProfileId=1302, IsDefault=1)
+        //   ⇒ 库里同时存在 **两个** IsDefault=1 的 PUBLISHED 版本（811 属 Profile 283 / 1969 属 Profile 1302）
+        //   ⇒ 下方「唯一性」红线判歧义、拒绝执行。
+        //   `IsDefault` 本就是**按 StrategyProfile 各自**的默认（不同 Profile 各有一个），故歧义来自本夹具
+        //   「不按 Profile 收窄」这一写法，不是数据问题。点名可绕过，且保持「不盲取第一个」的红线。
+        var pinned = Environment.GetEnvironmentVariable("APS_REAL_DOMAIN_STRATEGY_VERSION_ID");
+        if (long.TryParse(pinned, out var pinnedId) && pinnedId > 0)
+        {
+            return pinnedId;
+        }
+
         var rows = (await _connectionManager.QueryAsync<long>(
             @"SELECT Id
               FROM StrategyProfileVersion
@@ -366,8 +397,10 @@ public class RealDomainFullRunTest
                 $"既有 PlanVersionId={existing.Value} 的 SourceScheduleRunId 为空 —— 无法收口 Run，拒绝复用。");
 
             // 复用前把 Run 打回 RUNNING（上次跑完是 COMPLETED；重跑要重新计时）
+            // ⚠️ 时间戳一律**本地**（`GETDATE()`）—— 2026-10-14 订正：原为 `GETUTCDATE()`，与
+            //    《APS V1》统一本地时间口径冲突，且会污染 ScheduleRun.CreatedAt 一列两种时区的既有毛病。
             await _connectionManager.ExecuteAsync(
-                "UPDATE ScheduleRun SET Status = 'RUNNING', StartedAt = GETUTCDATE(), CompletedAt = NULL, DurationSeconds = NULL WHERE Id = @Id",
+                "UPDATE ScheduleRun SET Status = 'RUNNING', StartedAt = GETDATE(), CompletedAt = NULL, DurationSeconds = NULL WHERE Id = @Id",
                 new { Id = existingRunId.Value }, db: DatabaseId.APS);
 
             return (existingRunId.Value, existing.Value, true);
@@ -403,7 +436,7 @@ public class RealDomainFullRunTest
                    [SourceScheduleRunId], [CreatedBy], [CreatedAt])
               OUTPUT INSERTED.[Id]
               VALUES (@VersionCode, 'DAILY_BASELINE', @DomainKey,
-                      @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'Created',
+                      @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'BUILDING',
                       @SourceScheduleRunId, @CreatedBy, @StartedAt)",
             new
             {

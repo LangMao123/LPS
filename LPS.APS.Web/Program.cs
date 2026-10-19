@@ -27,6 +27,8 @@ Log.Logger = new LoggerConfiguration()
         .SetBasePath(Directory.GetCurrentDirectory())
         .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
         .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
+        // 本机私有覆盖（不入版本库）：连接串密码等敏感值放这里，见 WebApplicationBuilder 处的同款加载
+        .AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true)
         .Build())
     .Enrich.FromLogContext()
     .Enrich.WithProperty("Application", "LPS.APS")
@@ -40,6 +42,32 @@ try
     Log.Information("========================================");
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ==================== 本机私有覆盖配置（appsettings.Local.json，不入版本库）====================
+// 用途：把连接串密码等敏感值留在**本机/服务器**上，不写进 appsettings.json / appsettings.{环境}.json。
+// 优先级：命令行参数 > 环境变量 > **本文件** > appsettings.{环境}.json > appsettings.json。
+// 文件可选：不存在则行为与之前完全一致（当前三份配置的 Production 连接串仍是占位符，
+//          生产环境需靠本文件或环境变量补齐，详见台账 §T-1104 十五节）。
+{
+    var sources = builder.Configuration.Sources;
+    var insertAt = sources.Count;
+    for (var i = 0; i < sources.Count; i++)
+    {
+        if (sources[i] is Microsoft.Extensions.Configuration.EnvironmentVariables.EnvironmentVariablesConfigurationSource)
+        {
+            insertAt = i;   // 插在「环境变量」之前 ⇒ 环境变量仍可压过本文件
+            break;
+        }
+    }
+
+    sources.Insert(insertAt, new Microsoft.Extensions.Configuration.Json.JsonConfigurationSource
+    {
+        Path = "appsettings.Local.json",
+        Optional = true,
+        ReloadOnChange = true,
+        FileProvider = builder.Environment.ContentRootFileProvider,
+    });
+}
 
 // 使用 Serilog 替换默认日志
 builder.Host.UseSerilog();
@@ -72,6 +100,9 @@ builder.Services.AddHangfireServices(builder.Configuration);
 builder.Services.AddControllers(options =>
 {
     options.Filters.Add<GlobalExceptionFilter>();
+    // 信封业务码→HTTP 状态统一桥（Owner 裁定 2026-10-19 (b1)）：裸 Fail(4xx/5xx) 不再 HTTP 200。
+    // 机制/豁免名单见 Filters/CodeToStatusResultFilter.cs 头注；清单函：致 3号位 2026-10-19。
+    options.Filters.Add<CodeToStatusResultFilter>();
 })
 .ConfigureApiBehaviorOptions(options =>
 {

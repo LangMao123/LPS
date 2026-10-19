@@ -131,6 +131,28 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<ResourceDefinition> Resources { get; init; }
         = Array.Empty<ResourceDefinition>();
 
+    /// <summary>
+    /// **纯设备** `ResourceId` 白名单（2号位 装载侧投影 → 1号位 消费）。
+    ///
+    /// 【语义】`null` ⇒ **未投影** ⇒ 1号位 保持现行行为（资源集合含人工槽合成键），**零回归**；
+    ///   非 null ⇒ 只列**纯设备** `ResourceId`（已剔除人工槽合成键 `ManualSlotResourceOffset + ManualSlotId`）。
+    ///   ⚠ **空集合 ≠ null**：空 = 本 Run 已投影、但一个纯设备都没有；null = 未投影。
+    ///
+    /// 【键域】与 <see cref="ResourceDefinition.ResourceId"/> **同域**，原样透传；
+    ///   1号位 **不做任何「资源身份判别」、不硬编码任何阈值**（其回执 §四 逐字）。
+    ///
+    /// 【消费语义（1号位 2026-10-16 回执 §四 点名）】非 null 时按其**分别**算「含人工槽」与「纯设备」
+    ///   两个排序键，**默认仍取含人工槽那个** ⇒ 默认行为不变。用于 R-2「**设备**有效稼动」口径的留痕增强：
+    ///   冻结 v1.13 R-2 = 设备有效稼动，而资源集合含人工槽 ⇒ 单一排序键无法区分两个口径。
+    ///
+    /// 【为什么判据在 2号位】合成键由 2号位 生成（`SolverResourceProjection`）；
+    ///   1号位 侧 `ManualSlot` / `1_000_000_000` grep = 0 命中 ⇒ 不得由 1号位 自判。
+    ///
+    /// 【契约归属】本字段由 1号位 点名落地（1↔2 契约字段只按 1号位 点名扩）；
+    ///   声明由双方共同确认，**填充由 2号位 装载侧做、消费由 1号位 Solver 做**。
+    /// </summary>
+    public IReadOnlyList<int>? DeviceResourceIds { get; init; }
+
     public IReadOnlyList<ResourceCalendarSlot> CalendarSlots { get; init; }
         = Array.Empty<ResourceCalendarSlot>();
 
@@ -293,7 +315,7 @@ public sealed class SolverStrategySnapshot
     /// （<c>PeggingOrchestrator.BatchPolicies = TaskSplitRuleConfigProjector.CropToDomain(...)</c>，
     /// 按 <c>demandMaterialIds</c> 单轴裁，保留全部部门变体，≈85×）。⇒ **列表里看不到某物料 = 域裁剪结果，不是装载缺失。**
     /// ⚠ 本属性**只承载「已生效规则行」**，**无状态位** ⇒ 单看它无法区分 MISSING 与 INVALID
-    /// （冻结 06 v1.37 <c>:25</c>／规则清单 B-013 要求 <c>VALID/MISSING/INVALID</c> 三态）。
+    /// （冻结 06 **v1.36 <c>:17</c>**／规则清单 **v1.7 <c>B-013</c>** 要求 <c>VALID/MISSING/INVALID</c> 三态）。
     /// **三态＋不可用载体已于 2026-10-13 落码 = <see cref="BatchPolicyStates"/>（同层，本 Run 逐业务键）**
     /// ⇒ 消费侧**不得**再把「本列表为空／查不到行」一律读作 MISSING（06 <c>:17</c> 逐字已判违规）。
     /// 本列表仍为 **Valid 行的规则参数来源**（载体只给状态，不给参数）。
@@ -319,7 +341,7 @@ public sealed class SolverStrategySnapshot
     /// 1号位 的 <c>Missing</c> 分支**已落码但今日不可达** —— 其注释逐字：「<c>Missing</c> 分支**保留**
     /// （**载体到位后由 2号位 可信状态激活**）—— 今日不可达」⇒ **本属性即该「可信状态」**。
     ///
-    /// **为什么与 <see cref="BatchPolicies"/> 并存而不是替换它**：06 v1.37 <c>:25</c> 只允许「**最小 DTO**」，
+    /// **为什么与 <see cref="BatchPolicies"/> 并存而不是替换它**：06 v1.36 <c>:17</c> 只允许「**最小 DTO**」，
     /// 且要求「**不得**把所有物料规则发送 Solver」。本载体只增加 <c>(键, 状态, 来源)</c> 三元组
     /// （**不含规则参数**），规则参数继续由 <see cref="BatchPolicies"/> 承载 ⇒ **纯增量、向后兼容**：
     /// 未适配的消费侧忽略本属性即回到旧行为，**零回归**。

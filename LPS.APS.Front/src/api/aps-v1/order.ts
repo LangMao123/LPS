@@ -12,10 +12,11 @@ import { apsHttp, APS_USE_MOCK } from './http'
 import { mockOrderDetail, mockOrderList, mockOrderSummary } from './__mocks__/fixtures'
 import type {
   OrderBasicInfo,
+  OrderListPageResult,
   OrderQuery,
   OrderScheduleDetailDto,
-  OrderSummaryStatus,
-  PageResult
+  OrderSummaryCounts,
+  OrderSummaryStatus
 } from './types'
 
 export const orderApi = {
@@ -24,8 +25,9 @@ export const orderApi = {
    *  - GET /api/order-query                  列表（无分页 Query；按 §八 11 维度筛选）
    *  - GET /api/order-query/{orderId:long}   详情
    *  旧版 /api/order/list 路径已废
+   *  10-12 收：返 OrderListPageResult<T>（字段 page，模块级本地包装）
    */
-  async list(query: OrderQuery): Promise<PageResult<OrderBasicInfo>> {
+  async list(query: OrderQuery): Promise<OrderListPageResult<OrderBasicInfo>> {
     if (APS_USE_MOCK) {
       return mockOrderList(query.pageIndex, query.pageSize, {
         orderNo: query.orderNo,
@@ -41,7 +43,7 @@ export const orderApi = {
         dueDateTo: query.dueDateTo
       })
     }
-    return apsHttp.get<PageResult<OrderBasicInfo>>({
+    return apsHttp.get<OrderListPageResult<OrderBasicInfo>>({
       url: '/api/order-query',
       params: { ...query }
     })
@@ -92,5 +94,24 @@ export const orderApi = {
       { status: 'AT_RISK', count: dto.riskCount ?? 0 },
       { status: 'UNSCHEDULED', count: dto.unscheduledCount ?? 0 }
     ]
+  },
+
+  /** 订单摘要**原始计数**（排产总览直接消费，不做状态名反查）
+   *  与 getSummary 同一端点；getSummary 面向订单列表 KPI（已映射为 OrderSummaryStatus），
+   *  本方法保留后端字段原名，便于总览页展示「合计」并避免二次映射失真。
+   */
+  async getSummaryCounts(planVersionId: number): Promise<OrderSummaryCounts> {
+    const dto = await apsHttp.get<OrderSummaryCounts>({
+      url: '/api/order-query/summary',
+      params: { planVersionId }
+    })
+    return {
+      planVersionId: dto.planVersionId,
+      totalCount: dto.totalCount ?? 0,
+      onTimeCount: dto.onTimeCount ?? 0,
+      delayedCount: dto.delayedCount ?? 0,
+      riskCount: dto.riskCount ?? 0,
+      unscheduledCount: dto.unscheduledCount ?? 0
+    }
   }
 }

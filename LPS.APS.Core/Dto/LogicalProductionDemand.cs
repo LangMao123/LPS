@@ -38,6 +38,30 @@ public sealed class LogicalProductionDemand
     public long? OrderId { get; init; }
 
     /// <summary>
+    /// 本需求是否为**该订单的顶层根需求**（BOM 展开的第 0 层）。
+    ///
+    /// 【为什么必须显式携带（0号位 2026-10-17 第十四轮 J14-03/J14-04）】
+    ///   Stage 链角色此前由「该物料在本运行是否有 BOM 供给阈值」反推 ⇒ 子件阈值为 NULL 时被错判成 ROOT。
+    ///   角色是**需求的结构属性**（本需求是不是本订单的根），阈值只决定 EDGE 链的**截断点**（<see cref="RequiredStageCode"/>）。
+    /// </summary>
+    public bool IsRootDemand { get; set; }
+
+    /// <summary>
+    /// 本需求所属 BOM 请求的 `ResolvedBOMNO`（来自 `OrderBomRequestLink`，按 `OrderId + PlanVersionId` 解析）。
+    /// null = 无锚点（旧链路/未建链接）⇒ Stage 链装载不做请求收窄并须留痕。
+    /// </summary>
+    public string? BomNo { get; set; }
+
+    /// <summary>本需求所属 BOM 请求的 `RequestDetailId`（`OrderBomRequestLink.RequestDetailId`，追溯用）。</summary>
+    public long? RequestDetailId { get; set; }
+
+    /// <summary>
+    /// 本需求所属 BOM 请求的 ROOT 代表锚点（`OrderBomRequestLink.RepWorksetId` = 该 RequestDetail 下 Level=1 的 `MIN(Workset.Id)`）。
+    /// ROOT 侧 Stage 链按它做第二层收窄（`WorksetId` 已回灌时生效）。
+    /// </summary>
+    public long? RepWorksetId { get; set; }
+
+    /// <summary>
     /// 物料ID
     /// </summary>
     public int MaterialId { get; init; }

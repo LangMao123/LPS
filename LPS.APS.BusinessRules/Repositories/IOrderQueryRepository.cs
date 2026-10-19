@@ -8,9 +8,9 @@ namespace LPS.APS.BusinessRules.Repositories;
 public interface IOrderQueryRepository
 {
     /// <summary>
-    /// 查询订单列表
+    /// 查询订单列表（分页 + total）
     /// </summary>
-    Task<List<OrderListItemDto>> QueryOrdersAsync(
+    Task<PageResult<OrderListItemDto>> QueryOrdersAsync(
         int planVersionId,
         string? orderNo = null,
         string? materialCode = null,
@@ -19,6 +19,10 @@ public interface IOrderQueryRepository
         string? domainKey = null,
         string? delayStatus = null,
         string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,

@@ -166,9 +166,9 @@ async function onSubmit(): Promise<void> {
 
       <ElAlert type="warning" :closable="false" show-icon class="d-alert">
         <template #title>唯一键</template>
-        <code>(生产部门, 小工序, 能力槽编码)</code> 三元组唯一，重复提交会被拒绝。 新建后该槽<strong
-          >尚无日历窗口 = 不可排</strong
-        >，请在「人工槽日历」页签补窗口。
+        <code>(生产部门, 小工序, 能力槽编码)</code> 三元组唯一，重复提交会被拒绝。 新建后这个槽
+        <strong>本级还没单独登记</strong> —— 所属工厂或部门开放了，它照样能排产；
+        需要单独调整它的可用时段时，再到「人工槽日历」页签补窗口。
       </ElAlert>
     </ElForm>
 

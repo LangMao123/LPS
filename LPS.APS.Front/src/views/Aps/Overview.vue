@@ -1,15 +1,25 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — 排产总览（页面 1 / U01 / U02 / U07）
+ * APS V1 4号位 — 排产总览（页面 1 / U01 / U02）
  *
- * 4号位文档第 4 节约束：
- *  - 顶部展示各 Domain 当前 ACTIVE 版本（多 Domain 同时支持）
- *  - 订单摘要按 5 种状态聚合：按期/延期/风险/未排/仅估算
- *  - 仅展示，不触发任何重算/触发接口
- *  - "仅估算"订单必须显示 ESTIMATED_BADGE_TEXT（4号位文档第 7 节 / U07）
- *  - Domain 异常清晰区分 FAILED / BLOCKED_BY_UPSTREAM / PI_POSITION_ISSUE / ODS_CONTRACT_FAILED
+ * 数据源（5号位真实端点，5 个数据面各自独立调，无聚合端点）：
+ *  - /api/overview/active-plan             各 Domain 生效版本（→ store.planVersionId）
+ *  - /api/order-query/summary?planVersionId= 订单摘要 4 类计数
+ *  - /api/overview/resource-bottleneck?planVersionId= 资源负荷 + 不可用窗口
+ *  - /api/overview/candidate-summary       待确认 Candidate 数
+ *  - /api/domain-status/{runId}            排程域状态（6 值）
  *
- * 写接口：本页面只读，0 个写调用（4号位文档第 2.1 节）
+ * 保留的 4号位文档约束：
+ *  - 只展示，不触发任何重算/触发接口（第 2.1 节）
+ *  - 多 Domain 同时展示生效版本（第 4 节）
+ *  - 排程域异常区分根因（FAILED）与非根因（BLOCKED），细分说明走 reason
+ *
+ * 已删：底部「仅估算订单」卡片 —— 冻结 07 §6.6a + 规则 P-009 规划性采购占位**仅内存不建表**，
+ *       总览是事后读模型物理上给不出（5号位 2026-10-15 §十；4号位 10-16 回执选 (A) 删除）。
+ *
+ * 10-16 版式精简：页面大标题 + 副标题 + 刷新按钮整块下线（标题由面包屑/标签页承担，页面只留数据）；
+ *   「无生效版本」说明从顶部横幅改为写进「当前生效版本」卡片的空状态，订单摘要取不到时给整块空态
+ *   而不是摆 5 张含 0 的 KPI 卡。
  */
 
 import { computed, onMounted } from 'vue'
@@ -18,18 +28,17 @@ import { storeToRefs } from 'pinia'
 import { useOverviewStore } from '@/store/modules/aps/overview'
 import { useDomainStore } from '@/store/modules/aps/domain'
 import {
-  ORDER_SUMMARY_STATUS_LABELS,
-  ESTIMATED_BADGE_TEXT,
-  PLAN_VERSION_STATUS_LABELS,
-  PLAN_VERSION_STATUS_TAG,
-  SETUP_SOURCES,
-  SETUP_SOURCE_META,
-  type OrderSummaryStatus
+  RUN_DOMAIN_ISSUE_STATUSES,
+  RUN_DOMAIN_STATUS_LABELS,
+  RUN_DOMAIN_STATUS_TAG,
+  planVersionStatusLabel,
+  planVersionStatusTag,
+  type OrderSummaryStatus,
+  type RunDomainStatus
 } from '@/api/aps-v1/types'
 
 import {
   ElAlert,
-  ElButton,
   ElCard,
   ElDescriptions,
   ElDescriptionsItem,
@@ -39,14 +48,20 @@ import {
 } from 'element-plus'
 
 const overviewStore = useOverviewStore()
-const { data, loading, error } = storeToRefs(overviewStore)
+const { errors, activeVersions, orderSummary, resources, pendingCandidateCount, domainStatuses } =
+  storeToRefs(overviewStore)
 
 const domainStore = useDomainStore()
 function humanLabel(domainKey: string | undefined | null): string {
   return domainStore.label(domainKey)
 }
 
-/* ===== 订单状态颜色 ===== */
+/** 时间容缺：后端 WhenWritingNull 会整段省略字段 */
+function fmtTime(v: string | null | undefined, pattern = 'YYYY-MM-DD HH:mm'): string {
+  return v ? dayjs(v).format(pattern) : '-'
+}
+
+/* ===== 订单摘要（4 类 + 合计；后端不提供「仅估算」，故不展示该卡） ===== */
 const ORDER_STATUS_COLORS: Record<OrderSummaryStatus, string> = {
   ON_TIME: '#059669',
   AT_RISK: '#f59e0b',
@@ -55,51 +70,40 @@ const ORDER_STATUS_COLORS: Record<OrderSummaryStatus, string> = {
   ESTIMATED_ONLY: '#8b5cf6'
 }
 
-const ORDER_STATUS_ORDER: OrderSummaryStatus[] = [
-  'ON_TIME',
-  'AT_RISK',
-  'DELAYED',
-  'ESTIMATED_ONLY',
-  'UNSCHEDULED'
-]
-
-/* ===== Domain 异常标签 ===== */
-const ISSUE_LABELS: Record<string, string> = {
-  FAILED: '排程域失败',
-  BLOCKED_BY_UPSTREAM: '上游阻断',
-  PI_POSITION_ISSUE: 'PI 位置缺失',
-  ODS_CONTRACT_FAILED: 'ODS 契约失败'
-}
-
-const ISSUE_COLORS: Record<string, 'danger' | 'warning' | 'info'> = {
-  FAILED: 'danger',
-  BLOCKED_BY_UPSTREAM: 'warning',
-  PI_POSITION_ISSUE: 'info',
-  ODS_CONTRACT_FAILED: 'danger'
-}
-
-/* ===== 订单摘要聚合（保证 5 种状态都出现） ===== */
-const orderSummaryItems = computed(() => {
-  const items = data.value?.orderSummary ?? []
-  const map = new Map(items.map((it) => [it.status, it.count]))
-  return ORDER_STATUS_ORDER.map((status) => ({
-    status,
-    label: ORDER_SUMMARY_STATUS_LABELS[status],
-    count: map.get(status) ?? 0,
-    color: ORDER_STATUS_COLORS[status]
-  }))
+const orderKpis = computed(() => {
+  const s = orderSummary.value
+  if (!s) return []
+  return [
+    { status: 'ON_TIME' as const, label: '按期', count: s.onTimeCount },
+    { status: 'DELAYED' as const, label: '延期', count: s.delayedCount },
+    { status: 'AT_RISK' as const, label: '风险', count: s.riskCount },
+    { status: 'UNSCHEDULED' as const, label: '未排', count: s.unscheduledCount }
+  ].map((it) => ({ ...it, color: ORDER_STATUS_COLORS[it.status] }))
 })
 
-const totalOrders = computed(() =>
-  orderSummaryItems.value.reduce((sum, item) => sum + item.count, 0)
+const totalOrders = computed(() => orderSummary.value?.totalCount ?? null)
+
+const orderShare = (count: number): number =>
+  totalOrders.value && totalOrders.value > 0 ? Math.round((count / totalOrders.value) * 100) : 0
+
+/* ===== 排程域状态 ===== */
+const issueStatuses = new Set<string>(RUN_DOMAIN_ISSUE_STATUSES)
+const issueCount = computed(
+  () => domainStatuses.value.filter((d) => issueStatuses.has(d.status)).length
 )
 
-/* ===== 资源利用率 ===== */
-const bottleneckResources = computed(() =>
-  (data.value?.resourceSummary ?? []).filter((r) => r.isBottleneck)
-)
+const domainLabel = (status: string): string =>
+  RUN_DOMAIN_STATUS_LABELS[status as RunDomainStatus] ?? status
+const domainTag = (status: string) => RUN_DOMAIN_STATUS_TAG[status as RunDomainStatus] ?? 'info'
 
-/* ===== 加载 ===== */
+/* ===== 资源 ===== */
+const bottleneckResources = computed(() => resources.value.filter((r) => r.isBottleneck))
+
+const utilPercent = (r: { utilizationRate?: number | null }): number | null =>
+  r.utilizationRate === null || r.utilizationRate === undefined
+    ? null
+    : Math.round(r.utilizationRate * 100)
+
 function refresh() {
   overviewStore.load()
 }
@@ -109,49 +113,37 @@ onMounted(refresh)
 
 <template>
   <div class="aps-overview">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title">排产总览</h2>
-        <p class="page-sub">排产只读视图，所有改动通过相关页面操作</p>
+    <!-- ===== 分块错误（单端点失败不清空其它数据） ===== -->
+    <ElAlert
+      v-for="e in errors"
+      :key="e.section"
+      type="error"
+      :closable="false"
+      show-icon
+      :title="`${e.section}加载失败：${e.message}`"
+    />
+
+    <!-- ===== 订单摘要：合计 + 4 类。取不到时给整块空态，不摆 0 ===== -->
+    <div v-if="orderSummary" class="kpi-row">
+      <div class="kpi-card total">
+        <div class="kpi-label">订单合计</div>
+        <div class="kpi-value">{{ totalOrders ?? '-' }}</div>
+        <div class="kpi-ratio">本版本全部订单</div>
       </div>
-      <ElButton :loading="loading" @click="refresh"> <Icon icon="vi-ep:refresh" /> 刷新 </ElButton>
-    </div>
-
-    <!-- ===== 4号位约束提示 ===== -->
-    <ElAlert type="info" :closable="false" show-icon class="hint-bar">
-      <template #title>
-        {{ ESTIMATED_BADGE_TEXT }}
-      </template>
-      <span class="hint-text">
-        订单状态含 <strong style="color: #8b5cf6">"仅估算"</strong> 时显示该徽章；该类订单依赖
-        PLANNING_PURCHASE_PLACEHOLDER，未与采购正式承诺。
-      </span>
-    </ElAlert>
-
-    <!-- ===== 错误 / 加载态 ===== -->
-    <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
-
-    <!-- ===== KPI 卡片：5 种订单状态 ===== -->
-    <div class="kpi-row">
       <div
-        v-for="item in orderSummaryItems"
+        v-for="item in orderKpis"
         :key="item.status"
         class="kpi-card"
         :style="{ borderTopColor: item.color }"
       >
         <div class="kpi-label">{{ item.label }}</div>
         <div class="kpi-value" :style="{ color: item.color }">{{ item.count }}</div>
-        <div class="kpi-ratio">
-          {{ totalOrders > 0 ? Math.round((item.count / totalOrders) * 100) : 0 }}%
-        </div>
-      </div>
-      <div class="kpi-card total">
-        <div class="kpi-label">订单合计</div>
-        <div class="kpi-value">{{ totalOrders }}</div>
-        <div class="kpi-ratio">5 类汇总</div>
+        <div class="kpi-ratio">占 {{ orderShare(item.count) }}%</div>
       </div>
     </div>
+    <ElCard v-else class="panel">
+      <ElEmpty description="暂无订单摘要，需先完成一次排产运行并正式采用生效版本" />
+    </ElCard>
 
     <!-- ===== 中部两列 ===== -->
     <div class="content-row">
@@ -160,31 +152,36 @@ onMounted(refresh)
         <template #header>
           <div class="panel-header">
             <span>当前生效版本</span>
-            <ElTag v-if="data?.activeVersions?.length" type="success" size="small">
-              {{ data.activeVersions.length }} 排程域
+            <ElTag v-if="activeVersions.length" type="success" size="small">
+              {{ activeVersions.length }} 排程域
             </ElTag>
           </div>
         </template>
-        <div v-if="!data?.activeVersions?.length" class="panel-empty">
-          <ElEmpty description="当前无生效的计划版本" />
+        <div v-if="!activeVersions.length" class="panel-empty">
+          <ElEmpty description="当前没有排程域处于生效（ACTIVE）状态">
+            <p class="empty-hint">
+              订单摘要、资源负荷、排程域状态都以生效版本为入参。<br />
+              需先完成一次排产运行并被正式采用。
+            </p>
+          </ElEmpty>
         </div>
         <div v-else class="version-list">
-          <div v-for="v in data.activeVersions" :key="v.planVersionId" class="version-card">
+          <div v-for="v in activeVersions" :key="v.planVersionId" class="version-card">
             <div class="version-card-head">
               <div class="version-code">{{ v.versionCode }}</div>
-              <ElTag :type="PLAN_VERSION_STATUS_TAG[v.status]" size="small">
-                {{ PLAN_VERSION_STATUS_LABELS[v.status] }}
+              <ElTag :type="planVersionStatusTag(v.status)" size="small">
+                {{ planVersionStatusLabel(v.status) }}
               </ElTag>
             </div>
             <ElDescriptions :column="2" size="small" class="version-desc">
               <ElDescriptionsItem label="排程域">{{ humanLabel(v.domainKey) }}</ElDescriptionsItem>
               <ElDescriptionsItem label="激活时间">
-                {{ dayjs(v.activatedAt).format('MM-DD HH:mm') }}
+                {{ fmtTime(v.activatedAt) }}
               </ElDescriptionsItem>
               <ElDescriptionsItem label="计划区间">
-                {{ dayjs(v.planHorizonStart).format('YYYY-MM-DD') }}
+                {{ fmtTime(v.planHorizonStart, 'YYYY-MM-DD') }}
                 ~
-                {{ dayjs(v.planHorizonEnd).format('YYYY-MM-DD') }}
+                {{ fmtTime(v.planHorizonEnd, 'YYYY-MM-DD') }}
               </ElDescriptionsItem>
               <ElDescriptionsItem label="来源 Run">
                 {{ v.sourceScheduleRunId ?? '-' }}
@@ -194,28 +191,29 @@ onMounted(refresh)
         </div>
       </ElCard>
 
-      <!-- Domain 异常 -->
+      <!-- 排程域状态 -->
       <ElCard class="panel">
         <template #header>
           <div class="panel-header">
-            <span>排程域异常</span>
-            <ElTag v-if="data?.domainIssues?.length" type="danger" size="small">
-              {{ data.domainIssues.length }} 项
-            </ElTag>
+            <span>排程域状态</span>
+            <ElTag v-if="issueCount" type="danger" size="small"> {{ issueCount }} 项异常 </ElTag>
           </div>
         </template>
-        <div v-if="!data?.domainIssues?.length" class="panel-empty">
-          <ElEmpty description="当前无排程域异常" />
+        <div v-if="!domainStatuses.length" class="panel-empty">
+          <ElEmpty description="暂无排程域状态" />
         </div>
         <div v-else class="issue-list">
-          <div v-for="(issue, idx) in data.domainIssues" :key="idx" class="issue-item">
-            <ElTag :type="ISSUE_COLORS[issue.issueType] || 'info'" size="small">
-              {{ ISSUE_LABELS[issue.issueType] || issue.issueType }}
-            </ElTag>
+          <div
+            v-for="d in domainStatuses"
+            :key="d.domainKey"
+            class="issue-item"
+            :class="{ abnormal: issueStatuses.has(d.status) }"
+          >
+            <ElTag :type="domainTag(d.status)" size="small">{{ domainLabel(d.status) }}</ElTag>
             <div class="issue-body">
-              <div class="issue-domain">{{ humanLabel(issue.domainKey) }}</div>
-              <div class="issue-msg">{{ issue.message }}</div>
-              <div class="issue-time">{{ dayjs(issue.occurredAt).format('YYYY-MM-DD HH:mm') }}</div>
+              <div class="issue-domain">{{ humanLabel(d.domainKey) }}</div>
+              <div v-if="d.reason" class="issue-msg">{{ d.reason }}</div>
+              <div class="issue-time">{{ fmtTime(d.startedAt) }}</div>
             </div>
           </div>
         </div>
@@ -234,23 +232,7 @@ onMounted(refresh)
         </div>
       </template>
 
-      <!-- 换型来源五值图例（v1.5 §9/§10；标签取自 SETUP_SOURCE_META，与 SetupUncovered.vue + Gantt.vue Drawer 一致） -->
-      <ElAlert type="info" :closable="false" show-icon class="legend-alert">
-        <template #title>换型来源五值图例（与甘特 Task Drawer 一致）</template>
-        <div class="legend-row">
-          <ElTag
-            v-for="s in SETUP_SOURCES"
-            :key="s"
-            size="small"
-            :type="SETUP_SOURCE_META[s].tag"
-            effect="dark"
-          >
-            {{ SETUP_SOURCE_META[s].label }}
-          </ElTag>
-        </div>
-      </ElAlert>
-
-      <div v-if="!data?.resourceSummary?.length" class="panel-empty">
+      <div v-if="!resources.length" class="panel-empty">
         <ElEmpty description="暂无资源数据" />
       </div>
       <table v-else class="resource-table">
@@ -258,34 +240,31 @@ onMounted(refresh)
           <tr>
             <th>资源编码</th>
             <th>名称</th>
-            <th>利用率</th>
+            <th>负荷率</th>
             <th>状态</th>
             <th>不可用窗口</th>
           </tr>
         </thead>
         <tbody>
-          <tr
-            v-for="r in data.resourceSummary"
-            :key="r.resourceId"
-            :class="{ bottleneck: r.isBottleneck }"
-          >
+          <tr v-for="r in resources" :key="r.resourceId" :class="{ bottleneck: r.isBottleneck }">
             <td>{{ r.resourceCode }}</td>
             <td>{{ r.resourceName }}</td>
             <td>
-              <div class="util-bar">
+              <span v-if="utilPercent(r) === null" class="muted">-</span>
+              <div v-else class="util-bar">
                 <div
                   class="util-fill"
                   :style="{
-                    width: Math.round(r.utilization * 100) + '%',
+                    width: Math.min(utilPercent(r)!, 100) + '%',
                     background:
-                      r.utilization >= 0.9
+                      utilPercent(r)! >= 90
                         ? '#ef4444'
-                        : r.utilization >= 0.7
+                        : utilPercent(r)! >= 70
                           ? '#f59e0b'
                           : '#10b981'
                   }"
                 ></div>
-                <span class="util-text">{{ Math.round(r.utilization * 100) }}%</span>
+                <span class="util-text">{{ utilPercent(r) }}%</span>
               </div>
             </td>
             <td>
@@ -294,37 +273,24 @@ onMounted(refresh)
             </td>
             <td>
               <span v-if="!r.unavailableWindows.length" class="muted">无</span>
-              <span v-else>
-                {{ r.unavailableWindows[0].from }} ~ {{ r.unavailableWindows[0].to }}
-              </span>
+              <div v-else class="window-list">
+                <div v-for="(w, wi) in r.unavailableWindows" :key="wi" class="window-item">
+                  {{ fmtTime(w.from) }} ~ {{ fmtTime(w.to) }}
+                  <span v-if="w.reason" class="window-reason">{{ w.reason }}</span>
+                </div>
+              </div>
             </td>
           </tr>
         </tbody>
       </table>
     </ElCard>
 
-    <!-- ===== 底部：待确认候选 + 估算订单统计 ===== -->
-    <div class="footer-row">
-      <ElCard class="footer-card">
-        <div class="footer-item">
-          <ElIcon class="footer-icon"><Icon icon="vi-mdi:clock-alert-outline" /></ElIcon>
-          <div>
-            <div class="footer-label">待确认 Candidate</div>
-            <div class="footer-value">{{ data?.pendingCandidateCount ?? 0 }}</div>
-            <div class="footer-sub">阶段 B 入口：Ctp / Candidate 对比</div>
-          </div>
-        </div>
-      </ElCard>
-      <ElCard class="footer-card estimated">
-        <div class="footer-item">
-          <ElIcon class="footer-icon"><Icon icon="vi-mdi:alert-decagram-outline" /></ElIcon>
-          <div>
-            <div class="footer-label">仅估算订单</div>
-            <div class="footer-value">{{ data?.estimatedOnlyOrderCount ?? 0 }}</div>
-            <div class="footer-sub">{{ ESTIMATED_BADGE_TEXT }}</div>
-          </div>
-        </div>
-      </ElCard>
+    <!-- ===== 底部：待确认候选（整行窄条，不占半屏留白） ===== -->
+    <div class="candidate-bar">
+      <ElIcon class="candidate-icon"><Icon icon="vi-mdi:clock-alert-outline" /></ElIcon>
+      <span class="candidate-label">待确认 Candidate</span>
+      <span class="candidate-value">{{ pendingCandidateCount ?? '-' }}</span>
+      <span class="candidate-sub">去「候选版本确认」页处理</span>
     </div>
   </div>
 </template>
@@ -339,43 +305,23 @@ onMounted(refresh)
   gap: 16px;
 }
 
-/* 顶部 */
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .page-sub {
-    margin: 4px 0 0;
-    font-size: 12px;
-    color: #94a3b8;
-  }
+/* 顶部（页面大标题区已按 10-16 要求下线，标题由面包屑与标签页承担） */
+.hint-text {
+  font-size: 13px;
+  color: #475569;
 }
 
-/* 4号位约束提示 */
-.hint-bar {
-  :deep(.el-alert__title) {
-    font-weight: 600;
-  }
-
-  .hint-text {
-    margin-left: 8px;
-    font-size: 13px;
-    color: #475569;
-  }
+.empty-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #94a3b8;
 }
 
 /* KPI 卡片 */
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 12px;
 }
 
@@ -475,7 +421,7 @@ onMounted(refresh)
   }
 }
 
-/* Domain 异常 */
+/* 排程域状态 */
 .issue-list {
   display: flex;
   flex-direction: column;
@@ -486,9 +432,14 @@ onMounted(refresh)
   display: flex;
   gap: 12px;
   padding: 10px 12px;
-  background: #fef2f2;
-  border-left: 3px solid #ef4444;
+  background: #f8fafc;
+  border-left: 3px solid #cbd5e1;
   border-radius: 4px;
+
+  &.abnormal {
+    background: #fef2f2;
+    border-left-color: #ef4444;
+  }
 }
 
 .issue-body {
@@ -570,49 +521,55 @@ onMounted(refresh)
   }
 }
 
+.window-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.window-item {
+  font-size: 12px;
+  color: #475569;
+}
+
+.window-reason {
+  margin-left: 6px;
+  color: #94a3b8;
+}
+
 .muted {
   color: #cbd5e1;
 }
 
-/* 底部 */
-.footer-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-}
-
-.footer-card {
-  border-radius: 8px;
-
-  &.estimated {
-    background: #faf5ff;
-  }
-}
-
-.footer-item {
+/* 底部：待确认候选窄条 */
+.candidate-bar {
   display: flex;
   align-items: center;
-  gap: 16px;
+  padding: 12px 18px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+  gap: 12px;
 
-  .footer-icon {
-    font-size: 32px;
+  .candidate-icon {
+    font-size: 20px;
     color: #3b82f6;
   }
 
-  .footer-label {
-    font-size: 13px;
-    color: #64748b;
+  .candidate-label {
+    font-size: 14px;
+    color: #475569;
   }
 
-  .footer-value {
-    margin: 4px 0;
-    font-size: 24px;
+  .candidate-value {
+    font-size: 20px;
     font-weight: 600;
     color: #1e293b;
   }
 
-  .footer-sub {
-    font-size: 11px;
+  .candidate-sub {
+    margin-left: auto;
+    font-size: 12px;
     color: #94a3b8;
   }
 }

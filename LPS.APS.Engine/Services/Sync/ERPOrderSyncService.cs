@@ -15,7 +15,8 @@ namespace LPS.APS.Engine.Services.Sync;
 /// 
 /// 同步策略：
 /// - 全量同步：每日凌晨，拉取所有未取消/未完成订单（日期窗口过滤延迟到ETL层）
-/// - 增量同步：每小时，基于 UpdatedAt 水位线拉取变更订单
+/// - 增量同步：每小时，基于 UpdatedAt 水位线拉取变更订单；**提升整体成功才推进水位线**，
+///   整体失败保持原值以便下次重拉（逐行提升失败属正常业务分支，仍推进）
 /// - 新BOMNO嗅探：增量同步时检测 Order_Canonical 中不存在的BOMNO，触发实时BOM展开
 /// </summary>
 public class ERPOrderSyncService : IERPOrderSyncService
@@ -121,12 +122,19 @@ public class ERPOrderSyncService : IERPOrderSyncService
             }
 
             var maxUpdatedAt = orders.Max(o => o.UpdatedAt);
+            var promotionCompleted = false;
 
             try
             {
                 await BulkWriteToStagingAsync(orders);
                 var (promoted, failed) = await _promotionService.ValidateAndPromoteAsync(cancellationToken);
                 var newBOMNOs = await DetectNewBOMNOsAsync();
+
+                // 水位线只在**整条增量链**全部成功后推进（0号位 第二十二轮 J22-02 / P1）。
+                // 若把本行放在 DetectNewBOMNOsAsync 之前：提升已成功、探测抛异常时，
+                // finally 仍会推进水位线，而 catch 日志宣称「整体失败、水位线保持」——
+                // 日志与真实重试边界不一致，下次增量不会再拉取同批订单。
+                promotionCompleted = true;
 
                 stopwatch.Stop();
                 _logger.LogInformation(
@@ -141,11 +149,18 @@ public class ERPOrderSyncService : IERPOrderSyncService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "增量同步提升失败，水位线仍会更新");
+                // 整体失败（批量写 Staging、提升、或新 BOMNO 探测任一抛异常）⇒ 水位线保持原值，本批订单下次仍会被拉取。
+                // 仅「逐行提升失败」（ValidateAndPromoteAsync 正常返回 failed > 0）才推进水位线，属正常业务分支。
+                _logger.LogError(ex,
+                    "增量同步整体失败，水位线保持 {LastSyncTime} 不回退推进，本批 {Count} 条订单下次重试",
+                    lastSyncTime, orders.Count);
             }
             finally
             {
-                await UpdateSyncWatermarkAsync(maxUpdatedAt);
+                if (promotionCompleted)
+                {
+                    await UpdateSyncWatermarkAsync(maxUpdatedAt);
+                }
             }
 
             // 【白天候选】订单池同步：增量订单压进 ACTIVE PlanVersion 的 [Order]
@@ -165,7 +180,9 @@ public class ERPOrderSyncService : IERPOrderSyncService
     ///    改为直连 ODS 库查询，耗时降至约10秒
     /// ⚠️ 全量同步时数据量大（22万条），设置5分钟超时
     /// </summary>
-    private async Task<List<ERPOrderDto>> QueryOrdersFromODSAsync(string whereClause, object? parameters, int commandTimeout = 300)
+    // ↓ 以下五个 IO 边沿为 protected virtual：供单测覆写，验证水位线推进边界（J22-02 负例）。
+    //   生产路径零覆写者，语义与 private 相同。
+    protected virtual async Task<List<ERPOrderDto>> QueryOrdersFromODSAsync(string whereClause, object? parameters, int commandTimeout = 300)
     {
         var sql = $@"
             SELECT
@@ -211,8 +228,22 @@ public class ERPOrderSyncService : IERPOrderSyncService
     /// 批量写入 ERP_Order_Staging 表（SyncStatus = PENDING）
     /// 使用 SqlBulkCopy 高性能写入
     /// ⚠️ 写入前按 OrderNo 去重，避免 ODS 视图返回重复数据导致违反唯一约束
+    /// ⚠️ 写入后按「同一 OrderNo 只保留最新一条 PENDING」收敛：增量同步整体失败时不推进水位线
+    ///    （见 IncrementalSyncAsync），下一轮会重新拉取同一批订单。若同一 OrderNo 存在两条 PENDING，
+    ///    sp_ValidateAndPromoteOrders 的 MERGE 源侧无去重、按 OrderNo 匹配 ⇒ 8672「多行匹配同一目标行」
+    ///    ⇒ 事务整体回滚 ⇒ 每次重试都失败，无法自愈。唯一约束为 (OrderNo, SyncedAt)，
+    ///    重试写入新 SyncedAt 不会自动拦截，故须收敛。
+    ///
+    /// 【为什么是「写入后收敛」，不是「写入前全表清空」（0号位 第二十二轮 J22-01 / P0）】
+    ///   · 写入前 `DELETE … WHERE SyncStatus='PENDING'` 无批次／来源约束，会把**其它批次、并发调用
+    ///     正在处理**的待校验订单一并删掉；且 DELETE 与 BulkInsert 非原子，插入失败即「清零而新行未就绪」，
+    ///     待处理事实凭空消失。
+    ///   · 改为插入成功后，只删除「同一 OrderNo 已被更新 PENDING 覆盖」的旧行：
+    ///     范围由 OrderNo ＋ SyncedAt 确定，其它订单的 PENDING 一条不碰；插入失败时旧行原样保留。
+    ///   · 收敛失败时最坏结果是「同单号两条 PENDING」⇒ 下次提升 8672 ⇒ 下轮再收敛，属**可自愈**，
+    ///     不再出现「事实丢失且不可恢复」。
     /// </summary>
-    private async Task BulkWriteToStagingAsync(List<ERPOrderDto> orders)
+    protected virtual async Task BulkWriteToStagingAsync(List<ERPOrderDto> orders)
     {
         // 按 OrderNo 去重（OrderNo 是 APS 业务主键），保留 UpdatedAt 最新的记录
         var distinctOrders = orders
@@ -240,6 +271,10 @@ public class ERPOrderSyncService : IERPOrderSyncService
         dataTable.Columns.Add("UOM", typeof(string));
         dataTable.Columns.Add("DueDate", typeof(DateTime));
         dataTable.Columns.Add("OriginalDueDate", typeof(DateTime));
+        // 视图的 CreatedAt 即 ERP 的 InstrIssueDate（订单/生产指示正式下发日期）。
+        // 冻结 07 IssueDate=源事实字段，下游 sp_ValidateAndPromoteOrders /
+        // sp_SyncOrdersToPartitionTable 均已透传，此前只断在装载这一处。
+        dataTable.Columns.Add("IssueDate", typeof(DateTime));
         dataTable.Columns.Add("ReceivedQty", typeof(decimal));
         dataTable.Columns.Add("Priority", typeof(int));
         dataTable.Columns.Add("BOMNO", typeof(string));
@@ -273,10 +308,11 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 order.UOM,
                 order.DueDate,
                 order.OriginalDueDate,
+                order.CreatedAt,          // = InstrIssueDate → IssueDate
                 order.ReceivedQty,
                 order.Priority,
                 order.BOMNO,
-                order.Status ?? "Open",
+                order.Status ?? "OPEN",
                 // v5.0.3 源事实字段
                 (object?)order.TransportMode ?? DBNull.Value,
                 (object?)order.CustomerName ?? DBNull.Value,
@@ -292,14 +328,38 @@ public class ERPOrderSyncService : IERPOrderSyncService
             );
         }
 
+        // 先写本次批次：写入失败时上一轮的残留 PENDING 原样保留（不丢事实）。
         await _connectionManager.BulkInsertAsync(dataTable, "ERP_Order_Staging", DatabaseId.APS);
+
+        // 再收敛重复：同一 OrderNo 只保留 SyncedAt 最新的一条 PENDING（本次刚写入的那条）。
+        // 影响范围仅限「本 OrderNo 自己」，不触碰其它批次／并发调用的 PENDING；
+        // 被收敛的是同单号的旧待处理副本，该订单的最新事实仍在，不会造成订单事实丢失。
+        var purged = await _connectionManager.ExecuteAsync(
+            @"DELETE stale
+              FROM ERP_Order_Staging AS stale
+              WHERE stale.SyncStatus = 'PENDING'
+                AND EXISTS (
+                    SELECT 1
+                    FROM ERP_Order_Staging AS newer
+                    WHERE newer.OrderNo    = stale.OrderNo
+                      AND newer.SyncStatus = 'PENDING'
+                      AND (newer.SyncedAt > stale.SyncedAt
+                           OR (newer.SyncedAt = stale.SyncedAt AND newer.Id > stale.Id))
+                );",
+            db: DatabaseId.APS);
+
+        if (purged > 0)
+        {
+            _logger.LogWarning(
+                "写入后收敛同单号旧 PENDING: {Count} 条（上轮整体失败遗留，已被本次最新记录覆盖）", purged);
+        }
     }
 
     /// <summary>
     /// 检测新BOMNO（紧急插单支持）
     /// 对比最新Staging批次中的BOMNO与现有Order_Canonical，找出新增的BOMNO
     /// </summary>
-    private async Task<List<string>> DetectNewBOMNOsAsync()
+    protected virtual async Task<List<string>> DetectNewBOMNOsAsync()
     {
         var sql = @"
             SELECT DISTINCT stg.BOMNO
@@ -323,7 +383,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
     /// ⚠️ 首次同步：返回一个很早的日期（2020-01-01），确保全量拉取所有历史订单
     /// ⚠️ 后续同步：返回上次水位线，拉取所有变更（不限制回溯时间）
     /// </summary>
-    private async Task<DateTime> GetLastSyncWatermarkAsync()
+    protected virtual async Task<DateTime> GetLastSyncWatermarkAsync()
     {
         try
         {
@@ -353,7 +413,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
     /// <summary>
     /// 更新同步水位线
     /// </summary>
-    private async Task UpdateSyncWatermarkAsync(DateTime syncTime)
+    protected virtual async Task UpdateSyncWatermarkAsync(DateTime syncTime)
     {
         try
         {

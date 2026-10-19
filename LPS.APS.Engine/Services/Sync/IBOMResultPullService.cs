@@ -24,16 +24,25 @@ public interface IBOMResultPullService
     Task<int> PullBOMResultFromODSAsync(string batchNo, IReadOnlyList<int> planVersionIds, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 查找最近一个READY状态的批次号（用于NightlyBatchOrchestrator自动接货）
+    /// 校验**指定批次**是否已 READY（用于 NightlyBatchOrchestrator 自动接货）。
+    ///
+    /// 0号位 2026-10-17 §三.C：接货必须按「本次夜间那一个批号」校验，
+    /// `WHERE BatchNo = @expectedBatchNo AND Status = 'READY'` —— **不再查「任意最新 READY」**。
+    /// 批号由 <see cref="BomNightBatchIdentity"/> 从推送成功日志唯一解析；解析不出则不接货。
     /// </summary>
-    /// <returns>READY批次号，无则返回null</returns>
-    Task<string?> FindReadyBatchAsync(CancellationToken cancellationToken = default);
+    /// <param name="expectedBatchNo">本次夜间应接货的批号（必传；空/空白 ⇒ 直接返回 null，不做任何回落）</param>
+    /// <returns>该批号在 ODS 确为 READY 且展开行数 &gt; 0 时返回同一批号；否则 null</returns>
+    Task<string?> FindReadyBatchAsync(string expectedBatchNo, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 独立接货：查找最近 READY 批次并接货（与 NightlyBatchOrchestrator 解耦，供白天补接货 / 联调单独触发）。
-    /// 等价于 FindReadyBatchAsync → PullBOMResultFromODSAsync 的串联封装；无 READY 批次时返回空结果（不抛异常）。
+    /// 独立接货：接**本次夜间**的批次（与 NightlyBatchOrchestrator 解耦，供白天补接货 / 联调单独触发）。
+    ///
+    /// 批号来源与夜间链一致：<see cref="BomNightBatchResolver"/> 从推送成功日志唯一解析；
+    /// 解析不出则不接货（**不回落「任意最新 READY」**，0号位 2026-10-17 §三.C）。
+    /// 无可用批次时返回空结果（不抛异常）。
     /// </summary>
     /// <param name="planVersionIds">本批全部 Domain 的 PlanVersionID 集合（供 OrderBomRequestLink 映射，禁止内部猜测）</param>
+    /// <param name="expectedBatchNo">显式指定批号（联调/补接货用）；为 null 时按本次夜间唯一推送记录解析</param>
     /// <param name="cancellationToken">取消令牌</param>
-    Task<BOMIntakeResult> IntakeLatestReadyBatchAsync(IReadOnlyList<int> planVersionIds, CancellationToken cancellationToken = default);
+    Task<BOMIntakeResult> IntakeNightBatchAsync(IReadOnlyList<int> planVersionIds, string? expectedBatchNo = null, CancellationToken cancellationToken = default);
 }

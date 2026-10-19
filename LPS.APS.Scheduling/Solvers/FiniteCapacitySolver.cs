@@ -154,6 +154,14 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
             ExplanationFacts = finalResult.ExplanationFacts,
             // B.2：透传 Phase5 导出的求解过程追溯 —— 此前重组装漏拷，会静默丢弃 2号位 r13494 落地的 SolveTraceNotes 载体
             SolveTraceNotes = finalResult.SolveTraceNotes,
+            // §④⑤⑨：透传 Phase5 构建的 Demand 级时间事实 —— **同一类漏拷缺陷的第二次实例**（与上一行
+            //   SolveTraceNotes 同因）：`PhaseFiveCompression.cs:210` 已由 `StageTimingNodeBuilder.Build`
+            //   构建 `DemandCompletions`，但本重组装未拷贝 ⇒ `SolveAsync`（唯一端到端入口）返回的
+            //   `DemandCompletions` **恒为空**，`DEMAND_COMPLETION_TIME_UNAVAILABLE` /
+            //   `STAGE_TIMING_PATH_UNDETERMINED` 留痕所指的**时间事实载体被静默丢弃**。
+            //   实测证据：`OperationPlanningModeContractTests.R2F_10` / `R2F_11` 整改前红（集合为空）。
+            //   ⚠ 只补透传，不改任何取值语义；载体在 Core（2号位 落），值由 1号位 填。
+            DemandCompletions = finalResult.DemandCompletions,
             Summary = new SolveSummary
             {
                 TotalDrafts = finalResult.Summary.TotalDrafts,

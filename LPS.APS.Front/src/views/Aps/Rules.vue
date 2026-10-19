@@ -11,7 +11,7 @@
  * 角色矩阵：
  *  - VIEWER / PMC              只读
  *  - RULE_ADMIN                可查看详情、提交校验
- *  - RULE_PUBLISHER / SYSTEM   可发布 / 退役
+ *  - RULE_PUBLISHER / SYSTEM   可发布 / 停用
  */
 
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -22,9 +22,12 @@ import { useRulesStore } from '@/store/modules/aps/rules'
 import {
   RULE_STATUS_LABELS,
   RULE_STATUS_TAG,
-  RULE_STATUSES,
+  NO_VERSION,
+  NO_VERSION_LABEL,
+  RULE_STATUSES_UI,
   roleLabelOf,
   type RuleStatus,
+  type RuleSetSummaryDto,
   type BlockKey,
   BLOCK_KEYS
 } from '@/api/aps-v1'
@@ -58,10 +61,11 @@ const rulesStore = useRulesStore()
 const {
   filteredRuleSets,
   statusCounts,
+  noVersionCount,
   currentDetail,
   currentDiff,
   lastPublish,
-  lastRetire,
+  lastDisable,
   statusFilter,
   loading,
   listLoading,
@@ -131,10 +135,20 @@ type TabKey = 'parameters' | 'segments' | 'strategy' | 'diff' | 'history'
 const activeTab = ref<TabKey>('parameters')
 
 /* ===== 操作 ===== */
-async function selectRuleSet(ruleSetId: number): Promise<void> {
+/** 选中的规则集没有任何版本时的占位（右侧空态用；避免抛红条 + 外露内部 ID） */
+const noVersionPicked = ref<RuleSetSummaryDto | null>(null)
+
+async function selectRuleSet(ruleSet: RuleSetSummaryDto): Promise<void> {
+  noVersionPicked.value = null
   rulesStore.reset()
   activeTab.value = 'parameters'
-  await rulesStore.loadDetail(ruleSetId)
+  // 无版本的规则集必然加载不出内容（published-version 404 → versions 空数组），
+  // 与其让用户看一条报错红条，不如直接告诉他「这个还没配版本」
+  if (!ruleSet.hasVersion) {
+    noVersionPicked.value = ruleSet
+    return
+  }
+  await rulesStore.loadDetail(ruleSet.ruleSetId)
 }
 
 async function onValidate(): Promise<void> {
@@ -229,23 +243,23 @@ async function onPublish(): Promise<void> {
   if (ok) publishDialog.value = false
 }
 
-/* ===== Retire Dialog ===== */
-const retireDialog = ref(false)
-const retireForm = ref({ reason: '' })
+/* ===== Disable Dialog ===== */
+const disableDialog = ref(false)
+const disableForm = ref({ reason: '' })
 
-function openRetireDialog(): void {
-  retireForm.value = { reason: '' }
-  retireDialog.value = true
+function openDisableDialog(): void {
+  disableForm.value = { reason: '' }
+  disableDialog.value = true
 }
-async function onRetire(): Promise<void> {
+async function onDisable(): Promise<void> {
   if (!detailNN.value) return
-  const reason = retireForm.value.reason.trim()
+  const reason = disableForm.value.reason.trim()
   if (!reason) {
-    rulesStore.handleError(new Error('请填写退役原因'))
+    rulesStore.handleError(new Error('请填写停用原因'))
     return
   }
-  await rulesStore.retire(detailNN.value.summary.ruleSetId, reason)
-  if (!error.value) retireDialog.value = false
+  await rulesStore.disable(detailNN.value.summary.ruleSetId, reason)
+  if (!error.value) disableDialog.value = false
 }
 
 /* ===== [保存草稿] Dialog（Step 4） ===== */
@@ -382,25 +396,31 @@ onBeforeRouteLeave(async () => {
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
-    <!-- ===== KPI 横条（v1.4 §二十 6 态；仅显示非零状态） ===== -->
+    <!-- ===== KPI 横条（UI 流程 3 态子集；后端 6 态为 DDL 冻结但前端无 submit/approve/archive 入口） ===== -->
     <div class="kpi-strip">
       <div class="kpi-pill">
         <span class="pill-label">规则集总数</span>
         <span class="pill-val">{{ rulesStore.ruleSets.length }}</span>
       </div>
-      <div v-for="key in RULE_STATUSES" :key="key" class="kpi-pill">
+      <div v-for="key in RULE_STATUSES_UI" :key="key" class="kpi-pill">
         <span class="pill-label">{{ RULE_STATUS_LABELS[key] }}</span>
         <span class="pill-val">{{ statusCounts[key] ?? 0 }}</span>
       </div>
+      <!-- 「未配版本」是 6 态之外的正交计数：这些规则集一条版本都没有，点开必然加载不出内容 -->
+      <div class="kpi-pill">
+        <span class="pill-label">{{ NO_VERSION_LABEL }}</span>
+        <span class="pill-val">{{ noVersionCount }}</span>
+      </div>
     </div>
 
-    <!-- ===== 状态过滤（v1.4 §二十 6 态） ===== -->
+    <!-- ===== 状态过滤（UI 流程 3 态子集；与 KPI 一致） ===== -->
     <div class="filter-row">
       <ElRadioGroup v-model="statusFilter" @change="setFilter">
         <ElRadioButton label="ALL">全部</ElRadioButton>
-        <ElRadioButton v-for="key in RULE_STATUSES" :key="key" :label="key">
-          {{ key }}
+        <ElRadioButton v-for="key in RULE_STATUSES_UI" :key="key" :label="key">
+          {{ RULE_STATUS_LABELS[key] }}
         </ElRadioButton>
+        <ElRadioButton :label="NO_VERSION">{{ NO_VERSION_LABEL }}</ElRadioButton>
       </ElRadioGroup>
     </div>
 
@@ -427,12 +447,16 @@ onBeforeRouteLeave(async () => {
               published: r.status === 'PUBLISHED',
               disabled: r.status === 'DISABLED'
             }"
-            @click="selectRuleSet(r.ruleSetId)"
+            @click="selectRuleSet(r)"
           >
             <div class="rs-head">
               <span class="rs-code">{{ r.ruleSetCode }}</span>
-              <ElTag :type="RULE_STATUS_TAG[r.status]" size="small" effect="dark">
-                {{ RULE_STATUS_LABELS[r.status] }}
+              <ElTag
+                :type="r.hasVersion ? RULE_STATUS_TAG[r.status] : 'info'"
+                size="small"
+                effect="dark"
+              >
+                {{ r.hasVersion ? RULE_STATUS_LABELS[r.status] : NO_VERSION_LABEL }}
               </ElTag>
             </div>
             <div class="rs-name">{{ r.ruleSetName }}</div>
@@ -454,7 +478,13 @@ onBeforeRouteLeave(async () => {
 
       <!-- ===== 右：详情 ===== -->
       <ElCard class="panel right-panel">
-        <template v-if="!currentDetail">
+        <template v-if="noVersionPicked">
+          <ElEmpty
+            :description="`「${noVersionPicked.ruleSetName}」还没有配任何版本，现在没有内容可看。`"
+          />
+        </template>
+
+        <template v-else-if="!currentDetail">
           <ElEmpty description="从左侧选择一个规则集" />
         </template>
 
@@ -490,14 +520,14 @@ onBeforeRouteLeave(async () => {
                 <Icon icon="vi-mdi:rocket-launch" /> 发布
               </ElButton>
               <ElButton
-                v-if="actions.canRetire"
+                v-if="actions.canDisable"
                 type="danger"
                 size="small"
                 plain
                 :disabled="!canPublishAction"
-                @click="openRetireDialog"
+                @click="openDisableDialog"
               >
-                <Icon icon="vi-mdi:archive" /> 退役
+                <Icon icon="vi-mdi:archive" /> 停用
               </ElButton>
             </div>
           </div>
@@ -532,8 +562,8 @@ onBeforeRouteLeave(async () => {
               {{ detailNN.summary.lastChangeReason || '（无）' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem v-if="!canPublishAction && canWrite" label="权限" :span="3">
-              <ElTag type="warning" size="small">当前账号无发布/退役权限</ElTag>
-              <span class="msg-line">如需发布或退役，请联系系统管理员授予相应权限</span>
+              <ElTag type="warning" size="small">当前账号无发布/停用权限</ElTag>
+              <span class="msg-line">如需发布或停用，请联系系统管理员授予相应权限</span>
             </ElDescriptionsItem>
           </ElDescriptions>
 
@@ -732,7 +762,7 @@ onBeforeRouteLeave(async () => {
                   修改需通过 StrategyController，本页只展示结果。
                 </ElAlert>
                 <ElButton type="primary" @click="$router.push('/aps/strategy-profile')">
-                  打开独立策略配置 →
+                  打开策略包版本 →
                 </ElButton>
               </div>
               <ElDescriptions :column="2" size="small" border>
@@ -916,19 +946,19 @@ onBeforeRouteLeave(async () => {
             </ElDescriptions>
           </ElCard>
 
-          <ElCard v-if="lastRetire" class="result-card retire-card">
+          <ElCard v-if="lastDisable" class="result-card disable-card">
             <template #header>
               <span>
                 <Icon icon="vi-mdi:archive" />
-                最近退役结果
+                最近停用结果
               </span>
             </template>
             <ElDescriptions :column="3" size="small" border>
-              <ElDescriptionsItem label="规则集">{{ lastRetire.ruleSetCode }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="退役版本">v{{ lastRetire.version }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="操作者">{{ lastRetire.actor }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="退役时间" :span="3">
-                {{ dayjs(lastRetire.retiredAt).format('YYYY-MM-DD HH:mm:ss') }}
+              <ElDescriptionsItem label="规则集">{{ lastDisable.ruleSetCode }}</ElDescriptionsItem>
+              <ElDescriptionsItem label="停用版本">v{{ lastDisable.version }}</ElDescriptionsItem>
+              <ElDescriptionsItem label="操作者">{{ lastDisable.actor }}</ElDescriptionsItem>
+              <ElDescriptionsItem label="停用时间" :span="3">
+                {{ dayjs(lastDisable.retiredAt).format('YYYY-MM-DD HH:mm:ss') }}
               </ElDescriptionsItem>
             </ElDescriptions>
           </ElCard>
@@ -1001,10 +1031,10 @@ onBeforeRouteLeave(async () => {
       </template>
     </ElDialog>
 
-    <!-- ===== Retire Dialog ===== -->
+    <!-- ===== Disable Dialog ===== -->
     <ElDialog
-      v-model="retireDialog"
-      title="退役已发布规则集"
+      v-model="disableDialog"
+      title="停用已发布规则集"
       width="480px"
       :close-on-click-modal="false"
     >
@@ -1012,29 +1042,29 @@ onBeforeRouteLeave(async () => {
         <ElFormItem label="规则集">
           <span class="d-val">{{ detailNN?.summary.ruleSetCode }}</span>
         </ElFormItem>
-        <ElFormItem label="退役版本">v{{ detailNN?.summary.currentVersion }}</ElFormItem>
-        <ElFormItem label="退役原因 (必填)">
+        <ElFormItem label="停用版本">v{{ detailNN?.summary.currentVersion }}</ElFormItem>
+        <ElFormItem label="停用原因 (必填)">
           <ElInput
-            v-model="retireForm.reason"
+            v-model="disableForm.reason"
             type="textarea"
             :rows="3"
             placeholder="必须填写；将出现在审计记录"
           />
         </ElFormItem>
-        <ElAlert type="error" :closable="false" show-icon class="d-alert">
-          <template #title>退役后不可恢复</template>
-          退役后规则集进入只读状态；如需恢复，需基于此版本重新创建草稿。
+        <ElAlert type="warning" :closable="false" show-icon class="d-alert">
+          <template #title>停用前请确认</template>
+          停用后规则集进入只读状态，排程引擎不再读取该版本；如需恢复，可基于此版本新建草稿，或联系系统管理员重新发布。
         </ElAlert>
       </ElForm>
       <template #footer>
-        <ElButton @click="retireDialog = false">取消</ElButton>
+        <ElButton @click="disableDialog = false">取消</ElButton>
         <ElButton
           type="danger"
           :loading="actionRunning"
           :disabled="!canPublishAction"
-          @click="onRetire"
+          @click="onDisable"
         >
-          确认退役
+          确认停用
         </ElButton>
       </template>
     </ElDialog>
@@ -1492,7 +1522,7 @@ onBeforeRouteLeave(async () => {
     border: 1px solid #86efac;
   }
 
-  &.retire-card {
+  &.disable-card {
     background: #fef2f2;
     border: 1px solid #fca5a5;
   }

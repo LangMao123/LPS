@@ -62,7 +62,7 @@ public class AuditLogRepository : IAuditLogRepository
             await _context.AuditLogs.AddAsync(new AuditLog
             {
                 ActionCode = "PROBE",
-                OccurredAt = DateTime.UtcNow,
+                OccurredAt = DateTime.Now,
                 Remark = "EnsureWritableAsync 写探针（事务内回滚，零留痕）。",
             }, cancellationToken);
             await _context.SaveChangesAsync(cancellationToken);

@@ -72,6 +72,8 @@ const {
   severityCounts,
   totalFacts,
   factsByObjectType,
+  unrecognizedObjectTypeFacts,
+  unrecognizedRawObjectTypes,
   businessFactIssues,
   businessFactIssuesTotal,
   businessFactIssuesPage,
@@ -272,6 +274,47 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+      <!-- 待核对：未入字典的 ObjectType（5号位 10-12 §二；Q1 DEMAND 待 0号位 最终确认） -->
+      <ElAlert
+        v-if="unrecognizedObjectTypeFacts.length"
+        type="info"
+        :closable="false"
+        show-icon
+        class="unrecognized-alert"
+      >
+        <template #title>
+          <span>
+            待核对：以下事实的 ObjectType 未在冻结字典（{{
+              unrecognizedRawObjectTypes.join('、')
+            }}）
+          </span>
+        </template>
+        <div class="fact-list">
+          <div
+            v-for="f in unrecognizedObjectTypeFacts"
+            :key="f.factId"
+            class="fact-item"
+            :class="{ error: f.severity === 'ERROR' }"
+          >
+            <div class="fact-head">
+              <ElTag size="small" effect="plain"> 待核对·{{ f.objectType }} </ElTag>
+              <ElTag size="small" :type="EXPLANATION_SEVERITY_TAG[f.severity]">
+                {{ EXPLANATION_SEVERITY_LABELS[f.severity] }}
+              </ElTag>
+              <span class="fact-ref">{{ f.objectRef }}</span>
+              <ElTag size="small" type="primary" effect="plain">
+                {{ reasonLabel(f.reasonCode) }}
+              </ElTag>
+              <span v-if="f.impactHours && f.impactHours > 0" class="fact-impact">
+                {{ f.impactHours }}h
+              </span>
+            </div>
+            <div class="fact-time">
+              {{ dayjs(f.occurredAt).format('YYYY-MM-DD HH:mm') }}
+            </div>
+          </div>
+        </div>
+      </ElAlert>
     </ElCard>
 
     <!-- ===== 业务事实问题 + 重排建议（两列） ===== -->
@@ -519,6 +562,17 @@ onMounted(async () => {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 12px;
+}
+
+/* ===== 待核对：未入字典 ObjectType（5号位 10-12 §二） ===== */
+.unrecognized-alert {
+  margin-top: 12px;
+  .fact-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
 }
 
 .fact-group {

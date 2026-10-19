@@ -15,6 +15,15 @@ namespace LPS.APS.Engine.Services.Sync;
 /// </summary>
 public class OrderPromotionService : IOrderPromotionService
 {
+    /// <summary>
+    /// 提升 SP 的执行超时（秒）。
+    /// APS 连接串的 CommandTimeout 是 120 秒，对「数十万条 PENDING 全量校验 + MERGE」
+    /// 不够：2026-10-19 连续两次夜间批均在此处打满 120 秒超时（同批数据用 sqlcmd
+    /// 复跑仅 57～74 秒，差异来自会话 SET 选项导致计划不重用）。此处显式抬到 1800，
+    /// 与 <see cref="BomBatchExpandService"/> 的同类余量口径一致。
+    /// </summary>
+    private const int PromoteCommandTimeoutSeconds = 1800;
+
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<OrderPromotionService> _logger;
 
@@ -39,7 +48,8 @@ public class OrderPromotionService : IOrderPromotionService
                 "sp_ValidateAndPromoteOrders",
                 parameters,
                 CommandType.StoredProcedure,
-                DatabaseId.APS);
+                DatabaseId.APS,
+                PromoteCommandTimeoutSeconds);
 
             var promoted = parameters.Get<int>("@PromotedCount");
             var failed = parameters.Get<int>("@FailedCount");

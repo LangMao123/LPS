@@ -436,6 +436,42 @@ internal sealed class ResourceProductTimeline
         // COW：同上 —— 任何写入前先确保该 list 为本实例独有
         var list = Mutable(resourceId);
 
+        // ── 2026-10-19 性能整改：本列表**按 `End` 升序**（唯一写入方 <see cref="Place"/> 即二分插入），
+        //   故用**同比较器二分**定位 `End == occEnd` 的**首段**，取代整表线性扫描。
+        //   实测（2026-10-19 基准 `正式基准_规模扫描_热点定位`，resources=16 / FinalTask=11,124）：
+        //   `MergeBatchDetach` 热点 5,596 ms = ΣPhase 的 **11.3%** 几乎全部来自下面那趟线性扫描 ——
+        //   本方法在该档被调用约 **252,000** 次 × 每资源约 700 条登记 ≈ **1.76 亿次**比较。
+        //
+        //   ⚠ 三重证据齐备才认二分结果，否则**回落**原线性扫描（语义逐字不变，只影响快慢）：
+        //     ① `lo` 命中 `End == occEnd`；
+        //     ② `lo` 确为**首个** `End >= occEnd`（即 `lo == 0 || list[lo-1].End != occEnd`）；
+        //     ③ 只在 `End == occEnd` 的**连续段内**前扫找 `MaterialId` —— 该段覆盖了全部同 `End` 条目
+        //        ⇒ 段内没有就是全表没有，可安全提前返回（与线性扫描的「第一条匹配」语义一致）。
+        //   任一条不成立（例如某处破坏了有序不变式）⇒ 退回线性扫描，结果**逐字不变**。
+        int lo = 0, hi = list.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (list[mid].End < occEnd) lo = mid + 1;
+            else hi = mid;
+        }
+
+        if (lo < list.Count
+            && list[lo].End == occEnd
+            && (lo == 0 || list[lo - 1].End != occEnd))
+        {
+            for (int i = lo; i < list.Count && list[i].End == occEnd; i++)
+            {
+                if (list[i].MaterialId == materialId)
+                {
+                    list.RemoveAt(i);
+                    return;
+                }
+            }
+
+            return;
+        }
+
         for (int i = 0; i < list.Count; i++)
         {
             if (list[i].End == occEnd && list[i].MaterialId == materialId)

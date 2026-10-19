@@ -36,11 +36,24 @@ public static class QuantityReconciliation
         IReadOnlyDictionary<string, decimal> ScheduledQtyByDemandKey,
         int UnmappedShareCount);
 
-    /// <summary>Run 级三量对账结果（对应 B10 写入 `ObjectType='DOMAIN'` 的那一行）。</summary>
+    /// <summary>
+    /// Run 级三量对账结果（对应 B10 写入 `ObjectType='DOMAIN'` 的那一行）。
+    ///
+    /// 【`UnscheduledQtyTotal` 与 `UnreportedRemainderQty` 必须分开看】
+    ///   · `UnscheduledQtyTotal` = **1号位 报上来的** `UnscheduledTasks` 逐条的 `max(Q−S,0)` 之和。
+    ///     它只覆盖「1号位 主动报未排程」的集合，**不等于本 Run 的全部未排净量**。
+    ///   · `UnreportedRemainderQty` = **未报未排程**的需求的 `max(Q−S,0)` 之和
+    ///     （即 `MissingDemandKeys` ＋ `UnderScheduledDemandKeys` 两族对应的量）。
+    ///   · 两者相加才是「全部未排净量」：`UnscheduledQtyTotal + UnreportedRemainderQty`
+    ///     ＝ `DemandNetQtyTotal − ScheduledQtyTotal`（在无越域份额时严格成立）。
+    ///   ⇒ 只拿 `UnscheduledQtyTotal` 当「未排量」会把 ③ 两族（凭空蒸发／部分已排未报）**漏记**，
+    ///     这正是 2026-10-19 复核发现的 DOMAIN 行口径问题。
+    /// </summary>
     public sealed record RunLevelReconciliation(
         decimal DemandNetQtyTotal,
         decimal ScheduledQtyTotal,
         decimal UnscheduledQtyTotal,
+        decimal UnreportedRemainderQty,
         decimal DeltaQty,
         int DemandCount,
         int ScheduledDemandCount,
@@ -52,13 +65,19 @@ public static class QuantityReconciliation
     /// <summary>
     /// 单个需求的未排净量：`max(需求净量 − 已排份额, 0)`，并给出重叠标记。
     /// `OverlapDetected=true` ⇒ 该需求**部分已排**却仍被 1号位 列为未排程，「整单记账」假定被打破。
+    ///
+    /// 【判据为何是 `已排 &gt; 0 且 剩余 &gt; 0` 而不是只看「已排 &gt; 0」】
+    ///   重叠的语义前提是「**还欠量**却同时出现在两侧」。若 `已排 ≥ 需求净量`，该需求**已排满**
+    ///   （剩余被截为 0），此时它出现在 `UnscheduledTasks` 里属「1号位 报了一条 U=0 的未排程」，
+    ///   是上游回执口径问题，**不是重叠**。旧判据 `scheduled &gt; 0` 会把这类 U=0 行打成重叠，
+    ///   再叠加落库侧 `Severity='ERROR'` ⇒ 「已排满」被读成「异常」。
     /// </summary>
     public static (decimal UnscheduledQty, bool OverlapDetected) PerDemandRemaining(
         decimal netOutputQty, decimal scheduledShareQty)
     {
         var remaining = netOutputQty - scheduledShareQty;
         if (remaining < 0m) remaining = 0m;
-        return (remaining, scheduledShareQty > 0m);
+        return (remaining, scheduledShareQty > 0m && remaining > 0m);
     }
 
     /// <summary>
@@ -100,6 +119,9 @@ public static class QuantityReconciliation
 
     /// <summary>
     /// Run 级三量对账：`Δ = 需求净量Σ − (已排净量Σ + 未排净量Σ)`。
+    /// **Δ 的作用是「报警」不是「未排量」**：它按 1号位 报上来的未排程集合算 U，故 Δ≠0 恰说明
+    /// 有需求没被报到；其中「未报未排程」的那部分量由 `UnreportedRemainderQty` 显性给出。
+    /// 读「本 Run 到底还有多少没排」必须用 `UnscheduledQtyTotal + UnreportedRemainderQty`。
     /// Δ≠0 或任一清单非空 ⇒ 恒等式未闭合（调用方据此置 `Severity='ERROR'`）。**本函数不抛、不阻断**
     /// （PM 2026-09-11 硬口径：记账差异不得反过来阻断落库）。
     /// </summary>
@@ -125,12 +147,17 @@ public static class QuantityReconciliation
 
         var missing = new List<string>();
         var underScheduled = new List<string>();
+        var unreportedRemainderQty = 0m;
 
         foreach (var kv in netByDemandKey)
         {
             var key = kv.Key;
             scheduledQtyByDemandKey.TryGetValue(key, out var scheduled);
             if (unscheduledKeys.Contains(key)) continue;   // 已报未排程 ⇒ 由 ②/未排净量 管辖
+
+            // 未报未排程的需求：其剩余量**不进** `UnscheduledQtyTotal`（那只统计 1号位 报上来的集合），
+            // 但必须单独计量 —— 否则 Run 级「未排量」会整族漏掉 Missing/UnderScheduled 两类需求。
+            unreportedRemainderQty += PerDemandRemaining(kv.Value, scheduled).UnscheduledQty;
 
             if (scheduled <= 0m)
             {
@@ -164,6 +191,7 @@ public static class QuantityReconciliation
             DemandNetQtyTotal: demandNetQtyTotal,
             ScheduledQtyTotal: scheduledQtyTotal,
             UnscheduledQtyTotal: unscheduledQtyTotal,
+            UnreportedRemainderQty: unreportedRemainderQty,
             DeltaQty: demandNetQtyTotal - (scheduledQtyTotal + unscheduledQtyTotal),
             DemandCount: netByDemandKey.Count,
             ScheduledDemandCount: scheduledQtyByDemandKey.Count,

@@ -45,6 +45,56 @@ internal static class SolverDiagnostics
         /// <summary>`CloneShares` 调用次数（每次重建全量份额字典，O(N)）。</summary>
         public long CloneShares;
 
+        /// <summary>
+        /// 2026-10-19 性能定位：`TryMergeDemandIntoStageBatch` 摘除段累计摘除的 Task 数 **Σk**
+        ///   （= Σ|锚批|）。与 <see cref="DetachListLen"/> 一起算出「每次调用摘几个 / 列表多长」，
+        ///   用于判定「逐个 `RemoveAt` 的搬移量 ≈ k·n/2」到底是不是耗时主因。纯观测。
+        /// </summary>
+        public long DetachTaskCount;
+
+        /// <summary>
+        /// 2026-10-19 性能定位：摘除时 `scheduledTasks` 的累计长度 **Σn**。纯观测。
+        /// </summary>
+        public long DetachListLen;
+
+        /// <summary>
+        /// 2026-10-19 二次定位：摘除段**回落全表扫描**的次数。与
+        ///   <see cref="DetachIndexBuild"/> 热点次数一起算命中率 ——
+        ///   若命中率低，说明「预建下标表」优化没吃到，129.6 µs/次 是 O(n) 扫描而非 O(k) 定位。纯观测。
+        /// </summary>
+        public long DetachFallbackCount;
+
+        /// <summary>2026-10-19 二次定位：回落原因 ①——**根本没有下标表**（`taskIndexById == null`）。纯观测。</summary>
+        public long DetachFallbackNoIndex;
+
+        /// <summary>2026-10-19 二次定位：回落原因 ②——锚批 Task 的 `FinalDraftId` 为 null。纯观测。</summary>
+        public long DetachFallbackNullId;
+
+        /// <summary>2026-10-19 二次定位：回落原因 ③——**下标表里查不到**该 `FinalDraftId`（或下标越界/回读不符）。纯观测。</summary>
+        public long DetachFallbackMissing;
+
+        /// <summary>2026-10-19 二次定位：回落原因 ④——同一批内**下标重复**（`seenPositions.Add` 失败）。纯观测。</summary>
+        public long DetachFallbackDupPos;
+
+        /// <summary>
+        /// 2026-10-19 二次定位：`BuildTaskIndexById` **实际被调用**的次数。设计上每个 `RunBatchPlan` 只建一次
+        ///   （`??=` 缓存）；若该读数远大于 `RunBatchPlan` 调用次数 ⇒ 说明它**返回了 null** ⇒ `??=` 缓存失效、
+        ///   每个候选都重建一次 O(N) 表（既浪费建表时间，又让摘除段永远走全表扫描）。纯观测。
+        /// </summary>
+        public long TaskIndexBuilds;
+
+        /// <summary>2026-10-19 二次定位：`BuildTaskIndexById` **返回 null** 的次数（表内出现 null 或重复 `FinalDraftId`）。纯观测。</summary>
+        public long TaskIndexNullResults;
+
+        /// <summary>2026-10-19 二次定位：`RunBatchPlan` 的**总调用次数**（两个调用点：`:833` 多批路径 + `:1624` 批方案候选）。纯观测。</summary>
+        public long RunBatchPlanInvocations;
+
+        /// <summary>
+        /// 2026-10-19 二次定位：进入 `TryMergeOrSchedule` 的 Stage 合批分支（`operations.Count &gt; 1`）时
+        ///   **`taskIndexById` 为 null** 的次数 ⇒ 直接指出是**哪条调用路径**没拿到索引。纯观测。
+        /// </summary>
+        public long MergeStageEnteredWithNullIndex;
+
         /// <summary>时间槽搜索次数（正排 `FindFirstAvailableSlot` + 倒排 `FindBackwardSlot`）。</summary>
         public long SlotSearches;
 
@@ -200,17 +250,31 @@ internal static class SolverDiagnostics
         // ══════════════════════════════════════════════════════════════════
         private readonly long[] _hotspotTicks = new long[HotspotCount];
 
+        /// <summary>
+        /// 2026-10-19 性能定位：各热点的**调用次数**（与 <see cref="_hotspotTicks"/> 同索引）。
+        ///   有次数才能把「累计 ms」换算成「每次多少 µs」——判定「是不是单次开销过大」必须靠它。
+        /// </summary>
+        private readonly long[] _hotspotCalls = new long[HotspotCount];
+
         /// <summary>热点数量（= <c>SolverDiagnostics.Hotspot</c> 枚举项数）。</summary>
-        public const int HotspotCount = 8;
+        public const int HotspotCount = 16;
 
         internal void AddHotspotTicks(int hotspot, long ticks)
         {
-            if ((uint)hotspot < HotspotCount) _hotspotTicks[hotspot] += ticks;
+            if ((uint)hotspot < HotspotCount)
+            {
+                _hotspotTicks[hotspot] += ticks;
+                _hotspotCalls[hotspot]++;
+            }
         }
 
         /// <summary>取热点累计耗时（ms）。</summary>
         public double HotspotMs(int hotspot)
             => _hotspotTicks[hotspot] * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        /// <summary>2026-10-19 性能定位：取热点**调用次数**（配合 <see cref="HotspotMs"/> 算每次耗时）。</summary>
+        public long HotspotCallCount(int hotspot)
+            => (uint)hotspot < HotspotCount ? _hotspotCalls[hotspot] : 0L;
     }
 
     /// <summary>热点标识（索引须与 <see cref="Counters.HotspotCount"/> 对齐）。</summary>
@@ -232,6 +296,49 @@ internal static class SolverDiagnostics
         public const int DemandSchedule = 6;
         /// <summary>Phase4 传播循环整体。</summary>
         public const int Phase4Propagation = 7;
+        /// <summary>
+        /// `FindMergeableStageBatches` 首段「按 `ExecutionBatchDraftKey` 把**全量** `scheduledTasks` 重新分组」
+        ///   （O(N) 扫描 + 每个批键一个 `List` 的分配）。该段在**每个 Routing 候选试跑**里被整表重建一次
+        ///   ⇒ 实测是 `DemandSchedule` 热点里最大的**未埋点**成本（2026-10-19 定位）。
+        /// </summary>
+        public const int BatchGroupIndex = 8;
+        /// <summary>`ScheduleDemandOperations`（单条需求全部工序的完整排程；`DemandSchedule` 的最大子项）。</summary>
+        public const int ScheduleDemandOps = 9;
+        /// <summary>
+        /// `TryMergeDemandIntoStageBatch`（多工序 Stage 合批候选：移出锚批 → 以锚身份+两需求量之和**重跑完整链**）。
+        ///   在锚点循环内逐锚调用（`TryMergeOrSchedule` 的 `stageBatches` 擂台），实测 2026-10-19 单次求解
+        ///   调用 84,110 次（= `CloneOccupancy` 115,521 − `CloneTaskList` 31,411）。
+        /// </summary>
+        public const int TryMergeStageBatch = 10;
+        /// <summary>
+        /// `TryMergeDemandIntoStageBatch` 的**摘除段**：全量扫描 `scheduledTasks` 找锚批 Task（`ids.Contains`）
+        ///   + 逐个 `RemoveAt`（O(N) 内存搬移）+ 摘占用窗/时间线/份额。调用 84,110 次 ⇒ 约 9.4 亿次迭代。
+        /// </summary>
+        public const int MergeBatchDetach = 11;
+        /// <summary>
+        /// 2026-10-19 二次定位：`MergeBatchDetach` 的**第 1 段** —— **定位**锚批 Task 的下标
+        ///   （快路径 = 预建 `FinalDraftId → 下标` 表逐条查找；慢路径 = `ids` 全表扫描）
+        ///   + `removedTasks` 登记 + `CountDetachShape`。**不含** `RemoveAt` 搬移（见 <see cref="DetachRemoveAt"/>）。
+        /// </summary>
+        public const int DetachIndexBuild = 12;
+        /// <summary>
+        /// 2026-10-19 二次定位：摘除段的 **`RemoveAt` 搬移循环**（嵌套在 <see cref="DetachIndexBuild"/> 计时区间内，
+        ///   故本项已计入第 1 段总读数，此处只是**再切一刀**看「定位」与「搬移」各占多少）。
+        ///   形状实测：每次摘 k=3 个、列表 n≈10,568 ⇒ 理论搬移 ≈ k·n·8B ≈ 250 KB/次。
+        /// </summary>
+        public const int DetachRemoveAt = 13;
+        /// <summary>
+        /// 2026-10-19 二次定位：`MergeBatchDetach` 的**第 3 段**（逐 Task 摘占用窗 / 时间线登记 / 份额血缘）。
+        ///   ⚠ **已停用**，理由同 <see cref="DetachEnsureOwned"/>（实测 1,512 ms ≈ ΣPhase 的 1.7%）。
+        ///   ⚠ **已停用**：一次性定位已完成（实测 1,512 ms ≈ ΣPhase 的 1.7%，**不是**摘除段主体）。
+        ///   逐 Task 埋点自身开销会污染 `MergeBatchDetach` 总读数，故已从热路径移除。槽位保留以免全仓常量重新编号。
+        /// </summary>
+        public const int DetachBookkeeping = 14;
+        /// <summary>
+        /// 2026-10-19 二次定位：`MergeBatchDetach` 的**第 4 段** —— 收尾快照
+        ///   （`CaptureOccupancyResourceIds` + `occupancyInsertLog` + `ProductTimeline.Clone()`）。
+        /// </summary>
+        public const int DetachTail = 15;
     }
 
     private static readonly AsyncLocal<Counters?> Current = new();
@@ -314,6 +421,50 @@ internal static class SolverDiagnostics
     internal static void CountCloneShares()
     {
         if (Current.Value is { } c) c.CloneShares++;
+    }
+
+    /// <summary>2026-10-19 性能定位：累计摘除 Task 数 Σk 与摘除时列表长度 Σn。</summary>
+    internal static void CountDetachShape(int removedCount, int listLength)
+    {
+        if (Current.Value is { } c)
+        {
+            c.DetachTaskCount += removedCount;
+            c.DetachListLen += listLength;
+        }
+    }
+
+    /// <summary>2026-10-19 二次定位：`RunBatchPlan` 总调用次数。</summary>
+    internal static void CountRunBatchPlanInvocation()
+    {
+        if (Current.Value is { } c) c.RunBatchPlanInvocations++;
+    }
+
+    /// <summary>2026-10-19 二次定位：进 Stage 合批分支时无索引的次数。</summary>
+    internal static void CountMergeStageNoIndex()
+    {
+        if (Current.Value is { } c) c.MergeStageEnteredWithNullIndex++;
+    }
+
+    /// <summary>2026-10-19 二次定位：`BuildTaskIndexById` 调用次数 / 返回 null 次数。</summary>
+    internal static void CountTaskIndexBuild(bool nullResult)
+    {
+        if (Current.Value is not { } c) return;
+        c.TaskIndexBuilds++;
+        if (nullResult) c.TaskIndexNullResults++;
+    }
+
+    /// <summary>2026-10-19 二次定位：摘除段回落全表扫描次数（判「预建下标表」优化命中率）。</summary>
+    internal static void CountDetachFallback(int reason)
+    {
+        if (Current.Value is not { } c) return;
+        c.DetachFallbackCount++;
+        switch (reason)
+        {
+            case 0: c.DetachFallbackNoIndex++; break;
+            case 1: c.DetachFallbackNullId++; break;
+            case 2: c.DetachFallbackMissing++; break;
+            default: c.DetachFallbackDupPos++; break;
+        }
     }
 
     internal static void CountSlotSearch()

@@ -244,6 +244,72 @@ public class PiStageQuantityIndexTests
     }
 
     // ══════════════════════════════════════════════════════════════════
+    //  ④ 防串用反例（0号位 交付清单 ③：S1-02「消费索引和账本防串用」）
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **防串用（跨工厂）** —— S1-02 缺口的**消费侧表现**：
+    /// `PiStageQuantityBaseline` 无 `FactoryId`（0号位《正式回复 v2.0》S1-02；已核 `Core/Dto/DomainSolveRequest.cs`）
+    /// ⇒ **两个工厂同 `(PI, 物料, Stage)`** 的两条真实行，在本索引里**键完全相同** ⇒ 走**撞键摘除**
+    /// ⇒ 取上下文 `null` ⇒ 门禁 **Fail Closed**（显式未满足），**绝不静默用任一工厂的额度放行**。
+    /// ⚠ 这是**缺口在我方消费侧的兜底**：不是「已支持两工厂」，而是「两工厂载荷下**拒绝串用**」。
+    ///   补 `FactoryId` 归 2号位（Core）；补上后本用例期望应从「摘除」改为「各自独立可键控」。
+    /// </summary>
+    [Fact]
+    public void 防串用_两工厂同PI同物料同Stage_无FactoryId则撞键摘除_不静默串用()
+    {
+        // 两个工厂各一行；工厂身份在 Core DTO 里**无处可放** ⇒ 两行在索引键上退化为同一三元组。
+        var factoryA = Row(stageFree: 100m);
+        var factoryB = Row(stageFree: 7m);
+
+        var index = PhaseTwoInitialScheduler.BuildPiStageQuantityIndex(
+            new[] { factoryA, factoryB }, out var ambiguous);
+
+        Assert.Empty(index);                                   // 摘除，不取首条（否则会把 100 当成唯一额度）
+        Assert.Equal((PiNo, MaterialId, Stage), Assert.Single(ambiguous));
+        Assert.Null(PhaseTwoInitialScheduler.ResolvePiStageContext(index, PiNo, MaterialId, Stage));
+    }
+
+    /// <summary>
+    /// **防串用（跨 PI）**：同物料 / 同 Stage、**不同 PI 号** ⇒ 各自独立键控，
+    /// 按需求 PI 取上下文时**只取本 PI 的额度**，**绝不互借**。
+    /// 比单行 null 断言更强：索引里**确有**另一 PI 的同 Stage 行（若实现按「物料+Stage」而非三元组取 ⇒ 会取到 30）。
+    /// </summary>
+    [Fact]
+    public void 防串用_同物料同Stage不同PI_只取本PI额度_不互借()
+    {
+        var index = PhaseTwoInitialScheduler.BuildPiStageQuantityIndex(
+            new[]
+            {
+                Row(piNo: "PI-1", stageFree: 10m),
+                Row(piNo: "PI-2", stageFree: 30m)
+            },
+            out _);
+
+        Assert.Equal(10m, PhaseTwoInitialScheduler.ResolvePiStageContext(index, "PI-1", MaterialId, Stage)!.StageFreeEligibleQty);
+        Assert.Equal(30m, PhaseTwoInitialScheduler.ResolvePiStageContext(index, "PI-2", MaterialId, Stage)!.StageFreeEligibleQty);
+    }
+
+    /// <summary>
+    /// **防串用（跨物料）**：同 PI / 同 Stage、**不同物料** ⇒ 各自独立键控，**绝不互借**。
+    /// （索引里确有另一物料的同 Stage 行。）
+    /// </summary>
+    [Fact]
+    public void 防串用_同PI同Stage不同物料_只取本物料额度_不互借()
+    {
+        var index = PhaseTwoInitialScheduler.BuildPiStageQuantityIndex(
+            new[]
+            {
+                Row(materialId: 1, stageFree: 10m),
+                Row(materialId: 2, stageFree: 30m)
+            },
+            out _);
+
+        Assert.Equal(10m, PhaseTwoInitialScheduler.ResolvePiStageContext(index, PiNo, 1, Stage)!.StageFreeEligibleQty);
+        Assert.Equal(30m, PhaseTwoInitialScheduler.ResolvePiStageContext(index, PiNo, 2, Stage)!.StageFreeEligibleQty);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     //  ③ 端到端：投影段接上门禁后，生产形状的载荷能**放行**（今天从未执行过的那条路径）
     // ══════════════════════════════════════════════════════════════════
 

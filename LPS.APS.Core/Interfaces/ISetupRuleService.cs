@@ -63,13 +63,13 @@ public interface ISetupRuleService
     Task PublishAsync(long versionId, string? changeReason, int actorUserId, string actorUserCode, CancellationToken cancellationToken = default);
 
     /// <summary>主数据 Code→Id 读：部门下拉（Setup 三 Dialog 数据源；search 模糊 DeptCode；红线 #4 返回列表）</summary>
-    Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, int limit = 200, CancellationToken cancellationToken = default);
 
     /// <summary>主数据 Code→Id 读：设备下拉（Setup 三 Dialog 数据源；search 模糊 ResourceCode/ResourceName；红线 #4 返回列表）</summary>
-    Task<IReadOnlyList<ResourceLookupItem>> LookupResourcesAsync(string? search, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ResourceLookupItem>> LookupResourcesAsync(string? search, int limit = 200, CancellationToken cancellationToken = default);
 
     /// <summary>主数据 Code→Id 读：物料下拉（Setup 三 Dialog 数据源；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；红线 #4 返回列表）</summary>
-    Task<IReadOnlyList<MaterialLookupItem>> LookupMaterialsAsync(string? search, bool activeOnly = false, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<MaterialLookupItem>> LookupMaterialsAsync(string? search, bool activeOnly = false, int limit = 200, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// #10 uncovered-stats：规则缺失（0 分钟兜底）命中频次聚合（v1.4 §十一 KPI 监控）。

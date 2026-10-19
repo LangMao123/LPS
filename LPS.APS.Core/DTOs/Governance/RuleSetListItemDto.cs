@@ -21,8 +21,12 @@ public class RuleSetListItemDto
     public DateTime? UpdatedAt { get; set; }
     public string? UpdatedBy { get; set; }
 
+    /// <summary>最新 PUBLISHED 版本标识（C-4 身份补全：准确 VersionId；无版本则 null）</summary>
+    public long? CurrentVersionId { get; set; }
     /// <summary>最新 PUBLISHED 版本编码（如 V1 / RS-DEMO-V2；无则为 null）</summary>
     public string? CurrentVersionCode { get; set; }
+    /// <summary>最新 DRAFT 版本标识（C-4 身份补全：准确 VersionId；无版本则 null）</summary>
+    public long? DraftVersionId { get; set; }
     /// <summary>最新 DRAFT 版本编码（无则为 null）</summary>
     public string? DraftVersionCode { get; set; }
     /// <summary>最新版本状态（六态：DRAFT/SUBMITTED/APPROVED/PUBLISHED/DISABLED/ARCHIVED；无版本则 null）</summary>

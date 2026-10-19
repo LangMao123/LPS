@@ -26,8 +26,12 @@ export const scheduleApi = {
   /** 指定版本的甘特图数据（@owner 5号位 中转 2号位 ScheduleResult） */
   async getGantt(planVersionId: number): Promise<GanttDataDto> {
     if (APS_USE_MOCK) return mockGantt(planVersionId)
+    // 10-12 RC21：30s 超时保护，dev 后端 gantt/143 第二次卡死不再拖死前端
+    // - 兜底：store handleError 接 ApiError，ElMessage 提示；不静默吞
+    // - 与 loadCurrent 内 Promise.allSettled 不冲突（getGantt 自身先超时抛错）
     return apsHttp.get<GanttDataDto>({
-      url: `/api/schedule/gantt/${planVersionId}`
+      url: `/api/schedule/gantt/${planVersionId}`,
+      timeout: 30_000
     })
   },
 

@@ -30,8 +30,8 @@ namespace LPS.APS.Tests.Unit;
 ///   裁词（0号位《APS_V1_2_20261010.md》§3 AUD-1-004）：冻结 B-001/B-006 —— 生效规则按
 ///     `MaterialId + **明确** ProductionDepartmentId` **精确匹配**；历史 `NULL` 部门只作**兼容**，
 ///     **不得**在 Solver 里重新变成「Material 级默认」。
-///   真实装载侧同口径：3号位 `TaskSplitRuleConfigProjector.Project` 已按 v5.1.10 收口④
-///     **排除** `ProductionDepartmentId is null` 的行 ⇒ 快照里**不存在** NULL 部门规则。
+///   真实装载侧同口径：治理写路径 Create/Update 强制 `ProductionDepartmentId` 必填（v5.1.10 收口④），
+///     `TaskSplitRuleConfig` 表不存在 NULL 部门规则；⑧投影已退休、装载由 2号位 表直读。
 ///   ⇒ 夹具过去靠 NULL 行「覆盖任意部门」的写法**在真实数据下不成立**（那正是被判 P0 的兜底），
 ///     故本构造器改为**显式部门**：调用方必须传本夹具真实使用的部门号，
 ///     且被排需求必须带 `StartStageCode`（真实由 2号位 `FillStartStageCodes` 回填），

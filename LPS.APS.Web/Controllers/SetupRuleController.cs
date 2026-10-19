@@ -298,14 +298,14 @@ public class SetupRuleController : ControllerBase
 
     #region 主数据 Code→Id 读（Setup 三 Dialog 数据源；3号位 直接读源表，红线 #4 返回列表）
 
-    /// <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode）</summary>
+    /// <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/departments")]
-    public async Task<IActionResult> LookupDepartments([FromQuery] string? search, CancellationToken ct)
+    public async Task<IActionResult> LookupDepartments([FromQuery] string? search, CancellationToken ct, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupDepartmentsAsync(search, ct);
+            var data = await _setupRuleService.LookupDepartmentsAsync(search, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<DepartmentLookupItem>>.Success(data));
         }
         catch (Exception ex)
@@ -314,14 +314,14 @@ public class SetupRuleController : ControllerBase
         }
     }
 
-    /// <summary>设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName）</summary>
+    /// <summary>设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/resources")]
-    public async Task<IActionResult> LookupResources([FromQuery] string? search, CancellationToken ct)
+    public async Task<IActionResult> LookupResources([FromQuery] string? search, CancellationToken ct, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupResourcesAsync(search, ct);
+            var data = await _setupRuleService.LookupResourcesAsync(search, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<ResourceLookupItem>>.Success(data));
         }
         catch (Exception ex)
@@ -330,14 +330,14 @@ public class SetupRuleController : ControllerBase
         }
     }
 
-    /// <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动）</summary>
+    /// <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/materials")]
-    public async Task<IActionResult> LookupMaterials([FromQuery] string? search, CancellationToken ct, [FromQuery] bool activeOnly = false)
+    public async Task<IActionResult> LookupMaterials([FromQuery] string? search, CancellationToken ct, [FromQuery] bool activeOnly = false, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupMaterialsAsync(search, activeOnly, ct);
+            var data = await _setupRuleService.LookupMaterialsAsync(search, activeOnly, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<MaterialLookupItem>>.Success(data));
         }
         catch (Exception ex)

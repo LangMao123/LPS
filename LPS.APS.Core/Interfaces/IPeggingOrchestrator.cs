@@ -12,7 +12,9 @@ public interface IPeggingOrchestrator
 {
     /// <summary>
     /// 执行完整的 Pegging 流程（步骤2.1-2.8）
-    /// 1. 读 APS_BOM_RAW / APS_BOM_STAGE_PATH_RAW / APS_BOM_CROSS_FACTORY_EDGE_RAW
+    /// 1. 读 APS_BOM_RAW / APS_BOM_STAGE_PATH_RAW；
+    ///    跨厂边读 ODS 同义词 ext_MES_APS_BOM_Workset_CrossFactoryEdge
+    ///    （APS 库**无** APS_BOM_CROSS_FACTORY_EDGE_RAW 表，原注释所指为不存在的对象）
     /// 2. 读供给池（INVENTORY / WIP / PIPELINE / PRODUCTION_INSTRUCTION / PURCHASE_ORDER）
     /// 3. 按3号位 DemandPriorityConfig 排序 Demand
     /// 4. BOM 遍历 + 供给原子扣减（TryAtomicAllocation）

@@ -27,6 +27,18 @@ export interface RuleSetSummaryDto {
   /** 待发布 DRAFT 版本号（仅当 status=DRAFT 时存在） */
   draftVersion?: number
   status: RuleStatus
+  /**
+   * 是否存在版本行（10-14 增）
+   *
+   * 后端 `RuleSetListItemDto` 的 Status/CurrentVersionCode 等版本字段来自 RuleSetVersion 的
+   * OUTER APPLY，且 `Program.cs:94` 设了 `WhenWritingNull` —— 该 RuleSet **一条版本都没有**时，
+   * 这些 key 会整个从 JSON 里消失。故「status 缺失」= 「无任何版本」，是一个独立于 6 态的**正交布尔**，
+   * 不新增第 7 个 RuleStatus（v1.4 §二十 6 态是 DDL 冻结契约，不因前端展示需要而扩张）。
+   *
+   * 用途：无版本的规则集点开必然 404（published-version 无行 → versions 空数组），
+   * 列表要如实显示「未配版本」并让点击走空态，不能谎报「已发布」。
+   */
+  hasVersion: boolean
   lastChangeReason?: string
   createdAt: IsoDateTime
   publishedAt?: IsoDateTime
@@ -163,8 +175,8 @@ export interface PublishRuleResult {
   actor: string
 }
 
-/** 退役 Rule 输入 */
-export interface RetireRuleInput {
+/** 停用 Rule 输入 */
+export interface DisableRuleInput {
   ruleSetId: number
   version: number
   /** v1.4 §二十：3 号位 后端 /rule-set/version/{versionId}/disable 端点使用 */
@@ -174,8 +186,8 @@ export interface RetireRuleInput {
   actorRoles: RoleKey[]
 }
 
-/** 退役结果 */
-export interface RetireRuleResult {
+/** 停用结果 */
+export interface DisableRuleResult {
   ruleSetCode: string
   version: number
   retiredAt: IsoDateTime

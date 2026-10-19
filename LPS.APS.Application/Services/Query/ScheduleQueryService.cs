@@ -8,7 +8,8 @@ using Microsoft.Extensions.Logging;
 namespace LPS.APS.Application.Services.Query;
 
 /// <summary>
-/// 排程结果查询服务实现（3号位）
+/// 排程结果查询服务实现（**5号位**——头注原标「3号位」系历史署名，Owner 2026-10-19 裁定归属 5号位；
+/// 消费方 CandidateController/Governance 等仍属 3号位，其页面数据语义变化照常知会）
 ///
 /// 架构红线：
 ///   - 只读 APS_Production 库（已落盘数据），不触碰推演期内存沙盘
@@ -85,20 +86,43 @@ public class ScheduleQueryService : IScheduleQueryService
     public async Task<GanttDataDto> GetGanttAsync(
         int userId,
         int planVersionId,
+        DateTime? from = null,
+        DateTime? to = null,
+        IReadOnlyList<int>? resourceIds = null,
         CancellationToken cancellationToken = default)
     {
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var hasResources = resourceIds is { Count: > 0 };
 
-        // 1. 版本信息（含 DomainKey 做范围校验）
-        var version = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string VersionCode, string DomainKey, DateTime PlanHorizonStart, DateTime PlanHorizonEnd)>(
-            @"SELECT Id, VersionCode, DomainKey, PlanHorizonStart, PlanHorizonEnd
-              FROM PlanVersion WHERE Id = @Id",
+        // 1. 版本信息（含 DomainKey 做范围校验；同时取 Status / BasePlanVersionId 供前端区分版本类型）
+        var version = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string VersionCode, string DomainKey, DateTime PlanHorizonStart, DateTime PlanHorizonEnd, string Status, int? BasePlanVersionId)>(
+            @"SELECT pv.Id, pv.VersionCode, pv.DomainKey, pv.PlanHorizonStart, pv.PlanHorizonEnd,
+                     pv.Status,
+                     CASE WHEN pv.VersionCategory = 'CANDIDATE' OR pv.Status = 'ARCHIVED'
+                          THEN (
+                              SELECT TOP 1 b.Id
+                              FROM PlanVersion b
+                              WHERE b.DomainKey = pv.DomainKey
+                                AND b.Status = 'ARCHIVED'
+                                AND b.ActivatedAt <= pv.CreatedAt
+                              ORDER BY b.ActivatedAt DESC, b.Id DESC
+                          )
+                          ELSE NULL
+                     END AS BasePlanVersionId
+              FROM PlanVersion pv WHERE pv.Id = @Id",
             new { Id = planVersionId },
             db: DatabaseId.APS);
 
-        if (version.Id == 0 || !IsDomainAllowed(allowed, version.DomainKey))
+        if (version.Id == 0)
         {
-            return new GanttDataDto { PlanVersionId = planVersionId };
+            // 版本不存在：VersionExists=false（显式位，不靠 versionCode 空串隐式判断）
+            return new GanttDataDto { PlanVersionId = planVersionId, VersionExists = false, IsEmpty = true };
+        }
+
+        if (!IsDomainAllowed(allowed, version.DomainKey))
+        {
+            // 越权（fail-closed）：ScopeDenied=true，前端据此显示"无权限"而非"无数据"
+            return new GanttDataDto { PlanVersionId = planVersionId, VersionExists = true, ScopeDenied = true, IsEmpty = true };
         }
 
         // 2. 资源行（仅返回该版本里被 Task 使用到的资源，减少前端噪声）
@@ -120,17 +144,30 @@ public class ScheduleQueryService : IScheduleQueryService
               LEFT JOIN Factory f ON f.Id = r.FactoryId
               LEFT JOIN ProductionDepartment pd ON pd.Id = r.ProductionDepartmentId
               WHERE t.PlanVersionId = @Id
+                -- 与任务条同口径过滤：资源行只保留过滤后仍可见的任务所用资源
+                AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
+                AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
+                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)
               ORDER BY r.FactoryId, r.ProductionDepartmentId, r.ResourceCode",
-            new { Id = planVersionId, DomainKey = version.DomainKey },
+            new
+            {
+                Id = planVersionId,
+                DomainKey = version.DomainKey,
+                From = from,
+                To = to,
+                HasResources = hasResources,
+                ResourceIds = resourceIds
+            },
             db: DatabaseId.APS);
 
         // 3. 任务条
         //    G2-b 档①：DomainKey = COALESCE(Order.DomainKey, PlanVersion.DomainKey)
         //              netQty = Task.Quantity（落盘即净合格产出 NetOutputQty）
-        //              plannedProcessQty / mesEligible / crossDomainBlocked 无落盘来源，返回 null / 保守默认
-        //              （详见 v1.2 §二 2.3 与 §七 事实来源待对齐清单）
+        //              plannedProcessQty 取 Task.PlannedProcessQty（DDL 08:4242，2号位已落盘）；
+        //              mesEligible / crossDomainBlocked 仍无落盘来源，保持保守默认
+        //              （4号位 2026-10-17 R2/R3/R4/R6 已落实；R5 DelayReasons 待事实粒度对齐）
         var tasks = await _connectionManager.QueryAsync<GanttTaskDto>(
-            @"SELECT
+            $@"SELECT
                 t.Id                AS TaskId,
                 t.TaskNo,
                 t.OrderId,
@@ -147,36 +184,70 @@ public class ScheduleQueryService : IScheduleQueryService
                 t.PlannedEndTime,
                 t.Status,
                 t.SetupSource                 AS SetupSource,
+                t.IsCriticalPath              AS IsCriticalPath,
+                -- Duration 库值单位=分钟（2号位 PeggingOrchestrator 落库口径：PlannedEnd-Start 的 TotalMinutes）。
+                -- 冻结 07:3680 写「单位：小时」，两者不一致；查询层按【小时】返回以对齐冻结契约，
+                -- 由前端按小时展示（4号位 R6/Q3）。库值本身不改（写入方归 2号位）。
+                t.Duration / 60.0             AS Duration,
+                o.CustomerDueDate             AS CustomerDueDate,
+                -- 延期判定按【日期】比较：CustomerDueDate 为 DATE，PlannedEndTime 为 DATETIME2，
+                -- 直接比较会隐式提升为「完工时刻 vs 交日零点」，导致交期当天完工被判延期（4号位 Q1）。
                 CAST(CASE
                     WHEN t.PlannedEndTime IS NOT NULL
                      AND o.CustomerDueDate IS NOT NULL
-                     AND t.PlannedEndTime > o.CustomerDueDate
+                     AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")}
                     THEN 1 ELSE 0
                 END AS BIT) AS IsDelayed,
+                CAST(CASE
+                    WHEN t.PlannedEndTime IS NOT NULL
+                     AND o.CustomerDueDate IS NOT NULL
+                     AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")}
+                    THEN DATEDIFF(MINUTE, CAST(o.CustomerDueDate AS datetime2), t.PlannedEndTime) / 60.0
+                    ELSE NULL
+                END AS DECIMAL(18,4)) AS DelayHours,
                 COALESCE(o.DomainKey, pv.DomainKey) AS DomainKey,
                 t.Quantity          AS NetQty,
-                CAST(NULL AS DECIMAL(18,4)) AS PlannedProcessQty,
-                CAST(0 AS BIT)      AS MesEligible,
+                t.PlannedProcessQty AS PlannedProcessQty,
+                CAST(NULL AS BIT)   AS MesEligible,   -- 未判定（资格判定未接入）；不是表列，纯占位。改可空以区分「判定为否」
                 CAST(NULL AS NVARCHAR(4000)) AS MesIneligibleReasons,
-                CAST(0 AS BIT)      AS CrossDomainBlocked,
+                CAST(NULL AS BIT)   AS CrossDomainBlocked,   -- 未判定；不是表列，纯占位。改可空以区分「判定为否」
                 CAST(NULL AS NVARCHAR(4000)) AS CrossDomainBlockReason
               FROM [Task] t
               LEFT JOIN [Order] o ON o.Id = t.OrderId
               LEFT JOIN Material m ON m.Id = t.MaterialId
               LEFT JOIN PlanVersion pv ON pv.Id = @Id
               WHERE t.PlanVersionId = @Id
+                AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
+                AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
+                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)
               ORDER BY t.ResourceId, t.PlannedStartTime",
-            new { Id = planVersionId },
+            new
+            {
+                Id = planVersionId,
+                From = from,
+                To = to,
+                HasResources = hasResources,
+                ResourceIds = resourceIds
+            },
             db: DatabaseId.APS);
+
+        var taskList = tasks.ToList();
+        var resourceList = resources.ToList();
 
         return new GanttDataDto
         {
-            PlanVersionId    = version.Id,
-            VersionCode      = version.VersionCode,
-            PlanHorizonStart = version.PlanHorizonStart,
-            PlanHorizonEnd   = version.PlanHorizonEnd,
-            Resources        = resources.ToList(),
-            Tasks            = tasks.ToList()
+            PlanVersionId      = version.Id,
+            VersionCode        = version.VersionCode,
+            PlanVersionStatus  = version.Status,
+            BasePlanVersionId  = version.BasePlanVersionId,
+            PlanHorizonStart   = version.PlanHorizonStart,
+            PlanHorizonEnd     = version.PlanHorizonEnd,
+            Resources          = resourceList,
+            Tasks              = taskList,
+            ScopeDenied        = false,
+            VersionExists      = true,
+            // 空态标志：区分"该版本（在过滤条件下）确实没有任务"
+            IsEmpty            = taskList.Count == 0 && resourceList.Count == 0
         };
     }
 
@@ -193,17 +264,27 @@ public class ScheduleQueryService : IScheduleQueryService
             new { Id = planVersionId },
             db: DatabaseId.APS);
 
-        if (versionKey.Id == 0 || !IsDomainAllowed(allowed, versionKey.DomainKey))
+        if (versionKey.Id == 0)
         {
-            return new ScheduleSummaryDto { PlanVersionId = planVersionId };
+            // 版本不存在：VersionExists=false，调用方可与"存在但无排程结果"区分（4号位 10-17 §六）
+            return new ScheduleSummaryDto { PlanVersionId = planVersionId, VersionExists = false };
+        }
+
+        if (!IsDomainAllowed(allowed, versionKey.DomainKey))
+        {
+            // 越权（fail-closed）：ScopeDenied=true
+            return new ScheduleSummaryDto { PlanVersionId = planVersionId, VersionExists = true, ScopeDenied = true };
         }
 
         var summary = await _connectionManager.QueryFirstOrDefaultAsync<ScheduleSummaryDto>(
-            @"SELECT
+            $@"SELECT
                 pv.Id                AS PlanVersionId,
                 pv.VersionCode,
                 pv.Status,
-                pv.DurationSeconds   AS ComputeDurationSeconds,
+                -- ComputeDurationSeconds 不再取 pv.DurationSeconds：该列只存在于 ScheduleRun，
+                -- PlanVersion 无此列（冻结 08 DDL:4020 仅 ScheduleRun.DurationSeconds）。
+                -- 原 SQL 引用不存在列 → 端点必然 500（4号位 10-10/10-17 两次报障）。
+                -- DTO 字段保留为可空，契约不变；如需「求解耗时」请另走 ScheduleRun 维度端点。
 
                 (SELECT COUNT(*) FROM [Task] WHERE PlanVersionId = @Id)
                     AS TotalTasks,
@@ -218,8 +299,8 @@ public class ScheduleQueryService : IScheduleQueryService
                     WHERE t.PlanVersionId = @Id
                       AND t.PlannedEndTime IS NOT NULL
                       AND o.CustomerDueDate IS NOT NULL
-                      AND t.PlannedEndTime > o.CustomerDueDate)
-                    AS DelayedTasks,
+                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")})
+                    AS DelayedTasks,   -- 10-19 补 Q1 日期判据（原裸 datetime=191，与甘特体 179 分叉 12 条）
 
                 (SELECT COUNT(*) FROM [Order] WHERE PlanVersionId = @Id)
                     AS TotalOrders,
@@ -228,8 +309,8 @@ public class ScheduleQueryService : IScheduleQueryService
                     WHERE o.PlanVersionId = @Id
                       AND t.PlannedEndTime IS NOT NULL
                       AND o.CustomerDueDate IS NOT NULL
-                      AND t.PlannedEndTime > o.CustomerDueDate)
-                    AS DelayedOrders,
+                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")})
+                    AS DelayedOrders,   -- 同上一并补（v2 恰好两口径同值=1，换版本即分叉）
 
                 (SELECT MIN(PlannedStartTime) FROM [Task] WHERE PlanVersionId = @Id)
                     AS FirstTaskStart,
@@ -240,7 +321,13 @@ public class ScheduleQueryService : IScheduleQueryService
             new { Id = planVersionId },
             db: DatabaseId.APS);
 
-        return summary ?? new ScheduleSummaryDto { PlanVersionId = planVersionId };
+        if (summary is null)
+            return new ScheduleSummaryDto { PlanVersionId = planVersionId, VersionExists = false };
+
+        // 版本存在且未越权：标 VersionExists=true（计数可能全 0 = 该版本确无排程结果，与"版本不存在"可区分）
+        summary.VersionExists = true;
+        summary.ScopeDenied = false;
+        return summary;
     }
 
     /// <inheritdoc />
@@ -367,7 +454,7 @@ public class ScheduleQueryService : IScheduleQueryService
                WHERE t_c.PlanVersionId = @CandidateId
                  AND t_c.PlannedEndTime IS NOT NULL
                  AND o.CustomerDueDate IS NOT NULL
-                 AND t_c.PlannedEndTime > o.CustomerDueDate
+                 AND {DelayedOnDate("t_c.PlannedEndTime", "o.CustomerDueDate")}
                  AND NOT EXISTS (
                    SELECT 1
                    FROM [Task] t_b
@@ -375,7 +462,7 @@ public class ScheduleQueryService : IScheduleQueryService
                    WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
                      AND t_b.PlannedEndTime IS NOT NULL
                      AND ob.CustomerDueDate IS NOT NULL
-                     AND t_b.PlannedEndTime > ob.CustomerDueDate)",
+                     AND {DelayedOnDate("t_b.PlannedEndTime", "ob.CustomerDueDate")})",
             parameters);
 
         // 3. 汇总组装（crossDomain 计数未落盘，保守返 0；estimatedOnlyCount 归 2号位 返 null —— v1.2 §三 3.3 / §九-b）
@@ -561,6 +648,15 @@ public class ScheduleQueryService : IScheduleQueryService
 
     private static bool IsDomainAllowed(IReadOnlySet<string>? allowed, string domainKey)
         => allowed == null || allowed.Contains(domainKey);
+
+    /// <summary>
+    /// 「延期」判定单一判据（**本服务所有延期口径 SQL 必须走此方法**）：按**日期**比较。
+    /// PlannedEndTime 为 DATETIME2、CustomerDueDate 为 DATE，裸比较会隐式提升为「完工时刻 vs 交日零点」，
+    /// 交期当天完工被误判延期（Q1 裁决 2026-10-17；summary×2/candidate×2 漏改于 2026-10-19 补齐，
+    /// dev v2 实测裸判据 191 vs 日期判据 179、差额=12 条交期当天完工，4号位 10-19 §五.2）。
+    /// </summary>
+    private static string DelayedOnDate(string endTimeColumn, string dueDateColumn)
+        => $"CAST({endTimeColumn} AS date) > {dueDateColumn}";
 
     /// <summary>标量 COUNT 查询（只读 APS_Production；T=int 无约束时 T? 仅为注解，须显式 int? 类型参数才能 ?? 0 兜底）</summary>
     private async Task<int> CountScalarAsync(string sql, object parameters)

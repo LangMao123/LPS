@@ -27,8 +27,8 @@ import type {
   PrioritySegmentDto,
   PublishRuleInput,
   PublishRuleResult,
-  RetireRuleInput,
-  RetireRuleResult,
+  DisableRuleInput,
+  DisableRuleResult,
   RuleDiffDto,
   RuleSetDetailDto,
   RuleSetSummaryDto,
@@ -45,6 +45,7 @@ import type {
   PublishGovernanceResult,
   ForkDraftResult
 } from './types'
+import { normalizeRuleStatus } from './types/common'
 
 /* ===== Rule Set List ===== */
 
@@ -57,6 +58,7 @@ const mockRuleSets: RuleSetSummaryDto[] = [
     currentVersion: 12,
     draftVersion: 13,
     status: 'DRAFT',
+    hasVersion: true,
     lastChangeReason: '调整 Demand Protection 阈值 0.15 → 0.20',
     createdAt: new Date(Date.now() - 86400_000).toISOString(),
     publishedAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
@@ -70,6 +72,7 @@ const mockRuleSets: RuleSetSummaryDto[] = [
     domainKey: 'ALL',
     currentVersion: 3,
     status: 'PUBLISHED',
+    hasVersion: true,
     createdAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
     publishedAt: new Date(Date.now() - 30 * 86400_000).toISOString(),
     validationStatus: 'PASSED'
@@ -81,6 +84,7 @@ const mockRuleSets: RuleSetSummaryDto[] = [
     domainKey: 'ALL',
     currentVersion: 5,
     status: 'PUBLISHED',
+    hasVersion: true,
     createdAt: new Date(Date.now() - 60 * 86400_000).toISOString(),
     publishedAt: new Date(Date.now() - 60 * 86400_000).toISOString(),
     validationStatus: 'PASSED'
@@ -92,6 +96,7 @@ const mockRuleSets: RuleSetSummaryDto[] = [
     domainKey: 'FAMILY_INJECTION',
     currentVersion: 8,
     status: 'DISABLED',
+    hasVersion: true,
     createdAt: new Date(Date.now() - 180 * 86400_000).toISOString(),
     publishedAt: new Date(Date.now() - 90 * 86400_000).toISOString(),
     retiredAt: new Date(Date.now() - 7 * 86400_000).toISOString(),
@@ -111,6 +116,7 @@ const mockRuleSetDetail = (ruleSetId: number): RuleSetDetailDto => {
       domainKey: 'ALL',
       currentVersion: 1,
       status: 'DRAFT',
+      hasVersion: false,
       createdAt: new Date().toISOString(),
       validationStatus: 'PENDING'
     },
@@ -299,12 +305,16 @@ export const ruleApi = {
    *  旧 /api/rules 路径已废（lps 无此端点）
    *
    *  真实模式字段映射（B 设计稿 §3 落地后实测）：
-   *  - 后端返回精简主表：{id, ruleSetCode, ruleSetName, description, isActive, createdAt, createdBy}
-   *  - 前端 RuleSetSummaryDto 期望 13 字段，缺 5 个关键：domainKey / currentVersion / draftVersion /
-   *    status / lastChangeReason / validationStatus
-   *  - 缺字段在 mapping 时填占位（'ALL' / 0 / 'PENDING' / undefined），让页面先渲染骨架，
-   *    详情加载后再回填（store action 负责）
-   *  - 临时方案：等 3号位 列表端点扩展后切到完整 DTO（见回执/联调触发手册）
+   *  - 后端返回精简主表 + 版本摘要（3号位 R2 `OUTER APPLY`，DTO 字段齐：
+   *    id/ruleSetCode/ruleSetName/description/isActive/createdAt/createdBy +
+   *    status/currentVersionCode/draftVersionCode/lastChangeReason/publishedAt）
+   *  - ⚠️ `Program.cs:94` 设了 `JsonIgnoreCondition.WhenWritingNull`：RuleSetVersion 表里
+   *    **一条版本都没有**时，版本摘要那几个 key 会整个从 JSON 里消失（不是 null，是没有）。
+   *    dev 实测 2026-10-14：698 个规则集里只有 3 个有版本行，其余 695 个连 status key 都没有。
+   *  - 所以 status 判定顺序是「有 status 用 status；无 status = 无任何版本」，
+   *    绝不能再退回 isActive 派生（那会把 695 个点不开的规则集全标成「已发布」）。
+   *  - 前端 RuleSetSummaryDto 仍缺 domainKey（线上无规则集↔域关联，已提报 0号位 裁决），
+   *    mapping 填占位 'ALL'，详情加载后由 store 回填
    */
   async listRuleSets(): Promise<RuleSetSummaryDto[]> {
     if (APS_USE_MOCK) return mockRuleSets
@@ -316,25 +326,41 @@ export const ruleApi = {
       isActive?: boolean
       createdAt?: string
       createdBy?: string
+      /** 3号位 R2：有版本行时才有；无版本则整个 key 缺失（WhenWritingNull） */
+      status?: string | null
+      currentVersionCode?: string | null
+      draftVersionCode?: string | null
+      lastChangeReason?: string | null
+      publishedAt?: string | null
     }
     const raw = await apsHttp.get<BackendRuleSet[]>({ url: '/api/governance/rule-sets' })
-    return raw.map((r) => ({
-      // 主表直连字段
-      ruleSetId: r.id,
-      ruleSetCode: r.ruleSetCode,
-      ruleSetName: r.ruleSetName,
-      createdAt: (r.createdAt ?? new Date().toISOString()) as RuleSetSummaryDto['createdAt'],
-      // 占位字段（详情加载后由 store 回填）
-      domainKey: 'ALL' as RuleSetSummaryDto['domainKey'],
-      currentVersion: 0,
-      draftVersion: undefined,
-      // isActive=true 视为有发布版本，否则视为 DISABLED（保守；详情加载后校正）
-      status: (r.isActive === false ? 'DISABLED' : 'PUBLISHED') as RuleSetSummaryDto['status'],
-      lastChangeReason: r.description,
-      publishedAt: undefined,
-      retiredAt: undefined,
-      validationStatus: 'PENDING' as const
-    }))
+    return raw.map((r) => {
+      // 版本摘要是有就有、没有就没有 —— 这个「有没有」本身就是最可靠的事实
+      const hasVersion = r.status != null && String(r.status).trim() !== ''
+      return {
+        // 主表直连字段
+        ruleSetId: r.id,
+        ruleSetCode: r.ruleSetCode,
+        ruleSetName: r.ruleSetName,
+        createdAt: (r.createdAt ?? new Date().toISOString()) as RuleSetSummaryDto['createdAt'],
+        // 占位字段（详情加载后由 store 回填）
+        domainKey: 'ALL' as RuleSetSummaryDto['domainKey'],
+        currentVersion: 0,
+        draftVersion: undefined,
+        hasVersion,
+        // 有版本 → 用后端真状态；无版本 → 不再谎报 PUBLISHED（改按 isActive 落 DRAFT/DISABLED，
+        // 列表与卡片由 hasVersion 统一显示「未配版本」）
+        status: hasVersion
+          ? normalizeRuleStatus(r.status)
+          : ((r.isActive === false ? 'DISABLED' : 'DRAFT') as RuleSetSummaryDto['status']),
+        lastChangeReason: r.lastChangeReason ?? r.description,
+        publishedAt: r.publishedAt
+          ? (r.publishedAt as RuleSetSummaryDto['publishedAt'])
+          : undefined,
+        retiredAt: undefined,
+        validationStatus: 'PENDING' as const
+      }
+    })
   },
 
   /** RuleSet 当前已发布版本详情（v1.4 §二十 专用端点）
@@ -395,7 +421,9 @@ export const ruleApi = {
         url: `/api/governance/rule-set/${ruleSetId}/versions`
       })
       if (!Array.isArray(versions) || versions.length === 0) {
-        throw new Error(`RuleSet #${ruleSetId} 无可用版本`)
+        // 兜底：列表说有版本、点进来却一条都没有（两次请求之间数据被改）。
+        // 不外露内部 ID —— 用户看到的应该是「这个规则集没有可用版本」
+        throw new Error('该规则集没有可用版本')
       }
       const published: any =
         versions.find((v: any) => v.status === 'PUBLISHED' || v.status === 'Published') ??
@@ -411,6 +439,7 @@ export const ruleApi = {
           domainKey: fullVersion.domainKey ?? fullVersion.DomainKey ?? 'ALL',
           currentVersion: fullVersion.version ?? fullVersion.Version ?? 1,
           status: (fullVersion.status ?? fullVersion.Status ?? 'PUBLISHED').toUpperCase(),
+          hasVersion: true,
           createdAt: fullVersion.createdAt ?? fullVersion.CreatedAt ?? new Date().toISOString(),
           publishedAt: fullVersion.publishedAt ?? fullVersion.PublishedAt ?? null,
           validationStatus: fullVersion.validationStatus ?? 'PASSED'
@@ -463,6 +492,7 @@ export const ruleApi = {
         domainKey: fullVersion.domainKey ?? fullVersion.DomainKey ?? 'ALL',
         currentVersion: fullVersion.version ?? fullVersion.Version ?? 1,
         status: (fullVersion.status ?? fullVersion.Status ?? 'PUBLISHED').toUpperCase(),
+        hasVersion: true,
         createdAt: fullVersion.createdAt ?? fullVersion.CreatedAt ?? new Date().toISOString(),
         publishedAt: fullVersion.publishedAt ?? fullVersion.PublishedAt ?? null,
         validationStatus: fullVersion.validationStatus ?? 'PASSED'
@@ -544,11 +574,11 @@ export const ruleApi = {
     })
   },
 
-  /** 退役（仅 RULE_PUBLISHER）→ v1.4 后端语义改为 disable
+  /** 停用（仅 RULE_PUBLISHER）→ v1.4 后端语义对齐 disable
    *  v1.4 §二十：/api/governance/rule-set/version/{versionId}/disable
    *  不再使用 /retire 端点
    */
-  async retire(input: RetireRuleInput): Promise<RetireRuleResult> {
+  async disable(input: DisableRuleInput): Promise<DisableRuleResult> {
     if (APS_USE_MOCK) {
       return {
         ruleSetCode:
@@ -559,7 +589,7 @@ export const ruleApi = {
       }
     }
     const versionId = (input as any).versionId ?? input.version
-    return apsHttp.post<RetireRuleResult>({
+    return apsHttp.post<DisableRuleResult>({
       url: `/api/governance/rule-set/version/${versionId}/disable`,
       data: { reason: input.reason }
     })
@@ -676,6 +706,35 @@ export const ruleApi = {
     return apsHttp.post<PublishGovernanceResult>({
       url: `/api/governance/parameter-set/version/${input.versionId}/publish`,
       data: { changeReason: input.changeReason }
+    })
+  },
+
+  /**
+   * 取单条 RuleSetVersion（GET /api/governance/rule-set/version/{versionId}）
+   *
+   * 10-15 4号位：store/modules/aps/rules.ts 的 fetchRuleSetVersion 之前写的是
+   * `if ((ruleApi as any).getRuleSetVersion)` 这种 feature-detect，而方法压根不存在，
+   * 于是恒走兜底分支返回 `versionCode: 'v-' + id` / `ruleSetId: 0` 的手写桩对象——
+   * 那是真实联调路径上的假数据（不是 mock 模式里的），危害更大。
+   * 后端本就有这个端点（forkDraft 第 1 步已在用），此处补正式方法，store 改为直接调用。
+   */
+  async getRuleSetVersion(versionId: number): Promise<RuleSetVersion> {
+    if (APS_USE_MOCK) {
+      throw new Error('mock 模式下请使用 store 的 mock 分支；本端点仅真实模式')
+    }
+    return apsHttp.get<RuleSetVersion>({
+      url: `/api/governance/rule-set/version/${versionId}`
+    })
+  },
+
+  /** 取单条 ParameterSetVersion（GET /api/governance/parameter-set/version/{versionId}）
+   *  @see getRuleSetVersion 的 10-15 改动说明 */
+  async getParameterSetVersion(versionId: number): Promise<ParameterSetVersion> {
+    if (APS_USE_MOCK) {
+      throw new Error('mock 模式下请使用 store 的 mock 分支；本端点仅真实模式')
+    }
+    return apsHttp.get<ParameterSetVersion>({
+      url: `/api/governance/parameter-set/version/${versionId}`
     })
   },
 

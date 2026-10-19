@@ -124,7 +124,15 @@ export const generateRoutesByServer = (routes: AppCustomRouteRecordRaw[]): AppRo
 
 export const pathResolve = (parentPath: string, path: string) => {
   if (isUrl(path)) return path
-  const childPath = path.startsWith('/') || !path ? path : `/${path}`
+  // 子路由写绝对路径时它本身就是完整 URL，必须原样返回。
+  // 本仓的绝对子路由全部来自 10-16 的菜单分组（router/modules/aps.ts）：
+  // 顶级「策略配置」7 页 + 「角色与权限」4 页 + 「需求与供给」4 页 + 「排产执行」3 页
+  // + 「基础数据与日历」4 页 = 22 条。
+  // 它们的父节点（/strategy-config、/rbac、/aps-demand、/aps-execution、/aps-master-data）只是菜单分组壳；
+  // 若按老逻辑拼父路径，菜单 index 会变成 /strategy-config/aps/rules —— 侧边栏点击即跳到不存在的地址，
+  // 面包屑 / TagsView 同样错。改动前全仓没有绝对子路由，故对既有菜单零影响。
+  if (path.startsWith('/')) return path
+  const childPath = !path ? '' : `/${path}`
   return `${parentPath}${childPath}`.replace(/\/\//g, '/').trim()
 }
 

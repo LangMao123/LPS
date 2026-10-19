@@ -68,6 +68,8 @@ export interface RequestOptions {
   data?: unknown
   headers?: Record<string, string>
   responseType?: 'json' | 'blob' | 'arraybuffer' | 'text'
+  /** 单请求超时（ms），不传则走实例默认 30000 */
+  timeout?: number
 }
 
 /** 标记是否正在 refresh（防止多个 401 同时触发 refresh 风暴） */
@@ -223,21 +225,24 @@ export const apsHttp = {
     const res = await apsAxios.get<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, {
       params: opts.params,
       headers: opts.headers,
-      responseType: opts.responseType
+      responseType: opts.responseType,
+      timeout: opts.timeout
     })
     return unwrap<T>(res)
   },
   async post<T>(opts: RequestOptions): Promise<T> {
     const res = await apsAxios.post<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, opts.data, {
       params: opts.params,
-      headers: opts.headers
+      headers: opts.headers,
+      timeout: opts.timeout
     })
     return unwrap<T>(res)
   },
   async put<T>(opts: RequestOptions): Promise<T> {
     const res = await apsAxios.put<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, opts.data, {
       params: opts.params,
-      headers: opts.headers
+      headers: opts.headers,
+      timeout: opts.timeout
     })
     return unwrap<T>(res)
   },
@@ -246,7 +251,8 @@ export const apsHttp = {
       params: opts.params,
       headers: opts.headers,
       data: opts.data,
-      responseType: opts.responseType
+      responseType: opts.responseType,
+      timeout: opts.timeout
     })
     return unwrap<T>(res)
   }

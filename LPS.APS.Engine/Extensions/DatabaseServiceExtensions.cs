@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 using Microsoft.EntityFrameworkCore;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Configuration;
+using LPS.APS.Core.Extensions;
 using LPS.APS.Core.Interfaces;
 
 namespace LPS.APS.Engine.Extensions;
@@ -45,15 +46,22 @@ public static class DatabaseServiceExtensions
         services.Scan(scan => scan
             .FromAssemblyOf<DatabaseConnectionManager>()
                 // 注册 Auth 仓储（APS 侧走 Dapper + Services，无仓储层）
-                .AddClasses(classes => classes.InNamespaces(
-                    "LPS.APS.Engine.Repositories.Auth",
-                    "LPS.APS.Engine.Repositories.Pegging"))
+                .AddClasses(classes => classes
+                    .InNamespaces(
+                        "LPS.APS.Engine.Repositories.Auth",
+                        "LPS.APS.Engine.Repositories.Pegging")
+                    // 嵌套／异常／record 排除：record 天生实现 IEquatable<T>，会被 AsImplementedInterfaces
+                    // 当服务注册，ValidateOnBuild 因构造参数无法解析而启动失败
+                    // （2026-10-17 BomNightBatchResolver.PushRecord／Resolution 即因此致启动失败）。
+                    .Where(t => ServiceScanFilters.IsServiceCandidate(t)))
                 .AsImplementedInterfaces()
                 .WithScopedLifetime()
                 // 注册所有服务（IERPOrderSyncService → ERPOrderSyncService 等）
-                .AddClasses(classes => classes.InNamespaces(
-                    "LPS.APS.Engine.Services.Sync",
-                    "LPS.APS.Engine.Services.Auth"))
+                .AddClasses(classes => classes
+                    .InNamespaces(
+                        "LPS.APS.Engine.Services.Sync",
+                        "LPS.APS.Engine.Services.Auth")
+                    .Where(t => ServiceScanFilters.IsServiceCandidate(t)))
                 .AsImplementedInterfaces()
                 .WithScopedLifetime()
         );

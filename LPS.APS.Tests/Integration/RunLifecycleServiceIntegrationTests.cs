@@ -141,10 +141,10 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         oldRun!.Status.Should().Be("FAILED");
         oldRun.ErrorMessage.Should().Be("致命错误");
 
-        // P1-03：恢复壳落库（一域一壳 2 个 RECOVERY 壳，Status='Created'，SourceScheduleRunId=新 Run）
+        // P1-03：恢复壳落库（一域一壳 2 个 RECOVERY 壳，Status='BUILDING'，SourceScheduleRunId=新 Run）
         var shells = await _planVersionRepo.GetByScheduleRunIdAsync(_testRecoveredRunId, CancellationToken.None);
         shells.Should().HaveCount(2);
-        shells.Should().OnlyContain(s => s.VersionCategory == "RECOVERY" && s.Status == "Created");
+        shells.Should().OnlyContain(s => s.VersionCategory == "RECOVERY" && s.Status == "BUILDING");
         shells.Select(s => s.DomainKey).Should().BeEquivalentTo(new[] { "D1", "D2" });
     }
 
@@ -199,6 +199,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         trace.ParameterSetVersionCode.Should().NotBeNullOrWhiteSpace();
         trace.ExpectedDomainKeysJson.Should().Be("""["D1"]""");
         trace.PlanVersionId.Should().Be(_testPlanVersionId);
+        // PlanVersionStatus 回显 Status 列（该夹具已采用：Status='ACTIVE'）
         trace.PlanVersionStatus.Should().Be("ACTIVE");
     }
 
@@ -213,14 +214,16 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         // 确认（二轮复审 P0-05）：仅记审计，不写 ActivatedAt/ActivatedBy、不转 ACTIVE
         await _service.ConfirmCandidateAsync(_testPlanVersionId, 1, "tester", "集成测试确认", CancellationToken.None);
         var confirmed = await _planVersionRepo.GetByIdAsync(_testPlanVersionId);
-        confirmed!.Status.Should().Be("Computed");
+        confirmed!.Status.Should().Be("CANDIDATE");
         confirmed.ActivatedAt.Should().BeNull();
         confirmed.ActivatedBy.Should().BeNull();
 
         // 激活（二轮复审 P0-03/04/06）：已确认 + 来源 MANUAL_RESCHEDULE 可激活 → 原子替换 CANDIDATE → ACTIVE
         await _service.ActivateCandidateAsync(_testPlanVersionId, 1, "tester", CancellationToken.None);
         var activated = await _planVersionRepo.GetByIdAsync(_testPlanVersionId);
+        // 口径回退（B）：激活写 Status='ACTIVE'；身份 VersionCategory 出生即定，激活不动它
         activated!.Status.Should().Be("ACTIVE");
+        activated.VersionCategory.Should().Be("CANDIDATE");
         activated.ActivatedAt.Should().NotBeNull();
         activated.ActivatedBy.Should().Be("tester");
     }
@@ -258,12 +261,12 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         run.StrategyProfileVersionId.Should().Be(_testStrategyProfileVersionId);
         run.ExpectedDomainKeysJson.Should().Be($"""["{domainKey}"]""");
 
-        // 新壳落库：CANDIDATE + Created + SourceScheduleRunId=新 Run（白天候选壳初始态，D7 词表）
+        // 新壳落库：CANDIDATE + BUILDING + SourceScheduleRunId=新 Run（白天候选壳初始态，冻结词表）
         _testPlanVersionId = result.NewPlanVersionId;
         var shell = await _planVersionRepo.GetByIdAsync(result.NewPlanVersionId);
         shell.Should().NotBeNull();
         shell!.VersionCategory.Should().Be("CANDIDATE");
-        shell.Status.Should().Be("Created");
+        shell.Status.Should().Be("BUILDING");
         shell.DomainKey.Should().Be(domainKey);
         shell.SourceScheduleRunId.Should().Be(result.NewScheduleRunId);
     }
@@ -343,7 +346,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
                 ([VersionCode], [VersionCategory], [DomainKey], [Status], [SourceScheduleRunId],
                  [PlanHorizonStart], [PlanHorizonEnd], [ComputeMode], [CreatedBy], [CreatedAt])
               VALUES
-                (@VersionCode, 'RESCHEDULE', @DomainKey, 'ACTIVE', @SourceScheduleRunId,
+                (@VersionCode, 'DAILY_BASELINE', @DomainKey, 'ACTIVE', @SourceScheduleRunId,
                  @PlanHorizonStart, @PlanHorizonEnd, 'SIMULATION', 'IntegrationTest', GETDATE());
               SELECT CAST(SCOPE_IDENTITY() AS INT);",
             new
@@ -406,7 +409,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
                 ([VersionCode], [VersionCategory], [DomainKey], [Status], [SourceScheduleRunId],
                  [PlanHorizonStart], [PlanHorizonEnd], [ComputeMode], [CreatedBy], [CreatedAt])
               VALUES
-                (@VersionCode, 'RESCHEDULE', 'D1', 'ACTIVE', @SourceScheduleRunId,
+                (@VersionCode, 'DAILY_BASELINE', 'D1', 'ACTIVE', @SourceScheduleRunId,
                  @PlanHorizonStart, @PlanHorizonEnd, 'SIMULATION', 'IntegrationTest', GETDATE());
               SELECT CAST(SCOPE_IDENTITY() AS INT);",
             new
@@ -436,7 +439,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
                 ([VersionCode], [VersionCategory], [DomainKey], [Status], [SourceScheduleRunId],
                  [PlanHorizonStart], [PlanHorizonEnd], [ComputeMode], [CreatedBy], [CreatedAt])
               VALUES
-                (@VersionCode, 'CANDIDATE', 'D1', 'Computed', @SourceScheduleRunId,
+                (@VersionCode, 'CANDIDATE', 'D1', 'CANDIDATE', @SourceScheduleRunId,
                  @PlanHorizonStart, @PlanHorizonEnd, 'SIMULATION', 'IntegrationTest', GETDATE());
               SELECT CAST(SCOPE_IDENTITY() AS INT);",
             new

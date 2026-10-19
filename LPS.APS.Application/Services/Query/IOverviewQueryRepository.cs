@@ -8,19 +8,12 @@ namespace LPS.APS.Application.Services.Query;
 public interface IOverviewQueryRepository
 {
     /// <summary>
-    /// 查询当前ACTIVE计划版本信息
+    /// 查询当前ACTIVE计划版本信息（R1-a：按 Domain 列表，每 Domain 至多一条）
     /// </summary>
-    Task<OverviewActivePlanDto?> GetActivePlanAsync(
+    Task<List<OverviewActivePlanDto>> GetActivePlanAsync(
         string? domainKey = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedDomains = null);
-
-    /// <summary>
-    /// 查询任务状态摘要
-    /// </summary>
-    Task<OverviewTaskSummaryDto> GetTaskSummaryAsync(
-        int planVersionId,
-        CancellationToken ct = default);
 
     /// <summary>
     /// 查询资源负荷/Bottleneck

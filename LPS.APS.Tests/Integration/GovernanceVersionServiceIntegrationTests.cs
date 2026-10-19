@@ -119,6 +119,10 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         spvValidation.IsValid.Should().BeTrue();
         await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
 
+        // C-7 §9.2：默认标记经显式 SetDefault 治理操作置位（非 Create/Edit 直写）。发布后设为同族默认，
+        // 供下方 ResolveDefaultStrategyProfileVersionAsync 命中。
+        await _service.SetDefaultStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
+
         var publishedRuleSet = await _ruleSetVersionRepo.GetByIdAsync(_testRuleSetVersionId);
         publishedRuleSet!.Status.Should().Be("PUBLISHED");
         var publishedSpv = await _strategyProfileVersionRepo.GetByIdAsync(_testStrategyProfileVersionId);
@@ -293,10 +297,11 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
 
         await SetupBaseVersionsAsync();
 
-        // ① Reload（服务层 Create 已归一化主题 JSON → ContentSnapshotJson 落库；GET 投影回主题 JSON 前端兼容）
+        // ① Reload（服务层 Create 已归一化主题 JSON → ContentSnapshotJson 落库；GET 投影回主题 JSON 前端兼容；
+        //    rule-set 同族 2026-10-15：详情读路径置空快照载体，ContentSnapshotJson 仅仓储直读可见——DB 落库由后续快照六块断言证实）
         var reloadedRuleSet = await _service.GetRuleSetVersionAsync(_testRuleSetVersionId);
         reloadedRuleSet.Should().NotBeNull();
-        reloadedRuleSet!.ContentSnapshotJson.Should().NotBeNullOrWhiteSpace();
+        reloadedRuleSet!.ContentSnapshotJson.Should().BeNull();
         reloadedRuleSet.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
 
         var reloadedParamSet = await _service.GetParameterSetVersionAsync(_testParameterSetVersionId);
@@ -490,14 +495,15 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         }, "IntegrationTest", _testActorUserId);
         _testParameterSetVersionId = parameterSetVersion.Id;
 
-        // 版本表：StrategyProfileVersion —— 服务层 CRUD（引用上面两版本，IsDefault=1；Create 保留 IsDefault、强制 DRAFT）
+        // 版本表：StrategyProfileVersion —— 服务层 CRUD（引用上面两版本；C-7 §9.2 默认标记 IsDefault 属治理元数据，
+        // Create 不随请求直写即强制 IsDefault=false，默认只能经显式 SetDefault 治理操作置位——见主流程发布后 SetDefault）
         var spv = await _service.CreateStrategyProfileVersionAsync(new StrategyProfileVersion
         {
             StrategyProfileId = _testStrategyProfileId,
             VersionCode = $"TEST-S-{_now:yyyyMMddHHmmss}",
             RuleSetVersionId = _testRuleSetVersionId,
             ParameterSetVersionId = _testParameterSetVersionId,
-            IsDefault = true,
+            IsDefault = true,   // C-7：即使请求传 true，服务层亦强制 false，防越权写默认标记
         }, "IntegrationTest", _testActorUserId);
         _testStrategyProfileVersionId = spv.Id;
     }

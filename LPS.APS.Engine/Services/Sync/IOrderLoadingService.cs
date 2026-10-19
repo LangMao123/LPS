@@ -27,7 +27,7 @@ public interface IOrderLoadingService
     Task<int> LoadOrdersToActivePlanVersionsAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 归域失败捡漏：逐 Domain 装载后，检测本 Run 全部 PlanVersion 均未装走的活跃（Open/Released）订单。
+    /// 归域失败捡漏：逐 Domain 装载后，检测本 Run 全部 PlanVersion 均未装走的活跃（Status='OPEN'）订单。
     /// 这类订单因 ProductFamilyId 缺失 / 未映射到任何有效 DomainDefinition 而落空，
     /// 登记 APS_ETL_Log（WARN）标记为数据问题，供人工排查。非阻塞：不抛异常，仅登记日志。
     /// </summary>

@@ -212,7 +212,7 @@ public class DatabaseConnectionManager : IDisposable
     /// 执行SQL查询（返回单个对象）
     /// </summary>
     /// <param name="commandTimeout">命令超时时间（秒），null表示使用配置的默认超时</param>
-    public async Task<T?> QueryFirstOrDefaultAsync<T>(string sql, object? parameters = null, CommandType commandType = CommandType.Text, DatabaseId db = DatabaseId.APS, int? commandTimeout = null)
+    public virtual async Task<T?> QueryFirstOrDefaultAsync<T>(string sql, object? parameters = null, CommandType commandType = CommandType.Text, DatabaseId db = DatabaseId.APS, int? commandTimeout = null)
     {
         var (_, connOptions) = GetDbResources(db);
         var timeout = commandTimeout ?? connOptions.CommandTimeout;
@@ -232,7 +232,7 @@ public class DatabaseConnectionManager : IDisposable
     /// 执行非查询SQL（INSERT、UPDATE、DELETE）
     /// </summary>
     /// <param name="commandTimeout">命令超时时间（秒），null表示使用配置的默认超时</param>
-    public async Task<int> ExecuteAsync(string sql, object? parameters = null, CommandType commandType = CommandType.Text, DatabaseId db = DatabaseId.APS, int? commandTimeout = null)
+    public virtual async Task<int> ExecuteAsync(string sql, object? parameters = null, CommandType commandType = CommandType.Text, DatabaseId db = DatabaseId.APS, int? commandTimeout = null)
     {
         var (_, connOptions) = GetDbResources(db);
         var timeout = commandTimeout ?? connOptions.CommandTimeout;

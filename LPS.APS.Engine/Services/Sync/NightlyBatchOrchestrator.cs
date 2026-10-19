@@ -112,30 +112,57 @@ public class NightlyBatchOrchestrator : INightlyBatchOrchestrator
             // BOM 是物料级事实、按批次接货一次；OrderBomRequestLink 跨本批全部 Domain PlanVersion 映射
             // ═══════════════════════════════════════════
             _logger.LogInformation("[{BatchNo}] Step 5: BOM展开结果接货", batchNo);
-            var bomBatchNo = await _bomResultPullService.FindReadyBatchAsync(cancellationToken);
-            var bomPulledCount = 0;
 
-            if (bomBatchNo != null)
+            // 0号位 2026-10-17 §三.C：接货必须锁定「**本次夜间**那一个批号」，不再查「任意最新 READY」。
+            var night = await BomNightBatchResolver.ResolveAsync(_connectionManager, DateTime.Now, cancellationToken);
+            string? bomBatchNo = null;
+            var bomPulledCount = 0;
+            var bomReady = false;
+
+            if (!night.IsUnique)
             {
-                var planVersionIds = planVersions.Select(p => p.PlanVersionId).ToList();
-                bomPulledCount = await _bomResultPullService.PullBOMResultFromODSAsync(bomBatchNo, planVersionIds, cancellationToken);
-                _logger.LogInformation("[{BatchNo}] BOM接货完成: BOMBatchNo={BOMBatchNo}, 行数={PulledCount}",
-                    batchNo, bomBatchNo, bomPulledCount);
+                _logger.LogWarning("[{BatchNo}] BOM接货跳过：{Reason}", batchNo, night.Reason);
+                await LogETLAsync(batchNo, BomNightBatchIdentity.PullStep,
+                    $"SKIPPED：{night.Reason}（未接货，不回落任意最新 READY）", "SKIPPED");
             }
             else
             {
-                _logger.LogWarning("[{BatchNo}] 未找到READY状态的BOM批次，跳过接货（可能BOM展开尚未完成）", batchNo);
+                bomBatchNo = await _bomResultPullService.FindReadyBatchAsync(night.BatchNo!, cancellationToken);
+                if (bomBatchNo != null)
+                {
+                    var planVersionIds = planVersions.Select(p => p.PlanVersionId).ToList();
+                    bomPulledCount = await _bomResultPullService.PullBOMResultFromODSAsync(bomBatchNo, planVersionIds, cancellationToken);
+                    bomReady = true;
+                    _logger.LogInformation("[{BatchNo}] BOM接货完成: BOMBatchNo={BOMBatchNo}, 行数={PulledCount}",
+                        batchNo, bomBatchNo, bomPulledCount);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "[{BatchNo}] BOM接货跳过：本次批次 {ExpectedBatchNo} 尚未 READY（或行数为 0）",
+                        batchNo, night.BatchNo);
+                    await LogETLAsync(batchNo, BomNightBatchIdentity.PullStep,
+                        $"SKIPPED：本次批次 {night.BatchNo} 未 READY（未接货，不回落任意最新 READY）", "SKIPPED");
+                }
             }
 
             // ═══════════════════════════════════════════
-            // 记录成功日志
+            // 记录批次日志
+            // 0号位 §三.C：只有 BOM 缺口时不得再记无条件 SUCCESS —— 用既有 WARN 表示「夜间准备不完整」，
+            //   但 WARN 不是完成排程的许可（下游仍按严格 BOM 输入有效性判定）。
             // ═══════════════════════════════════════════
             stopwatch.Stop();
-            await LogETLAsync(batchNo, "NightlyBatch",
-                $"夜间批次完成 | ScheduleRunId:{scheduleRunId} | Domain数:{planVersions.Count} | 装载订单:{loadedCount} | 未归域:{unassignedCount} | BOM接货:{bomPulledCount}行 | 耗时:{stopwatch.ElapsedMilliseconds}ms",
-                "SUCCESS");
+            var nightlyStatus = bomReady ? "SUCCESS" : "WARN";
+            var bomSummary = bomReady
+                ? $"BOM接货:{bomPulledCount}行"
+                : $"BOM未接货（{night.Reason}）";
 
-            _logger.LogInformation("夜间批次完成: {BatchNo}, 耗时={Elapsed}ms", batchNo, stopwatch.ElapsedMilliseconds);
+            await LogETLAsync(batchNo, "NightlyBatch",
+                $"夜间批次{(bomReady ? "完成" : "准备不完整")} | ScheduleRunId:{scheduleRunId} | Domain数:{planVersions.Count} | 装载订单:{loadedCount} | 未归域:{unassignedCount} | {bomSummary} | 耗时:{stopwatch.ElapsedMilliseconds}ms",
+                nightlyStatus);
+
+            _logger.LogInformation("夜间批次{Status}: {BatchNo}, 耗时={Elapsed}ms",
+                bomReady ? "完成" : "准备不完整（BOM 未接货）", batchNo, stopwatch.ElapsedMilliseconds);
         }
         catch (Exception ex)
         {
@@ -160,10 +187,14 @@ public class NightlyBatchOrchestrator : INightlyBatchOrchestrator
         var versionCode = $"NIGHTLY_{now:yyyyMMdd}_{domainKey}";
 
         var sql = @"
-            -- 如果今天已有同名版本，先标记为已归档
+            -- 同日重跑幂等清理：本 VersionCode 含日期（NIGHTLY_{yyyyMMdd}_{DomainKey}），
+            -- 所以这条只命中「同一天重跑」留下的旧壳 —— 目的是给下面 INSERT 让路（UQ_PlanVersion_VersionCode 唯一约束）。
+            -- ⚠️ 跨天的历史版本**不在这里归档**：由新版本算完自动采用时的 ReplaceActiveAsync 归档旧 ACTIVE，
+            --    否则会在「新版本还没算完」的窗口里把该域唯一的正式版本提前归档掉。
+            -- 状态值一律用冻结词表（ARCHIVED），不写 'Archived' 这种大小写变体。
             UPDATE PlanVersion
-            SET Status = 'Archived', ArchivedAt = GETDATE()
-            WHERE VersionCode = @VersionCode AND Status <> 'Archived';
+            SET Status = 'ARCHIVED', ArchivedAt = GETDATE()
+            WHERE VersionCode = @VersionCode AND Status <> 'ARCHIVED';
 
             INSERT INTO PlanVersion (
                 VersionCode, VersionCategory, PlanHorizonStart, PlanHorizonEnd,
@@ -171,7 +202,7 @@ public class NightlyBatchOrchestrator : INightlyBatchOrchestrator
             )
             VALUES (
                 @VersionCode, 'DAILY_BASELINE', @PlanHorizonStart, @PlanHorizonEnd,
-                'FULL', 'Created', @BatchNo, @SourceScheduleRunId, @DomainKey, 'SYSTEM', GETDATE()
+                'FULL', 'BUILDING', @BatchNo, @SourceScheduleRunId, @DomainKey, 'SYSTEM', GETDATE()
             );
 
             SELECT CAST(SCOPE_IDENTITY() AS INT);";

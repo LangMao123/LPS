@@ -7,11 +7,17 @@
           ① 设备资源日历（Resource + ResourceCalendarSlot）
           ② 人工能力槽（ManualCapacitySlot）
           ③ 人工能力槽日历（ManualCapacitySlotCalendar）
-        §九 缺省语义：无有效日历 = 不可用（禁止 7×24 缺省）
+    - 冻结文档 v1.4（2026-10-12 三级继承）§17/§19/§23 **定向覆盖 v1.3 §九**：
+        · 本页 = 三级继承的第 3 级（工厂 → 部门 → 设备/人工槽），v1.4 line 19「保留设备及人工槽已有页面资产」
+        · 「本级无窗口 = 不可排」**已废止**（废止清单 O-024）：本级 MISSING 允许继承上级已认证窗口，
+          仅当**三级计算后仍无权威合法窗口**才判不可排
+        · 因此本页「未铺窗口」提示只能陈述本级事实，不得断言该资源不可排
+        · ⚠️ 合并后真实状态暂无查询端点（ResourceCalendarResolver 未挂 Service/Controller）——
+          已发函 5号位（4号位-2026-10-14）；落地前页面按本级事实表述，不得伪造三态
     - 5号位 2026-09-24《ResourceCalendar与ManualCapacity接口对接函》（9 端点 / 6 权限码）
 
   页面结构：
-    Tab1 设备资源日历：资源选择（过渡数据源）→ 窗口列表 → 批量铺窗 / 删窗
+    Tab1 设备资源日历：资源选择（资源主表 /api/resource 正式端点）→ 窗口列表 → 批量铺窗 / 删窗
     Tab2 人工能力槽  ：部门/工序过滤 + 含软删开关 → 主档列表 → 新增 / 查看窗口 / 铺窗 / 软删
     Tab3 人工槽日历  ：由 Tab2 选中行驱动 → 窗口列表 → 批量铺窗 / 删窗
 
@@ -19,10 +25,17 @@
     - 路由级 apsRequiredPermissions = [aps.resource_calendar.view, aps.manual_capacity.view]（OR 语义）
     - 按钮级：canEditDevice / canDeleteDevice / canEditManual / canDeleteManual
 
-  ⚠️ 三个已知缺口（已发函 5号位 2026-09-24；过渡方案见代码注释，**不在页面向用户展示**）：
-    G1 无资源主表列表端点   → 过渡用「计划版本甘特资源池」，可能遗漏未排资源
-    G2 无生产部门列表端点   → 过渡从资源池去重
-    G4 DTO 无 hasCalendar   → 状态由"窗口数组空"推导，且仅选中行才查证
+  10-12 RC23 收（G1 已闭环 + 撤过渡）：
+    - 旧「计划版本甘特资源池」候选 → 撤；改走 GET /api/resource（ResourceController.cs:34）
+    - 旧「手填资源 ID」 → 撤；el-select-v2 虚拟滚动满足 7773+ records 性能
+    - 旧「过渡数据源」用户提示 → 撤；当前实现已无"过渡/兜底"概念
+
+  2026-10-14 RC27 收（撤 RC19）：
+   - 撤顶部版本选择器（version-bar）—— 原为绕过"资源池取自甘特图、ACTIVE 版无甘特数据"的排查障碍而加，
+     同日 RC23 已把资源池改走 GET /api/resource（基础主数据，与计划版本无关），障碍不复存在
+   - 且本页从不读 gantt / summary，切版本只是触发一次本页用不上的取数；留着会误导用户
+     以为资源日历按计划版本分版本（上级工作日历同为基础数据，两页口径现已一致）
+   - 冻结 v1.4 §「4号位：资源能力维护页面Owner」只列 3 项维护对象，未要求计划版本锚点
 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -41,7 +54,9 @@ import {
   ElInput,
   ElInputNumber,
   ElOption,
+  ElPagination,
   ElSelect,
+  ElSelectV2,
   ElSwitch,
   ElTable,
   ElTableColumn,
@@ -56,8 +71,8 @@ import {
   type ManualCapacitySlotDto,
   type ManualSlotCalendarDto,
   type ManualSlotDraft,
-  type ResourceCalendarEntryDto,
-  type ResourceCandidate
+  type Resource,
+  type ResourceCalendarEntryDto
 } from '@/api/aps-v1'
 import type { RoleKey } from '@/api/aps-v1/types'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
@@ -68,14 +83,21 @@ import ManualSlotCreateDialog from './components/ManualSlotCreateDialog.vue'
 const apsAuth = useApsAuthStore()
 const store = useResourceCalendarStore()
 const {
-  resourceCandidates,
-  candidateNote,
-  candidateIsFallback,
+  resources,
+  resourcesLoading,
   currentResourceId,
   deviceWindows,
   deviceWindowsLoaded,
+  deviceWindowTotal,
+  deviceWindowPageRows,
+  deviceWindowPage,
+  deviceWindowPageSize,
   deviceCalendarStatus,
   slots,
+  slotTotal,
+  slotPage,
+  slotPageSize,
+  slotsLoading,
   departmentCandidates,
   currentSlotId,
   slotWindows,
@@ -99,36 +121,55 @@ const loadedTabs = ref<Set<TabName>>(new Set())
 async function onTabChange(name: TabName): Promise<void> {
   if (loadedTabs.value.has(name)) return
   loadedTabs.value.add(name)
-  if (name === 'device') {
-    await store.loadResourceCandidates()
-  } else if (name === 'manual') {
-    await Promise.all([store.loadSlots(), store.loadDepartmentCandidates()])
-  }
+  // 10-12 RC20：fire-and-forget，不阻塞 UI 切 Tab
+  //  - 原顶层 wait 在 onTabChange 内，会让 ElTabPane 切换视觉"卡"（慢响应端点会拖住 UI 切回）
+  //  - store 内部已有 loading / error / ElMessage，错误由 store 处理
+  //  - RC20 探针锁契约：onTabChange 内不在函数顶层 wait 数据加载
+  void (async () => {
+    try {
+      if (name === 'device') {
+        await store.loadResources()
+      } else if (name === 'manual') {
+        await Promise.all([store.loadSlots(), store.loadDepartmentCandidates()])
+      }
+    } catch {
+      // 错误已由 store handleError 写入 error ref + ElMessage；此处不重复
+    }
+  })()
 }
 
 /* ===== Tab1：设备资源日历 ===== */
-const manualResourceId = ref<number | undefined>(undefined)
+// 10-12 RC23：资源主表改走正式端点 GET /api/resource（含 hasCalendar，列表级判定日历状态）
+//  - 旧「手填资源 ID」已撤（@see RC23 老实现 + 原 G1 过渡说明）
+//  - dev 实测 7773 records → 用 el-select-v2 虚拟滚动渲染
 const deviceDialogVisible = ref(false)
 
-/** 资源下拉候选（过渡数据源；G1） */
-const resourceOptions = computed<ResourceCandidate[]>(() => resourceCandidates.value)
+/** ElSelectV2 需要的 {value,label} 形态；按 resourceCode 升序便于定位 */
+const resourceOptions = computed<Array<{ value: number; label: string; resource: Resource }>>(() =>
+  [...resources.value]
+    .sort((a, b) => (a.resourceCode ?? '').localeCompare(b.resourceCode ?? ''))
+    .map((r) => ({
+      value: r.resourceId,
+      label: labelOfResource(r),
+      resource: r
+    }))
+)
+
+/** 冻结 v1.4 line 17：「资源归部门」是三级继承的前提 —— 用户须先知道设备属于哪个车间，
+ *  才能去判断「上级（工厂/部门）开没开」。后端 ResourceListItemDto 已带 productionDepartmentName，
+ *  10-14 起展示（此前 DTO 有值但页面未用，dev 7773 条同名设备无法区分）。 */
+function labelOfResource(r: Resource): string {
+  const dept = r.productionDepartmentName?.trim()
+  return `${r.resourceCode ?? '-'} ${r.resourceName ?? ''}${dept ? `（${dept}）` : ''}`.trim()
+}
 
 async function pickResource(resourceId: number): Promise<void> {
   await store.loadDeviceWindows(resourceId)
 }
 
-async function loadManualResource(): Promise<void> {
-  const id = Number(manualResourceId.value)
-  if (!Number.isFinite(id) || id <= 0) {
-    ElMessage.warning('资源 ID 必须为正整数')
-    return
-  }
-  await store.loadDeviceWindows(id)
-}
-
 function openDeviceDialog(): void {
   if (currentResourceId.value == null) {
-    ElMessage.warning('请先选择或手填资源并加载窗口')
+    ElMessage.warning('请先选择资源并加载窗口')
     return
   }
   deviceDialogVisible.value = true
@@ -167,10 +208,29 @@ async function removeDeviceWindow(row: ResourceCalendarEntryDto): Promise<void> 
 const currentResourceLabel = computed<string>(() => {
   const id = currentResourceId.value
   if (id == null) return ''
-  const hit = resourceOptions.value.find((r) => r.resourceId === id)
+  const hit = resources.value.find((r) => r.resourceId === id)
   if (!hit) return `资源 #${id}`
-  return `${hit.resourceCode} ${hit.resourceName}`
+  return labelOfResource(hit)
 })
+
+/** 当前资源的归属部门（冻结 v1.4 line 17 资源归部门是三级继承前提；status 行展示供用户核对上级） */
+const currentResourceDept = computed<string>(
+  () =>
+    resources.value.find((r) => r.resourceId === currentResourceId.value)
+      ?.productionDepartmentName ?? ''
+)
+
+/* 10-14 RC26 收：设备窗口分页（过渡期前端切片；后端 PageResult 待 5号位 落地）
+ *  - 切页码 → 改 store 游标；切每页条数 → 回第 1 页防越界
+ *  - 后端改 PageResult 后这两个函数签名不变，只换 store 内部取数方式
+ */
+function onDeviceWindowPageChange(nextPage: number): void {
+  store.deviceWindowPage = nextPage
+}
+function onDeviceWindowSizeChange(nextSize: number): void {
+  store.deviceWindowPageSize = nextSize
+  store.deviceWindowPage = 1
+}
 
 /* ===== Tab2：人工能力槽 ===== */
 const slotDialogVisible = ref(false)
@@ -179,18 +239,32 @@ const filterOperationName = ref<string>('')
 const filterIncludeInactive = ref<boolean>(false)
 
 async function searchSlots(): Promise<void> {
-  await store.loadSlots({
-    departmentId: filterDepartmentId.value ?? undefined,
-    operationName: filterOperationName.value.trim() || undefined,
-    includeInactive: filterIncludeInactive.value
-  })
+  await store.loadSlots(
+    {
+      departmentId: filterDepartmentId.value ?? undefined,
+      operationName: filterOperationName.value.trim() || undefined,
+      includeInactive: filterIncludeInactive.value
+    },
+    { resetPage: true }
+  )
 }
 
 function resetSlotFilter(): void {
   filterDepartmentId.value = undefined
   filterOperationName.value = ''
   filterIncludeInactive.value = false
-  void store.loadSlots({})
+  void store.loadSlots({}, { resetPage: true })
+}
+
+/* 10-12 RC22 收：人工槽 Tab2 接入分页（@see taskSplitRuleConfig.vue:162-170 范式）
+ *  - 切页码 → loadSlots(undefined, { nextPageIndex })
+ *  - 切每页条数 → loadSlots(undefined, { resetPage: true, nextPageSize }) 防越界
+ */
+async function onSlotPageChange(nextPage: number): Promise<void> {
+  await store.loadSlots(undefined, { nextPageIndex: nextPage })
+}
+async function onSlotSizeChange(nextSize: number): Promise<void> {
+  await store.loadSlots(undefined, { resetPage: true, nextPageSize: nextSize })
 }
 
 async function submitCreateSlot(draft: ManualSlotDraft): Promise<void> {
@@ -320,12 +394,22 @@ function switchMockRole(role: RoleKey): void {
   ElMessage.success(`已切换角色：${role}（仅演示模式）`)
 }
 
+/* ===== 10-14 RC27 收：撤版本选择器（RC19 撤回）=====
+ *  - 冻结 v1.4 §「4号位：资源能力维护页面Owner」只列 3 项维护对象（设备日历 / 人工能力槽 / 人工槽日历），
+ *    **未要求计划版本锚点**；上级工作日历（同为基础数据）同样无版本条，两页口径现已一致
+ *  - 原 RC19 加它是为绕过"资源池取自甘特图、ACTIVE 版本无甘特数据 → 资源池空"的排查障碍；
+ *    同日 RC23 已把资源池改走 GET /api/resource（与版本无关的基础主数据），**该障碍不复存在**
+ *  - 且本页从不读取 gantt / summary：切版本只触发一次本页用不上的取数，纯装饰且误导
+ *    （让用户误以为资源日历按计划版本分版本）
+ */
+
 onMounted(async () => {
   if (!canViewDevice.value && !canViewManual.value) {
     ElMessage.warning('当前操作者无资源日历查看权限，请联系系统管理员授予')
   }
   loadedTabs.value.add('device')
-  await store.loadResourceCandidates()
+  // 10-12 RC23：资源主表走正式端点 /api/resource（基础数据，与计划版本无关）
+  await store.loadResources()
 })
 
 onBeforeUnmount(() => {
@@ -335,64 +419,66 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="rc-page">
-    <!-- 页面说明 -->
-    <ElCard class="rc-intro" shadow="never">
-      <template #header>
-        <div class="intro-header">
-          <span class="intro-title">资源日历维护</span>
-          <span class="intro-sub">设备资源日历 / 人工能力槽 / 人工槽日历</span>
-          <ElTooltip placement="bottom-start" effect="light" :show-after="150">
-            <span class="intro-help" tabindex="0">?</span>
-            <template #content>
-              <div class="help-pop">
-                <p class="help-pop-title">无有效日历窗口 = 不可用</p>
-                <p>设备与人工能力槽同一口径：系统不得按 7×24 小时缺省兜底。</p>
-                <p>窗口列表为空，即该资源当前<strong>不可排</strong>。</p>
-              </div>
-            </template>
-          </ElTooltip>
-          <!-- mock 角色切换器（仅 mock 模式显示；生产模式自动隐藏） -->
-          <ElDropdown
-            v-if="apsAuth.mockAvailableRoles.length > 0"
-            trigger="click"
-            class="role-switcher"
-            @command="switchMockRole"
+    <!-- 页面说明（10-12 收：原 ElCard 仅有 header 无 body，空 body 占行高；改用 div 紧凑布局） -->
+    <div class="rc-intro">
+      <div class="intro-header">
+        <span class="intro-title">资源日历维护</span>
+        <span class="intro-sub">设备资源日历 / 人工能力槽 / 人工槽日历</span>
+        <ElTooltip placement="bottom-start" effect="light" :show-after="150">
+          <span class="intro-help" tabindex="0">?</span>
+          <template #content>
+            <div class="help-pop">
+              <p class="help-pop-title">能不能排产，看厂和部门开没开</p>
+              <p>排产时间从上往下继承：工厂 → 部门 → 设备 / 工位。</p>
+              <p
+                >本级没铺窗口，只说明<strong>这台还没单独登记</strong>，不代表一定不能排 ——
+                厂里或部门开放了，它照样能排。</p
+              >
+              <p>只有三级都没开放，才是真的排不了；系统也不会默认按 7×24 小时当成一直可排。</p>
+            </div>
+          </template>
+        </ElTooltip>
+        <!-- mock 角色切换器（仅 mock 模式显示；生产模式自动隐藏） -->
+        <ElDropdown
+          v-if="apsAuth.mockAvailableRoles.length > 0"
+          trigger="click"
+          class="role-switcher"
+          @command="switchMockRole"
+        >
+          <ElTag
+            :type="ROLE_TAG[apsAuth.mockActiveRole]"
+            effect="dark"
+            class="role-badge"
+            title="点击切换角色（仅演示模式可用）"
           >
-            <ElTag
-              :type="ROLE_TAG[apsAuth.mockActiveRole]"
-              effect="dark"
-              class="role-badge"
-              title="点击切换角色（仅演示模式可用）"
-            >
-              {{ apsAuth.mockActiveRole }}
-            </ElTag>
-            <template #dropdown>
-              <ElDropdownMenu>
-                <ElDropdownItem
-                  v-for="r in apsAuth.mockAvailableRoles"
-                  :key="r"
-                  :command="r"
-                  :disabled="r === apsAuth.mockActiveRole"
-                >
-                  <ElTag :type="ROLE_TAG[r]" size="small" effect="plain">{{ r }}</ElTag>
-                  <span class="role-hint">
-                    {{
-                      r === 'aps.viewer.management'
-                        ? '仅 view（可看不可改）'
-                        : r === 'aps.planner'
-                          ? 'view + edit（不含 delete）'
-                          : r === 'aps.admin.aps' || r === 'aps.admin.system'
-                            ? '全 6 码（含 delete）'
-                            : ''
-                    }}
-                  </span>
-                </ElDropdownItem>
-              </ElDropdownMenu>
-            </template>
-          </ElDropdown>
-        </div>
-      </template>
-    </ElCard>
+            {{ apsAuth.mockActiveRole }}
+          </ElTag>
+          <template #dropdown>
+            <ElDropdownMenu>
+              <ElDropdownItem
+                v-for="r in apsAuth.mockAvailableRoles"
+                :key="r"
+                :command="r"
+                :disabled="r === apsAuth.mockActiveRole"
+              >
+                <ElTag :type="ROLE_TAG[r]" size="small" effect="plain">{{ r }}</ElTag>
+                <span class="role-hint">
+                  {{
+                    r === 'aps.viewer.management'
+                      ? '仅 view（可看不可改）'
+                      : r === 'aps.planner'
+                        ? 'view + edit（不含 delete）'
+                        : r === 'aps.admin.aps' || r === 'aps.admin.system'
+                          ? '全 6 码（含 delete）'
+                          : ''
+                  }}
+                </span>
+              </ElDropdownItem>
+            </ElDropdownMenu>
+          </template>
+        </ElDropdown>
+      </div>
+    </div>
 
     <!-- 错误条 -->
     <ElAlert
@@ -410,30 +496,25 @@ onBeforeUnmount(() => {
     <ElCard shadow="never">
       <ElTabs v-model="activeTab" @tab-change="(n) => onTabChange(n as TabName)">
         <!-- ============ Tab1 设备资源日历 ============ -->
-        <ElTabPane label="设备资源日历" name="device">
+        <ElTabPane label="设备资源日历" name="device" lazy>
           <ElForm inline label-position="right" label-width="80px" class="rc-toolbar">
-            <ElFormItem v-if="resourceOptions.length > 0" label="资源">
-              <ElSelect
+            <ElFormItem v-if="resources.length > 0" label="资源">
+              <!-- 10-12 RC23：el-select-v2 虚拟滚动（dev 7773+ records → el-select 会卡） -->
+              <ElSelectV2
                 :model-value="currentResourceId ?? undefined"
+                :options="resourceOptions"
+                :loading="resourcesLoading"
                 filterable
                 clearable
-                placeholder="从资源池选择"
-                style="width: 300px"
-                @change="(v: number) => v && pickResource(v)"
-              >
-                <ElOption
-                  v-for="r in resourceOptions"
-                  :key="r.resourceId"
-                  :label="`${r.resourceCode} ${r.resourceName}`"
-                  :value="r.resourceId"
-                />
-              </ElSelect>
+                placeholder="从资源主表选择（输入编码/名称/部门搜索）"
+                style="width: 360px"
+                @change="(v: number | undefined) => v && pickResource(v)"
+              />
             </ElFormItem>
-            <ElFormItem label="手填资源 ID">
-              <ElInputNumber v-model="manualResourceId" :min="1" :step="1" style="width: 140px" />
-              <ElButton class="rc-btn-gap" :loading="loading" @click="loadManualResource">
-                加载窗口
-              </ElButton>
+            <ElFormItem v-else label="资源">
+              <span class="rc-hint">{{
+                resourcesLoading ? '资源主表加载中…' : '资源主表为空'
+              }}</span>
             </ElFormItem>
             <ElFormItem>
               <ElButton
@@ -446,13 +527,12 @@ onBeforeUnmount(() => {
             </ElFormItem>
           </ElForm>
 
-          <div v-if="candidateIsFallback && candidateNote" class="rc-hint rc-source-hint">
-            {{ candidateNote }}
-          </div>
-
           <div v-if="currentResourceId != null" class="rc-status-row">
             <span class="rc-status-label">当前资源：</span>
             <strong>{{ currentResourceLabel }}</strong>
+            <ElTag v-if="currentResourceDept" type="info" class="rc-btn-gap" effect="plain">
+              所属部门：{{ currentResourceDept }}
+            </ElTag>
             <ElTag
               :type="CALENDAR_CONFIG_META[deviceCalendarStatus].tagType"
               class="rc-btn-gap"
@@ -468,23 +548,24 @@ onBeforeUnmount(() => {
 
           <ElEmpty
             v-if="currentResourceId == null"
-            description="请先在上方选择资源或手填资源 ID 后点击「加载窗口」"
+            description="请先在上方资源下拉中选中目标设备"
           />
           <template v-else>
             <ElAlert
               v-if="deviceWindowsLoaded && deviceWindows.length === 0"
-              type="error"
+              type="warning"
               :closable="false"
               show-icon
               class="rc-alert"
-              title="该设备未配日历 = 不可排"
+              title="这台设备本级还没登记"
             >
-              无有效窗口，排产判定该设备不可用。请点击「批量铺窗」补窗口后，设备才可参与排程。
+              只说明没有单独设过可用时段，<strong>不代表它一定不能排产</strong> ——
+              所属工厂或部门开放了，它照样能排。需要单独调整它的可用时段时，再点「批量铺窗」。
             </ElAlert>
 
             <ElTable
               v-if="deviceWindows.length > 0"
-              :data="deviceWindows"
+              :data="deviceWindowPageRows"
               :loading="loading"
               border
               stripe
@@ -522,11 +603,25 @@ onBeforeUnmount(() => {
                 </template>
               </ElTableColumn>
             </ElTable>
+
+            <!-- 10-14 RC26 收：设备窗口分页（过渡期前端切片；服务端分页端点待落地后切换） -->
+            <ElPagination
+              v-if="deviceWindowTotal > 0"
+              :current-page="deviceWindowPage"
+              :page-size="deviceWindowPageSize"
+              :total="deviceWindowTotal"
+              :page-sizes="[10, 20, 50, 100, 200]"
+              layout="total, sizes, prev, pager, next, jumper"
+              background
+              class="rc-pagination"
+              @current-change="onDeviceWindowPageChange"
+              @size-change="onDeviceWindowSizeChange"
+            />
           </template>
         </ElTabPane>
 
         <!-- ============ Tab2 人工能力槽 ============ -->
-        <ElTabPane label="人工能力槽" name="manual">
+        <ElTabPane label="人工能力槽" name="manual" lazy>
           <ElForm inline label-position="right" label-width="80px" class="rc-toolbar">
             <ElFormItem label="部门">
               <ElSelect
@@ -565,8 +660,8 @@ onBeforeUnmount(() => {
               <ElSwitch v-model="filterIncludeInactive" />
             </ElFormItem>
             <ElFormItem>
-              <ElButton type="primary" :loading="loading" @click="searchSlots">查询</ElButton>
-              <ElButton :disabled="loading" @click="resetSlotFilter">重置</ElButton>
+              <ElButton type="primary" :loading="slotsLoading" @click="searchSlots">查询</ElButton>
+              <ElButton :disabled="slotsLoading" @click="resetSlotFilter">重置</ElButton>
             </ElFormItem>
             <ElFormItem>
               <ElButton type="primary" :disabled="!canEditManual" @click="slotDialogVisible = true">
@@ -576,14 +671,14 @@ onBeforeUnmount(() => {
           </ElForm>
 
           <ElEmpty
-            v-if="slots.length === 0 && !loading"
+            v-if="slots.length === 0 && !slotsLoading"
             description="无人工能力槽；可点击「新增人工能力槽」创建"
           />
 
           <ElTable
             v-else
             :data="slots"
-            :loading="loading"
+            :loading="slotsLoading"
             border
             stripe
             row-key="manualSlotId"
@@ -640,10 +735,24 @@ onBeforeUnmount(() => {
               </template>
             </ElTableColumn>
           </ElTable>
+
+          <!-- 10-12 RC22 收：分页 ElPagination（@see TaskSplitRuleConfig.vue:842-852 范式） -->
+          <ElPagination
+            v-if="slotTotal > 0"
+            :current-page="slotPage"
+            :page-size="slotPageSize"
+            :total="slotTotal"
+            :page-sizes="[10, 20, 50, 100, 200]"
+            layout="total, sizes, prev, pager, next, jumper"
+            background
+            class="rc-pagination"
+            @current-change="onSlotPageChange"
+            @size-change="onSlotSizeChange"
+          />
         </ElTabPane>
 
         <!-- ============ Tab3 人工槽日历 ============ -->
-        <ElTabPane label="人工槽日历" name="manual-calendar">
+        <ElTabPane label="人工槽日历" name="manual-calendar" lazy>
           <ElEmpty
             v-if="currentSlotId == null"
             description="请先在「人工能力槽」页签中点击某行的「查看窗口」或「铺窗」"
@@ -694,13 +803,14 @@ onBeforeUnmount(() => {
 
             <ElAlert
               v-if="slotWindows.length === 0"
-              type="error"
+              type="warning"
               :closable="false"
               show-icon
               class="rc-alert"
-              title="该人工槽未配日历 = 不可排"
+              title="这个工位本级还没登记"
             >
-              无有效窗口，排产判定该人工槽不可用。请点击「批量铺窗」补窗口。
+              只说明没有单独设过可用时段，<strong>不代表它一定不能排产</strong> ——
+              所属工厂或部门开放了，它照样能排。需要单独调整它的可用时段时，再点「批量铺窗」。
             </ElAlert>
 
             <ElTable
@@ -754,8 +864,6 @@ onBeforeUnmount(() => {
       mode="DEVICE"
       :target-id="currentResourceId"
       :target-label="currentResourceLabel"
-      :existing-windows="deviceWindows"
-      :existing-windows-loaded="deviceWindowsLoaded"
       @update:visible="(v) => (deviceDialogVisible = v)"
       @submit="submitDeviceBulk"
     />
@@ -777,8 +885,6 @@ onBeforeUnmount(() => {
       mode="MANUAL_SLOT"
       :target-id="pendingSlotBulkId ?? currentSlotId"
       :target-label="currentSlotLabel"
-      :existing-windows="slotWindows"
-      :existing-windows-loaded="currentSlotId != null"
       @update:visible="(v) => (slotBulkDialogVisible = v)"
       @submit="submitSlotBulk"
     />
@@ -888,6 +994,13 @@ onBeforeUnmount(() => {
   margin-left: 0;
   margin-bottom: 8px;
 }
+
+/* 分页（10-12 RC22 收：人工槽 Tab2 接入 ElPagination） */
+.rc-pagination {
+  margin-top: 12px;
+  justify-content: flex-end;
+}
+
 :deep(.rc-row-disabled) {
   opacity: 0.6;
 }

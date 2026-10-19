@@ -13,7 +13,7 @@ namespace LPS.APS.Web.Controllers;
 /// 工厂/部门上级工作日历维护控制器（5号位=业务 Owner；表模型/三级解析=2号位）
 ///
 /// 路由规范：
-///   GET  /api/production-work-calendar            - 分页查询（PageResult，字段 page）
+///   GET  /api/production-work-calendar            - 分页查询（PageResult，字段 page；结果按授权 Factory/Department 过滤）
 ///   POST /api/production-work-calendar/weekly     - 周基准铺设（同范围同星期闭区间换版）
 ///   POST /api/production-work-calendar/exception  - 日期例外铺设（节假日OFF/补班WORK/授权加班）
 ///   POST /api/production-work-calendar/close      - 闭区间换版（旧开放行闭到新版前一日）
@@ -24,8 +24,11 @@ namespace LPS.APS.Web.Controllers;
 /// G4 公告前用于联调与备料，真实班次数据写入与解析消费等公告生效。
 /// 【权限】暂复用 aps.resource_calendar.*（5号位 日历域既有 3 码）；若 0号位/3号位 要求
 /// 独立 aps.production_work_calendar.* 权限码，G4 前另行申请，届时仅换 Policy 常量。
+/// 【S5-01 整改（2026-10-14）】功能权限之外，Service 层按目标行 Factory.Code（DEPARTMENT 行另加
+/// ProductionDepartment.DeptCode）做业务范围二次校验（IDataScopeService，fail-closed，不同维度 AND，
+/// 照 StageLeadTimeParam P0-03 先例）；越界抛 ScopeViolationException → 本控制器映射 403。
 /// 【DDL 尾注四项发布强校验】①同级时间重叠/星期日期冲突 ②部门归属Factory匹配
-/// ③操作权限（本控制器 Policy）④授权加班证据完整性 —— ①②④ 在 Service 发布路径强校验。
+/// ③操作权限（本控制器 Policy + Service 业务范围校验）④授权加班证据完整性 —— ①②③④ 在 Service 发布路径强校验。
 /// </summary>
 [ApiController]
 [Route("api/production-work-calendar")]
@@ -45,7 +48,11 @@ public class ProductionWorkCalendarController : ControllerBase
     private string GetOperator()
         => User.FindFirst(ClaimTypes.Name)?.Value ?? "unknown";
 
-    /// <summary>分页查询上级工作日历（MISSING=无行，不造虚拟行）</summary>
+    /// <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认，照 MesDispatchController 先例）</summary>
+    private int GetCurrentUserId()
+        => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
+
+    /// <summary>分页查询上级工作日历（MISSING=无行，不造虚拟行；结果按授权 Factory/Department 过滤）</summary>
     [Authorize(Policy = PermissionCodes.ResourceCalendarView)]
     [HttpGet]
     public async Task<ApiResponse<PageResult<ProductionWorkCalendarDto>>> Query(
@@ -55,13 +62,16 @@ public class ProductionWorkCalendarController : ControllerBase
         [FromQuery] bool includeInactive = false,
         [FromQuery] int pageIndex = 1,
         [FromQuery] int pageSize = 20,
+        [FromQuery] string? sortBy = null,
+        [FromQuery] string? sortDir = null,
         CancellationToken ct = default)
     {
         try
         {
-            var result = await _service.QueryAsync(scopeType, factoryId, departmentId, includeInactive, pageIndex, pageSize, ct);
+            var result = await _service.QueryAsync(scopeType, factoryId, departmentId, includeInactive, pageIndex, pageSize, sortBy, sortDir, GetCurrentUserId(), ct);
             return ApiResponse<PageResult<ProductionWorkCalendarDto>>.Success(result);
         }
+        catch (ArgumentException ex) { return ApiResponse<PageResult<ProductionWorkCalendarDto>>.Fail(400, ex.Message); }
         catch (Exception ex)
         {
             _logger.LogError(ex, "ProductionWorkCalendar query failed");
@@ -77,8 +87,13 @@ public class ProductionWorkCalendarController : ControllerBase
     {
         try
         {
-            var n = await _service.UpsertWeeklyAsync(request, GetOperator(), ct);
+            var n = await _service.UpsertWeeklyAsync(request, GetCurrentUserId(), GetOperator(), ct);
             return ApiResponse<int>.Success(n, $"Weekly rows upserted: {n}");
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "ProductionWorkCalendar weekly 业务范围越界：FactoryId={FactoryId}, DepartmentId={DepartmentId}", request?.FactoryId, request?.ProductionDepartmentId);
+            return ApiResponse<int>.Fail(403, ex.Message);
         }
         catch (ArgumentException ex) { return ApiResponse<int>.Fail(400, ex.Message); }
         catch (KeyNotFoundException ex) { return ApiResponse<int>.Fail(404, ex.Message); }
@@ -97,8 +112,13 @@ public class ProductionWorkCalendarController : ControllerBase
     {
         try
         {
-            var id = await _service.CreateExceptionAsync(request, GetOperator(), ct);
+            var id = await _service.CreateExceptionAsync(request, GetCurrentUserId(), GetOperator(), ct);
             return ApiResponse<long>.Success(id, $"Exception row created: {id}");
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "ProductionWorkCalendar exception 业务范围越界：FactoryId={FactoryId}, DepartmentId={DepartmentId}", request?.FactoryId, request?.ProductionDepartmentId);
+            return ApiResponse<long>.Fail(403, ex.Message);
         }
         catch (ArgumentException ex) { return ApiResponse<long>.Fail(400, ex.Message); }
         catch (KeyNotFoundException ex) { return ApiResponse<long>.Fail(404, ex.Message); }
@@ -117,8 +137,13 @@ public class ProductionWorkCalendarController : ControllerBase
     {
         try
         {
-            var n = await _service.CloseOpenAsync(request, GetOperator(), ct);
+            var n = await _service.CloseOpenAsync(request, GetCurrentUserId(), GetOperator(), ct);
             return ApiResponse<int>.Success(n, $"Open rows closed: {n}");
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "ProductionWorkCalendar close 业务范围越界：FactoryId={FactoryId}, DepartmentId={DepartmentId}", request?.FactoryId, request?.ProductionDepartmentId);
+            return ApiResponse<int>.Fail(403, ex.Message);
         }
         catch (ArgumentException ex) { return ApiResponse<int>.Fail(400, ex.Message); }
         catch (KeyNotFoundException ex) { return ApiResponse<int>.Fail(404, ex.Message); }
@@ -136,8 +161,13 @@ public class ProductionWorkCalendarController : ControllerBase
     {
         try
         {
-            await _service.CloseRowAsync(id, effectiveTo, GetOperator(), ct);
+            await _service.CloseRowAsync(id, effectiveTo, GetCurrentUserId(), GetOperator(), ct);
             return ApiResponse<bool>.Success(true, $"Row {id} closed at {effectiveTo:yyyy-MM-dd}");
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "ProductionWorkCalendar close row 业务范围越界：Id={Id}", id);
+            return ApiResponse<bool>.Fail(403, ex.Message);
         }
         catch (ArgumentException ex) { return ApiResponse<bool>.Fail(400, ex.Message); }
         catch (KeyNotFoundException ex) { return ApiResponse<bool>.Fail(404, ex.Message); }
@@ -156,8 +186,13 @@ public class ProductionWorkCalendarController : ControllerBase
     {
         try
         {
-            await _service.DeleteRowAsync(id, ct);
+            await _service.DeleteRowAsync(id, GetCurrentUserId(), ct);
             return ApiResponse<bool>.Success(true, $"Row {id} deleted");
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "ProductionWorkCalendar delete row 业务范围越界：Id={Id}", id);
+            return ApiResponse<bool>.Fail(403, ex.Message);
         }
         catch (KeyNotFoundException ex) { return ApiResponse<bool>.Fail(404, ex.Message); }
         catch (InvalidOperationException ex) { return ApiResponse<bool>.Fail(409, ex.Message); }

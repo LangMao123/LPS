@@ -15,6 +15,12 @@ public interface IStrategyProfileVersionRepository
     /// <summary>获取策略包的所有版本</summary>
     System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersion>> GetByStrategyProfileIdAsync(long strategyProfileId, CancellationToken ct = default);
 
+    /// <summary>
+    /// 获取策略包的所有版本（列表投影：JOIN 带出版本编码与父级主表 Id；4号位 2026-10-14 审计 R2/R3 补字段）。
+    /// 返回 StrategyProfileVersionListItem 而非实体——供前端版本列表直显编码与编辑时定位父级（消除 N+1 反查）。
+    /// </summary>
+    System.Threading.Tasks.Task<IReadOnlyList<LPS.APS.Core.DTOs.Governance.StrategyProfileVersionListItem>> GetByStrategyProfileIdWithCodesAsync(long strategyProfileId, CancellationToken ct = default);
+
     /// <summary>获取策略包的默认版本（IsDefault=1 且 PUBLISHED）</summary>
     System.Threading.Tasks.Task<StrategyProfileVersion?> GetDefaultByStrategyProfileIdAsync(long strategyProfileId, CancellationToken ct = default);
 
@@ -34,4 +40,17 @@ public interface IStrategyProfileVersionRepository
     /// 由 Application 层结合 EffectiveFrom/EffectiveTo 生效窗口过滤后判定 0/1/多（多 → 歧义报错）。
     /// </summary>
     System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersion>> GetDefaultByRunTypeAsync(string runType, CancellationToken ct = default);
+
+    /// <summary>
+    /// C-5/D-2 引用关系检查（3号位，2026-10-17）：
+    /// 反查「仍被合法可供新Run使用的已发布策略包版本」的引用。
+    /// 语义：引用 v.[RuleSetVersionId]=@ReferencedRuleSetVersionId 或 v.[ParameterSetVersionId]=@ReferencedParameterSetVersionId，
+    /// 且 v.[Status]='PUBLISHED'、父 StrategyProfile p.[IsActive]=1（合法可新Run资格，镜像 <see cref="GetDefaultByRunTypeAsync"/> 判定）。
+    /// 返回 IReadOnlyList 而非单对象（红线 #4）；生效窗口（EffectiveFrom/EffectiveTo）过滤由 Application 层完成。
+    /// 停用哪族传哪族（二选一）；被停用版本仍被合法可新Run策略包引用时，调用方须阻断停用（0号位 D-2 §4.2 方案a）。
+    /// </summary>
+    System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersion>> GetReferencingPublishedVersionsAsync(
+        long? referencedRuleSetVersionId,
+        long? referencedParameterSetVersionId,
+        CancellationToken ct = default);
 }

@@ -48,23 +48,13 @@ export const APS_ERROR_CODE = {
   INTERNAL: 500
 } as const
 
-/** 分页请求 */
-export interface PageQuery {
-  pageIndex: number
-  pageSize: number
-  /** 模糊匹配关键字 */
-  keyword?: string
-  /** 排序字段（如 "createdAt desc"） */
-  sort?: string
-}
-
-/** 分页响应 */
-export interface PageResult<T> {
-  items: T[]
-  total: number
-  pageIndex: number
-  pageSize: number
-}
+/** 分页请求
+ *  - 10-12 收：PageQuery / PageResult 通用类型已撤
+ *  - 各模块改用本地包装：ManualEtaPageResult / PagedTaskSplitRuleConfig / BusinessFactIssueResponsePage / 新增 ManualCapacitySlotPageResult
+ *  - 字段名统一为 `page`（后端 LPS.APS.Core.Dto.PageResult<T>.Page 真值）
+ *  - 此前 PageResult<T> 字段名 pageIndex 与后端 page 不一致，9 文件本地包装已隔离；删通用类型避免误用
+ */
+// （PageQuery / PageResult 已删，@see frontNew/docs/4号位-2026-10-12-三函闭环RC22-ME13-E24-给5号位.md）
 
 /**
  * 4号位文档第 6 节：Task 正式状态仅 5 种
@@ -96,16 +86,18 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
 }
 
 /**
- * 4号位文档第 15 节：PlanVersion 状态机
+ * PlanVersion 生命周期状态（冻结文档 07 §4.2:3552 值域 + 2号位 2026-10-15 词表统一）
  *
- *  - BUILDING       排程构建中
- *  - ACTIVE         当前生效版本（PMC 只读这个）
- *  - CANDIDATE      候选版本（PMC 可对比 + 最小人工确认）
- *  - FAILED         构建失败
- *  - ARCHIVED       已归档
- *  - Computed       D7 候选执行完成终态（2号位 ExecuteDomainAsync 写，@see lps/.../SchedulingOrchestrator.cs:601）
- *  - ComputeFailed  D8 失败终态（同上 isSuccess=false 分支；SchedulingOrchestrator.cs:685）
+ *  - BUILDING    待发令（排程启动建记录时的初始态）
+ *  - CANDIDATE   算完待确认
+ *  - ACTIVE      已生效 —— **「正式采用」直接看 Status = 'ACTIVE'**（07 §4.2:3573）
+ *  - FAILED      失败
+ *  - ARCHIVED    已被同域新版顶替
+ *  - Computing   计算中（实现子状态：发令枪防重复领取，非冻结 DDL 值）
  *
+ * 历史：2026-10-15 前代码曾偏离为 Created/Computed/ComputeFailed，
+ *       2号位 已统一回冻结词表（Created→BUILDING、Computed→CANDIDATE、ComputeFailed→FAILED）
+ *       ⇒ 后端**永不**返 Computed/ComputeFailed，这两个 key 是死分支，已删（5号位 10-15 §九）。
  * 注：CTP / INSERT_IMPACT_ANALYSIS 永远不能成为 PlanVersion（验收 U11/U12），
  *     因此枚举里也不包含这两种业务用途。
  */
@@ -115,21 +107,19 @@ export const PLAN_VERSION_STATUSES = [
   'CANDIDATE',
   'FAILED',
   'ARCHIVED',
-  'Computed',
-  'ComputeFailed'
+  'Computing'
 ] as const
 
 export type PlanVersionStatus = (typeof PLAN_VERSION_STATUSES)[number]
 
-/** UI 层用：PlanVersion 状态中文标签（4号位文档第 15 节状态机） */
+/** UI 层用：PlanVersion 状态中文标签（5号位 2026-10-15 §一 指定渲染口径） */
 export const PLAN_VERSION_STATUS_LABELS: Record<PlanVersionStatus, string> = {
-  BUILDING: '构建中',
-  ACTIVE: '生效中',
-  CANDIDATE: '候选',
-  FAILED: '构建失败',
-  ARCHIVED: '已归档',
-  Computed: '已求解',
-  ComputeFailed: '求解失败'
+  BUILDING: '待发令',
+  ACTIVE: '已生效',
+  CANDIDATE: '算完待确认',
+  FAILED: '失败',
+  ARCHIVED: '已被新版本顶替',
+  Computing: '计算中'
 }
 
 /** UI 层用：PlanVersion 状态 → ElTag type（4号位 全前端 owner：版本切换条 / Overview 状态徽章共用） */
@@ -142,9 +132,17 @@ export const PLAN_VERSION_STATUS_TAG: Record<
   CANDIDATE: 'warning',
   FAILED: 'danger',
   ARCHIVED: 'info',
-  Computed: 'success',
-  ComputeFailed: 'danger'
+  Computing: 'primary'
 }
+
+/** 后端返未知状态（新词表 / 老 dev 库）时的兜底，禁止页面因未知值崩 */
+export const planVersionStatusLabel = (raw: string | null | undefined): string =>
+  raw ? (PLAN_VERSION_STATUS_LABELS[raw as PlanVersionStatus] ?? raw) : '-'
+
+export const planVersionStatusTag = (
+  raw: string | null | undefined
+): 'success' | 'primary' | 'warning' | 'info' | 'danger' =>
+  raw ? (PLAN_VERSION_STATUS_TAG[raw as PlanVersionStatus] ?? 'info') : 'info'
 
 /** 4号位文档第 6 节：Task 不可移动标识（UI 显示，不允许拖动改库） */
 export type TaskLockMarker = 'EXECUTION' | 'FIRM' | 'FROZEN'
@@ -227,6 +225,27 @@ export const RULE_STATUSES = [
   'ARCHIVED'
 ] as const
 export type RuleStatus = (typeof RULE_STATUSES)[number]
+
+/**
+ * UI 流程实际触发的 3 态子集（v1.4 §二十 6 态冻结；前端无 submit / approve / archive 按钮）
+ * 用途：Rules.vue KPI 横条 + 状态过滤 Tab 的 v-for（避免永远 0 的 SUBMITTED/APPROVED/ARCHIVED 噪声）
+ * 不替代 RULE_STATUSES：类型、normalize、Record 键空间仍按 6 态对齐
+ */
+export const RULE_STATUSES_UI = ['DRAFT', 'PUBLISHED', 'DISABLED'] as const
+export type RuleStatusUI = (typeof RULE_STATUSES_UI)[number]
+
+/**
+ * 「未配版本」—— **不属于 6 态的 UI 过滤/展示标记**（10-14 增）
+ *
+ * 为什么需要：后端 `RuleSetListItemDto` 的 status 来自 RuleSetVersion 的 OUTER APPLY，
+ * 且 `Program.cs:94` 设了 `WhenWritingNull` —— RuleSet **一条版本都没有**时 status key 整个消失。
+ * 这类规则集点开必然 404，但它在 6 态里找不到正确的落点（标 PUBLISHED 是撒谎，标 DRAFT 暗示有草稿可编辑）。
+ *
+ * 故单独用这个字符串做 UI 标签 + 过滤值，**不**扩充 RULE_STATUSES —— v1.4 §二十 的 6 态是
+ * DDL 冻结契约，不因前端展示需要而扩张（@see RuleSetSummaryDto.hasVersion）。
+ */
+export const NO_VERSION = 'NO_VERSION' as const
+export const NO_VERSION_LABEL = '未配版本'
 
 /** UI 层用：RuleSet / ParameterSet 状态中文标签（6 态） */
 export const RULE_STATUS_LABELS: Record<RuleStatus, string> = {

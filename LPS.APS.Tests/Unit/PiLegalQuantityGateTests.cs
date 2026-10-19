@@ -17,7 +17,13 @@ namespace LPS.APS.Tests.Unit;
 /// 本文件把上述四条判据**逐条**落成反证：
 ///   · 唯一性（0 行 = 缺失 / ≥2 行 = 来源不唯一，**不得取首条**）→ ①②③
 ///   · Stage 位置未知（上下文缺失 / PI·物料不匹配 / StageCode 空）→ ④⑤⑥
-///   · 四项限量 min 取值的**逐项**判别（PI Original / PI Remaining / StageFree − 已占 / 配置 Max）→ ⑦⑧⑨⑩
+///   · 四项限量 min 取值的**逐项**判别（PI Original / PI Remaining / StageFree − 已占）→ ⑦⑧⑨
+///     ⚠ **2026-10-14 S1-01 更正**：第四项「配置 Max」**不再是生产硬上限** ——
+///       `BatchPolicy.MaxExecutionBatchQty` 是**经济**（软）单批偏好（2026-10-12 已生效有限产能 v1.9 /
+///       1号位 v1.8），已按 0号位《联合代码审核报告 v1.0》§4 **S1-01（P0 CONFIRMED）** 从硬 PI 闸移除
+///       （生产调用点全部改传 `configuredMax: null`）。⑩ 现只覆盖**形参接缝本身**（生产态无生产者），
+///       不再声称「正常 Policy 路径把 `MaxExecutionBatchQty` 传进门禁」。
+///       新增 S1-01 判别组见文件末 **S1-01** 区（正证：经济偏离不假未排；反证：PI/Stage 真上限仍拦住）。
 ///   · 边界相等合法、越限**不静默截断** → ⑪⑫
 ///   · 正常 Policy 路径同样过门禁；输入未投影则**登记缺口不拦截** → ⑬⑭
 ///   · B-010 兜底与 B-009 共用同一门禁（可靠 Stage 自由量 ⇒ 成立）→ ⑮
@@ -50,6 +56,8 @@ public class PiLegalQuantityGateTests
     /// <summary>
     /// V1_4 NEW-03：门禁签名的**夹具适配层**（补默认 `factoryId` / 目标 `StageCode`）。
     ///   保留原「位置参数 + `configuredMax:` 命名参数」的调用形状，使既有 17 条用例逐字不变。
+    ///   ⚠ **2026-10-14 S1-01**：`configuredMax` 现**无生产生产者**（生产三处调用点均传 `null`）——
+    ///     本形参只由 ⑩ 直接注入，用于守住「接缝仍在、但不得由 `BatchPolicy` 投影」这条事实。
     /// </summary>
     private static string? Gate(
         decimal quantity,
@@ -89,14 +97,14 @@ public class PiLegalQuantityGateTests
             DemandSequence = 1
         };
 
-    private static BatchPolicyRuleSnapshot Policy(decimal? max = null, decimal? min = null)
+    private static BatchPolicyRuleSnapshot Policy(decimal? max = null, decimal? min = null, bool allowSplit = true)
         => new()
         {
             MaterialId = MaterialId,
             ProductionDepartmentId = 100,
             MinExecutionBatchQty = min,
             MaxExecutionBatchQty = max,
-            AllowSplit = true,
+            AllowSplit = allowSplit,
             AllowMerge = false
         };
 
@@ -271,7 +279,12 @@ public class PiLegalQuantityGateTests
         Assert.Contains("Stage 合法自由 0", reason);
     }
 
-    /// <summary>⑩ **配置 Max** 是最紧项 ⇒ 按它判越限（正常 Policy 路径把 `MaxExecutionBatchQty` 传进门禁）。</summary>
+    /// <summary>
+    /// ⑩ **形参接缝**：显式注入的 `configuredMax` 仍是接缝内的最紧项 ⇒ 按它判越限。
+    ///   ⚠ **2026-10-14 S1-01 更正**：本条**不再**代表生产口径 —— 生产路径**不传** `MaxExecutionBatchQty`
+    ///     （经济 Max 是软目标，已从硬 PI 闸移除）。本用例只证明「接缝本身可用」，
+    ///     生产侧「不得从 `BatchPolicy` 投影经济 Max」由文件末 **S1-01** 区守。
+    /// </summary>
     [Fact]
     public void F03_最紧项为配置Max_按它判越限()
     {
@@ -892,5 +905,136 @@ public class PiLegalQuantityGateTests
         Assert.Contains("PI_LEGAL_QTY_OVER_LIMIT", overSales);
         Assert.Equal(overSales, overProd);
         Assert.Equal(overSales, overBlank);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  S1-01（2026-10-14）：**经济 Max 不得作为生产硬上限**
+    //    依据：0号位《APS V1｜1～5号位联合代码审核报告 v1.0》§4 **S1-01（P0 CONFIRMED）** 逐字：
+    //      「**经济Max仍参与PI批量硬数量校验**……冻结：2026-10-12已生效有限产能v1.9/1号位v1.8，
+    //       **经济Min/Max/Preferred都是软目标**；PI Original、ERP Remaining、Stage净自由、真实资源约束
+    //       另作硬限制。影响：硬合法批量仅因经济Max偏离而被拒排/禁止合批；可能造成单域未排量失真。
+    //       不可用「本函数注释写着Max是硬上限」否定新冻结。
+    //       **最小整改**：保留PI Original/Remaining/StageFree硬门禁；在硬PI闸和合批合法性闸排除经济Max；
+    //       软Max仅进入有界候选评分。**反例：PI剩1000、Stage新增合法400、经济Max30/600，
+    //       若允许拆合且资源合法，不能只因经济Max得出PI超限**；用独立真实硬数量限制验证不越界。」
+    //
+    //  判别性说明（本区 ① / ② / ⑥ 构成**判别器**，唯一变量 = 经济 Max）：
+    //    · 整改前：`ApplyPiLegalQuantityGate` 单批口径传 `policy.MaxExecutionBatchQty`
+    //      ⇒ cap = min(…, 经济 Max) ⇒ ① 会红（合法批被判 `PI_LEGAL_QTY_OVER_LIMIT`）；
+    //    · 整改后：经济 Max 移出硬闸 ⇒ ① 绿。
+    //  ③④⑤ 是**回归守卫**（非判别器）：证明「移出经济 Max」**没有**连 PI / Stage 真上限一起放宽。
+    //
+    //  ✅ **「整改前红」已实测（2026-10-14，非推断）**：临时把 `ApplyPiLegalQuantityGate` 的单批口径
+    //     改回 `configuredMax: policy.MaxExecutionBatchQty` 并重建 ⇒ 本区 **①/②/⑥ 三条全红**，
+    //     ③④⑤ 三条**保持绿**（⇒ ③④⑤ 确实只测真上限，与判别器不同源）；还原后本区 6 条全绿。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// S1-01 ① **正证（判别器）**：`AllowSplit=false` ⇒ 恒 1 批 `Q=10`；经济 `Max=6` 小于该批，
+    ///   但 PI Original 100 / PI Remaining 100 / Stage 合法自由 100 三项**真实硬上限充足**
+    ///   ⇒ **必须合法**（经济 Max 是软目标，不得据此判 `PI_LEGAL_QTY_OVER_LIMIT`）。
+    ///   整改前本用例红（单批 10 &gt; 经济 Max 6 ⇒ 误判 Conflict ⇒ 该需求假未排）。
+    /// </summary>
+    [Fact]
+    public void S101_经济Max小于单批量_硬上限充足_必须合法()
+    {
+        using var scope = SolverDiagnostics.BeginScope();
+
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 10m), Policy(max: 6m, allowSplit: false),
+            piFacts: new[] { Fact(original: 100m, remaining: 100m) },
+            piStageContext: Ctx(stageFree: 100m));
+
+        Assert.True(formation.IsLegal, formation.ConflictReason);
+        var single = Assert.Single(formation.Batches);
+        Assert.Equal(10m, single.NetOutputQty);                        // 数量**不得**被经济 Max 改写
+        Assert.Equal(0, scope.Counters.PiLegalQuantityGateBlocked);    // 硬闸**未**拦截
+    }
+
+    /// <summary>
+    /// S1-01 ② **正证（判别器，逐字复刻 0号位 反例）**：`PI剩 1000 / Stage 新增合法 400 / 经济 Max 200`
+    ///   ⇒ 需求量 300 **在 Stage 真上限 400 之内** ⇒ **不能只因经济 Max(200) 得出 PI 超限** ⇒ 必须合法。
+    ///   整改前本用例红（cap = min(1000, 1000, 400, **200**) = 200 &lt; 300 ⇒ 误判 `PI_LEGAL_QTY_OVER_LIMIT`）。
+    /// </summary>
+    [Fact]
+    public void S101_PI剩1000_Stage合法400_经济Max200_需求300_必须合法()
+    {
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 300m), Policy(min: 30m, max: 200m, allowSplit: false),
+            piFacts: new[] { Fact(original: 1000m, remaining: 1000m) },
+            piStageContext: Ctx(stageFree: 400m));
+
+        Assert.True(formation.IsLegal, formation.ConflictReason);
+        Assert.Equal(300m, Assert.Single(formation.Batches).NetOutputQty);
+    }
+
+    /// <summary>
+    /// S1-01 ③ **反证（回归守卫）**：**同一夹具**只把 Stage 合法自由量从 400 降到 250
+    ///   （&lt; 需求 300）⇒ **Stage 真上限**必须拦住 —— 证明 ② 的「合法」来自**经济 Max 被移出**，
+    ///   而不是「硬闸被整体放宽」。与 ② 构成**同夹具判别对**（唯一变量 = Stage 自由量）。
+    /// </summary>
+    [Fact]
+    public void S101_同夹具_Stage合法自由250_超Stage真上限_必须拦住()
+    {
+        using var scope = SolverDiagnostics.BeginScope();
+
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 300m), Policy(min: 30m, max: 200m, allowSplit: false),
+            piFacts: new[] { Fact(original: 1000m, remaining: 1000m) },
+            piStageContext: Ctx(stageFree: 250m));
+
+        Assert.False(formation.IsLegal);
+        Assert.Contains("PI_LEGAL_QTY_OVER_LIMIT", formation.ConflictReason);
+        Assert.Contains("Stage 合法自由 250", formation.ConflictReason);
+        Assert.Equal(1, scope.Counters.PiLegalQuantityGateBlocked);
+    }
+
+    /// <summary>
+    /// S1-01 ④ **反证（回归守卫）**：经济 Max **放大到 1000** 也**救不了** PI Remaining 真上限 ——
+    ///   `PI Remaining=5` 时需求 10 仍必须拦住（「保留 PI Original / Remaining 硬门禁」）。
+    /// </summary>
+    [Fact]
+    public void S101_经济Max放大_也救不了PI剩余量真上限_必须拦住()
+    {
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 10m), Policy(max: 1000m, allowSplit: false),
+            piFacts: new[] { Fact(original: 100m, remaining: 5m) },
+            piStageContext: Ctx(stageFree: 100m));
+
+        Assert.False(formation.IsLegal);
+        Assert.Contains("PI_LEGAL_QTY_OVER_LIMIT", formation.ConflictReason);
+        Assert.Contains("PI Remaining 5", formation.ConflictReason);
+    }
+
+    /// <summary>
+    /// S1-01 ⑤ **反证（回归守卫）**：经济 Max 放大到 1000 也**救不了** PI Original 真上限 ——
+    ///   `PI Original=8`（剩余也是 8）时需求 10 仍必须拦住。
+    /// </summary>
+    [Fact]
+    public void S101_经济Max放大_也救不了PI原始量真上限_必须拦住()
+    {
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 10m), Policy(max: 1000m, allowSplit: false),
+            piFacts: new[] { Fact(original: 8m, remaining: 8m) },
+            piStageContext: Ctx(stageFree: 100m));
+
+        Assert.False(formation.IsLegal);
+        Assert.Contains("PI_LEGAL_QTY_OVER_LIMIT", formation.ConflictReason);
+        Assert.Contains("PI Original 8", formation.ConflictReason);
+    }
+
+    /// <summary>
+    /// S1-01 ⑥ **边界**：`Q=10` / 经济 `Max=6` / Stage 合法自由 **恰 10**
+    ///   ⇒ 硬上限边界相等**合法**，且经济 Max 不得把它拉低到 6。
+    /// </summary>
+    [Fact]
+    public void S101_经济Max6_Stage自由恰10_边界相等合法()
+    {
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(
+            Demand(netQty: 10m), Policy(max: 6m, allowSplit: false),
+            piFacts: new[] { Fact(original: 100m, remaining: 100m) },
+            piStageContext: Ctx(stageFree: 10m));
+
+        Assert.True(formation.IsLegal, formation.ConflictReason);
     }
 }

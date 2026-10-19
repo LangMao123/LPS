@@ -44,10 +44,21 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
   /** 分页：后端返回的 total（满足筛选条件全量条数） */
   const total = ref(0)
 
+  /* ===== 10-12 ME13 收口：KPI 聚合不再读 list.length（翻页会跳） =====
+   *  - 后端未落 summary 聚合端点（5号位 10-12 函未明确），store 端维护 cumulative 计数
+   *  - 筛选变化 → 重置 cumulative + visitedPages；翻页 → 已访问页跳过，未访问页累加
+   *  - upsert/cancel → 同步累计（保证新增/取消后 KPI 即时刷新）
+   *  - 后端 R1 summary 端点落地后可改为单一 source-of-truth，cumulative 退化为回填
+   */
+  const totalActive = ref(0)
+  const totalCancelled = ref(0)
+  /** 已访问页标记（key = pageIndex），filter 变化时清空 */
+  const visitedPages = new Set<number>()
+
   // ===== getters =====
-  /** Active 行数 */
+  /** Active 行数（当前页；KPI 用 totalActive 全集，activeCount 仅供调试/兼容） */
   const activeCount = computed(() => list.value.filter((x) => x.isActive).length)
-  /** 已取消行数 */
+  /** 已取消行数（当前页；KPI 用 totalCancelled 全集，cancelledCount 仅供调试/兼容） */
   const cancelledCount = computed(() => list.value.filter((x) => !x.isActive).length)
   /** 采购订单号去重集合（供筛选下拉用） */
   const distinctPoNos = computed(() => Array.from(new Set(list.value.map((x) => x.poNo))).sort())
@@ -57,6 +68,23 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
   )
 
   // ===== actions =====
+  /** 重置 cumulative KPI（筛选条件变化时调用） */
+  function resetKpiAggregate(): void {
+    totalActive.value = 0
+    totalCancelled.value = 0
+    visitedPages.clear()
+  }
+
+  /** 累加当前页到 cumulative KPI（已访问页跳过） */
+  function accumulateKpi(page: number): void {
+    if (visitedPages.has(page)) return
+    visitedPages.add(page)
+    for (const item of list.value) {
+      if (item.isActive) totalActive.value += 1
+      else totalCancelled.value += 1
+    }
+  }
+
   async function load(filter?: ManualEtaListFilter): Promise<void> {
     loading.value = true
     error.value = null
@@ -67,10 +95,19 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
         pageSize: filter?.pageSize ?? pageSize.value,
         ...(filter ?? {})
       }
+      // 筛选条件变化（不含 pageIndex/pageSize）→ 重置 cumulative KPI
+      const prev = lastFilter.value
+      const filterKeyChanged =
+        prev.materialIds?.join(',') !== next.materialIds?.join(',') ||
+        prev.poNos?.join(',') !== next.poNos?.join(',') ||
+        prev.materialCodes?.join(',') !== next.materialCodes?.join(',') ||
+        prev.activeOnly !== next.activeOnly
+      if (filterKeyChanged) resetKpiAggregate()
       // 5号位 2026-10-08 端点已切分页：返回 { items, total, page, pageSize }；旧 mock / 老版本直接返回数组
       //  - 老形态：直接当数组用；total 取数组长度
       //  - 新形态：取 .items + .total 还原
       const resp = await manualEtaApi.list(next)
+      let currentPage = next.pageIndex ?? pageIndex.value
       if (Array.isArray(resp)) {
         list.value = resp
         total.value = resp.length
@@ -79,7 +116,10 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
         total.value = Number(resp?.total ?? 0)
         if (typeof resp?.page === 'number') pageIndex.value = resp.page
         if (typeof resp?.pageSize === 'number') pageSize.value = resp.pageSize
+        currentPage = pageIndex.value
       }
+      // 累加当前页到 cumulative KPI
+      accumulateKpi(currentPage)
       lastFilter.value = next
     } catch (err) {
       handleError(err)
@@ -109,6 +149,7 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
    *  - 列表写回用新数组引用（map / spread），不直接下标赋值 / unshift —— ElTable :data
    *    依赖引用变化触发重渲，原地变更会出现"新增后不显示，刷新后显示"的问题
    *  - currentDetail 同步刷新
+   *  - 10-12 ME13：同步刷新 cumulative KPI（新增 → totalActive+1；更新 → 状态翻转也翻转累计）
    */
   async function upsert(input: ManualEtaUpsertInput): Promise<ManualEtaDto> {
     saving.value = true
@@ -117,11 +158,25 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
       const result = await manualEtaApi.upsert(input)
       const idx = list.value.findIndex((x) => sameBusinessKey(x, result))
       if (idx >= 0) {
+        const prevActive = list.value[idx].isActive
         list.value = list.value.map((x, i) => (i === idx ? result : x))
+        // 状态翻转：active↔cancelled，cumulative KPI 同步迁移
+        if (prevActive !== result.isActive) {
+          if (result.isActive) {
+            totalActive.value += 1
+            totalCancelled.value = Math.max(0, totalCancelled.value - 1)
+          } else {
+            totalCancelled.value += 1
+            totalActive.value = Math.max(0, totalActive.value - 1)
+          }
+        }
       } else {
         list.value = [result, ...list.value]
         // 新增：list 长度 +1，total 兜底 +1（避免「共 X 条」与「当前页」长期不一致）
         total.value = total.value + 1
+        // 新增默认 isActive=true（后端 ManualEtaService 默认），cumulative KPI 累加
+        if (result.isActive) totalActive.value += 1
+        else totalCancelled.value += 1
       }
       currentDetail.value = result
       return result
@@ -138,6 +193,7 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
    *  - 软删除，保留记录
    *  - 列表内查找 / currentDetail 同步均用 4 字段复合主键（同 upsert）
    *  - 列表写回用新数组引用（map），不直接下标赋值（ElTable :data 重渲依赖，@see upsert）
+   *  - 10-12 ME13：同步刷新 cumulative KPI（active → cancelled，totalActive-1/totalCancelled+1）
    */
   async function cancel(input: ManualEtaCancelInput): Promise<ManualEtaDto> {
     saving.value = true
@@ -146,7 +202,13 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
       const result = await manualEtaApi.cancel(input)
       const idx = list.value.findIndex((x) => sameBusinessKey(x, result))
       if (idx >= 0) {
+        const prevActive = list.value[idx].isActive
         list.value = list.value.map((x, i) => (i === idx ? result : x))
+        // active → cancelled：cumulative 翻转
+        if (prevActive && !result.isActive) {
+          totalActive.value = Math.max(0, totalActive.value - 1)
+          totalCancelled.value += 1
+        }
       }
       if (currentDetail.value && sameBusinessKey(currentDetail.value as ManualEtaDto, result)) {
         currentDetail.value = result
@@ -178,6 +240,7 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
     currentDetail.value = null
     error.value = null
     lastFilter.value = {}
+    resetKpiAggregate()
   }
 
   return {
@@ -190,6 +253,8 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
     pageIndex,
     pageSize,
     total,
+    totalActive,
+    totalCancelled,
     activeCount,
     cancelledCount,
     distinctPoNos,
@@ -198,6 +263,7 @@ export const useManualEtaStore = defineStore('aps.manualEta', () => {
     upsert,
     cancel,
     openDetail,
-    reset
+    reset,
+    resetKpiAggregate
   }
 })

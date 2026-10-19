@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — PI Position / 供给追溯（页面 7 / U16 / U17 / U18）
+ * APS V1 4号位 — 供给来源追溯（页面 7 / U16 / U17 / U18）
  *
  * 4号位文档第 13 节约束：
  *  - 6 类 PositionType：ERP_REMAINING / PRODUCTION / TRANSIT / WAITING / UNLOCATED / CROSS_STAGE
@@ -229,7 +229,7 @@ onMounted(() => {
     <!-- ===== 顶部 ===== -->
     <div class="page-header">
       <div>
-        <h2 class="page-title">PI Position / 供给追溯</h2>
+        <h2 class="page-title">供给来源追溯</h2>
         <p class="page-sub">
           6 类位置 × 9 类供给；未分配数量与采购占位依赖会自动判定 MES 下发资格
         </p>

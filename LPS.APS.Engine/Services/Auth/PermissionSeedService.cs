@@ -15,7 +15,7 @@ public class PermissionSeedService : IPermissionSeedService
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<PermissionSeedService> _logger;
 
-    /// <summary>V1 功能权限码种子（Code / Name / Module / ActionType / Description），对齐 DDL v1.3 的 34 码 + Setup 换型 3 码 + ResourceCalendar/ManualCapacity 各 3 码（43 码）。</summary>
+    /// <summary>V1 功能权限码种子（Code / Name / Module / ActionType / Description），对齐 DDL v1.3 的 34 码 + Setup 换型 3 码 + ResourceCalendar/ManualCapacity 各 3 码 + ParameterPublish 发布 1 码（44 码，D-1）。</summary>
     private static readonly (string Code, string Name, string Module, string ActionType, string Description)[] Seeds =
     {
         // Plan
@@ -42,6 +42,7 @@ public class PermissionSeedService : IPermissionSeedService
         ("aps.rule.publish", "发布规则", "Rule", "Execute", "发布规则版本"),
         ("aps.parameter.view", "查看参数", "Parameter", "View", "查看参数集/版本"),
         ("aps.parameter.edit", "编辑参数", "Parameter", "Edit", "编辑参数草稿"),
+        ("aps.parameter.publish", "发布参数", "Parameter", "Execute", "发布参数版本（D-1 独立授权，不因规则发布自动获得）"),
         ("aps.strategy.view", "查看策略", "Strategy", "View", "查看策略包/版本"),
         ("aps.strategy.edit", "编辑策略", "Strategy", "Edit", "编辑策略草稿"),
         ("aps.strategy.publish", "发布策略", "Strategy", "Execute", "发布策略版本"),

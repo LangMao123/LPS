@@ -164,7 +164,9 @@ const MOCK_RULE_SETS: RuleSetDto[] = [
     description: '完整排产场景规则集（含优先级/瓶颈/换型）',
     isActive: true,
     createdAt: fixedDate(200),
-    createdBy: 'admin'
+    createdBy: 'admin',
+    status: 'PUBLISHED',
+    currentVersionCode: 'rs-v1.0.0'
   },
   {
     id: 201,
@@ -173,7 +175,9 @@ const MOCK_RULE_SETS: RuleSetDto[] = [
     description: 'CTP 试算/插单评估专用',
     isActive: true,
     createdAt: fixedDate(150),
-    createdBy: 'admin'
+    createdBy: 'admin',
+    status: 'DRAFT',
+    draftVersionCode: 'rs-v2.0.0-draft'
   }
 ]
 
@@ -215,7 +219,9 @@ const MOCK_PARAMETER_SETS: ParameterSetDto[] = [
     description: '完整排产场景参数集（Lock/Supply/Procurement/SolverStrategy）',
     isActive: true,
     createdAt: fixedDate(200),
-    createdBy: 'admin'
+    createdBy: 'admin',
+    status: 'PUBLISHED',
+    currentVersionCode: 'ps-v1.0.0'
   },
   {
     id: 301,
@@ -224,7 +230,9 @@ const MOCK_PARAMETER_SETS: ParameterSetDto[] = [
     description: 'CTP 试算/插单评估专用参数集',
     isActive: true,
     createdAt: fixedDate(150),
-    createdBy: 'admin'
+    createdBy: 'admin',
+    status: 'DRAFT',
+    draftVersionCode: 'ps-v2.0.0-draft'
   }
 ]
 
@@ -559,8 +567,15 @@ export const strategyProfileApi = {
   },
 
   /* ===== 附 4. ParameterSetVersion 列表（策略 DRAFT 表单下拉源 #4）=====
-   * 后端：GET /api/governance/parameter-set/{parameterSetId}/versions（GovernanceController.cs L141）
+   * 后端：GET /api/governance/parameter-set/{parameterSetId}/versions（GovernanceController.cs L142）
    * 用途：选完 ParameterSet 后加载其下属版本，第二级下拉
+   *
+   * 10-15 曾经单独放宽超时到 60s：当时实测 PS-PROD(1305) 稳定 37s（其余参数集 16~17ms），
+   * 根因是后端 SELECT * 把 ContentSnapshotJson 大 LOB 读进内存再丢掉。
+   * 10-16 3号位 Q1/Q2 落码并部署（新增 GetSummariesByParameterSetIdAsync 显式列查询，
+   * 契约登记 S-12，HTTP 响应零变化）后复测：**1305 = 17ms / 286 = 16ms / 881 = 17ms / 规则集 19ms**
+   * ⇒ 回到全局默认超时。**不要再加回 timeout**，否则慢的原因会被永久掩盖。
+   * SP07a 已改为反向探针锁这条。
    */
   async listParameterSetVersions(parameterSetId: number): Promise<ParameterSetVersionDto[]> {
     if (APS_USE_MOCK) {

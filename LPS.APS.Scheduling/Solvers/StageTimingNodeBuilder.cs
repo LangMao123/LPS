@@ -31,20 +31,48 @@ namespace LPS.APS.Scheduling.Solvers;
 /// 【边界】本类只用 `DomainSolveRequest` / `ConstraintContext` 的既有数据，**不查库、不查参数表**
 ///   （0号位 §4.4 末句：1号位 只消费已解析的 StageLeadTimeFact）。
 ///
-/// 【可见性说明】<c>Scheduling</c> 无 <c>InternalsVisibleTo(Tests)</c>（见 `SetupOptimizer` 同款处置），
-///   故**纯逻辑入口 <see cref="BuildCore"/> 设为 public 且只收公开类型**，便于单测；
+/// 【可见性说明】⚠ **2026-10-14 更正**：本处旧文曾称「<c>Scheduling</c> 无 <c>InternalsVisibleTo(Tests)</c>」
+///   —— 该断言**已过期**：`LPS.APS.Scheduling.csproj` 现含 `<c>&lt;InternalsVisibleTo Include="LPS.APS.Tests" /&gt;</c>`
+///   （故 <see cref="TracePathUndetermined"/>、<see cref="TraceCompletionTimeUnavailable"/> 等
+///   <c>internal</c> 成员**可被单测直接引用**）。
+///   尽管如此，**纯逻辑入口 <see cref="BuildCore"/> 仍保持 public 且只收公开类型** —— 这是**有意的接口约束**
+///   （纯函数、可脱离 Context 单测），**不是**可见性限制所致；
 ///   依赖 <c>internal</c> 的 <see cref="ConstraintContext"/> 的装配留在 <see cref="Build"/>（internal）。
 /// </summary>
 public static class StageTimingNodeBuilder
 {
-    /// <summary>0号位 2026-09-29 裁决：三级均未命中（或折算值 ≤ 0）时的兜底提前期 = 3 天。</summary>
-    private const decimal FallbackLeadTimeHours = 72m;
-
-    /// <summary>契约码：三级均未命中 / 值不可用。PM 原码；1号位 回执 §四 定为 V1 合法 4 值之一。</summary>
+    /// <summary>
+    /// 契约码：三级均未命中 / 值不可用。PM 原码；1号位 回执 §四 定为 V1 合法 4 值之一。
+    ///
+    /// ⚠ 2026-10-15（0号位 第九轮 §3.1/§3.3）**口径更正**：命中本码 = **没有可用的合法参数**
+    ///   ⇒ `BuildCore` **不产出时间段、不推进游标**，只留 Issue（不虚造时长）。
+    ///   原「72h 兜底」被明禁 —— 逐字：「不使用 0 或 72h 臆造时间」。这与 2026-09-29 §4.4
+    ///   「不得默认 0 小时 …… 对该 Stage 的后续正式时间无法证明时，应显式进入数据/参数 Issue」
+    ///   本来就一致；72h 是 1号位 侧早先自行加的，不是该裁决给的。
+    /// </summary>
     private const string MissingLevel = "STAGE_LEADTIME_MISSING";
 
     /// <summary>④ 纯内存节点的显式标记（0号位 §9.3；2号位 写库口的判据）。</summary>
     private const string StageTimingNodeType = "STAGE_TIMING";
+
+    /// <summary>
+    /// 追溯码（**决策说明层**，非冻结 `ReasonCode` 字典）：路径未唯一确定 ⇒ 无 Routing Stage 提前期
+    /// 取自候选路径并集，`CompletionTime` 只是候选口径。见 <see cref="Build"/>。
+    /// </summary>
+    internal const string TracePathUndetermined = "STAGE_TIMING_PATH_UNDETERMINED";
+
+    /// <summary>
+    /// 追溯码（**决策说明层**，非冻结 `ReasonCode` 字典）：**既无末端真实 Task、又无任何无 Routing Stage
+    /// 提前期**进入 `CompletionTime` ⇒ 该时间退化为 `request.PlanningStart`，**不是**已排/预计完工/供给可用时间。
+    ///
+    /// 【为什么单列】0号位 2026-10-14《APS V1｜致1号位综合正式审核回复 v1.1》§三.2 逐字：
+    ///   「`BuildCore`仍用`terminal?.PlannedEndTime ?? PlanningStart`作游标，在`terminal==null`且
+    ///    `segments.Count==0`时仍可能生成`CompletionTime=PlanningStart`的`DemandCompletionFact`，
+    ///    而r13685新增`SolveTraceNote`仅在`!PathDetermined && segments.Count>0`时触发。请补此可见反例…」
+    ///   判词**成立**（源码已核）。本码把它从「静默」改成「显式留痕」。
+    ///   ⚠ 与「仅有 StageLeadTime 的业务 Stage」（`segments.Count>0`，0号位 §10.3 认可）**不可混为一类**。
+    /// </summary>
+    internal const string TraceCompletionTimeUnavailable = "DEMAND_COMPLETION_TIME_UNAVAILABLE";
 
     /// <summary>0号位 2026-09-29 裁决 §4.2/§4.3：V1 只认的三级命中码（Material / ProductFamily 级不认）。</summary>
     private static readonly HashSet<string> HitLevels = new(StringComparer.Ordinal)
@@ -80,7 +108,75 @@ public static class StageTimingNodeBuilder
             }
         }
 
-        return BuildCore(request, constraints.EffectiveStages, terminalByDemandKey);
+        var pathUndetermined = new List<string>();
+        var completionTimeUnavailable = new List<string>();
+        var missingLeadTimeStages = new List<(string DemandKey, string StageCode)>();
+        var facts = BuildCore(
+            request, constraints.EffectiveStages, terminalByDemandKey,
+            pathUndetermined, completionTimeUnavailable, missingLeadTimeStages);
+
+        // ── S2-01（0号位 2026-10-14《…再次整改回执正式审核回复》§二）──
+        //   判词逐字：「**对尚未选定Path或实际未排下的需求，不得把任意候选路径并集产生的时间当作权威承诺时间，
+        //   也不得据此生成假Task、漏计真实StageLeadTime或静默报完整完成。**」
+        //   ⇒ 路径未唯一确定、且**确实有**无 Routing Stage 提前期进入了 `CompletionTime` 时，
+        //     该需求的时间只是**候选/诊断**口径 ⇒ 经既有合法追溯通道（`SolveTraceNote`，
+        //     与 `DEMAND_GOAL_ABSENT` 同一先例，见 `PhaseTwoInitialScheduler:739`）**显式留痕，绝不静默**。
+        //   ⚠ **不自造 `ReasonCode` 枚举**：此位承载的是决策说明层取值（0号位 Q4）。
+        //   ⚠ 归一化 ON（V1 现状：全部 op 均为 `DEFAULT/1` ⇒ 该 Route 唯一 Path ⇒ 已确定）时
+        //     `pathUndetermined` **恒空** ⇒ **零回归**。仅「归一化 OFF + 真实多 Path」才可能非空。
+        foreach (var key in pathUndetermined)
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = key,
+                ReasonCode = TracePathUndetermined,
+                Message = "无 Routing Stage 提前期取自**候选路径并集**（该需求未选定唯一 Path，或整条未排下）"
+                          + "⇒ 本需求 `CompletionTime` 为**候选口径**，不得作为权威承诺时间；"
+                          + "待真实 Path 事实（2号位/5号位）落地后重算。",
+                Level = "Warning"
+            });
+        }
+
+        // ── 0号位 2026-10-14《…综合正式审核回复 v1.1》§三.2：**不得静默**给出退化的 `CompletionTime` ──
+        //   判词：「不得将`PlanningStart`或候选路径并集时间作为正式已排/预计完工/供给可用时间；
+        //     不能编造Task或制造业务短缺原因。」⇒ 此位显式留痕，供 2号位 读模型/订单交付/Supply 可用时间侧
+        //   识别「该 Demand 的 `CompletionTime` 无真实依据」，不得当作已排承诺。
+        foreach (var key in completionTimeUnavailable)
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = key,
+                ReasonCode = TraceCompletionTimeUnavailable,
+                Message = "该 Demand **无末端真实 Task（未排下）**，且其 `StageTimings` 为空 —— "
+                          + "或该物料纯无 Routing 且无任何提前期段，或该物料**有真实 Routing** 而其无 Routing "
+                          + "Stage 提前期属**候选口径**已按第七轮 §八.3 抑制 ⇒ `CompletionTime`/`AvailableTime` "
+                          + "退化为 `PlanningStart`，**不是**已排/预计完工/供给可用时间，"
+                          + "**不得**作为承诺或数量闭合依据；真实未排原因见 `UnscheduledTasks`。",
+                Level = "Warning"
+            });
+        }
+
+        // ── N8-01（0号位 2026-10-15 第九轮 §3.1/§3.3）：缺参的 Stage 显式进 Issue，**不虚造时间** ──
+        //   冻结依据：规则 S-006「缺参报 STAGE_LEADTIME_MISSING」；《04》场景7「无参数时形成
+        //   `STAGE_LEADTIME_MISSING`」「缺失参数进入 Issue/Explanation」；0号位 2026-09-29 §4.4
+        //   「不得默认 0 小时 …… 无法证明时显式进入数据/参数 Issue」「也不得删除 Stage」。
+        //   ⇒ 该 Stage 仍在范围内、仍被识别（不丢），只是**没有时长**可用，故只留 Issue、不产出时间段。
+        foreach (var (demandKey, stageCode) in missingLeadTimeStages)
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demandKey,
+                ReasonCode = MissingLevel,
+                Message = $"Stage `{stageCode}` 无可用 `StageLeadTimeParam`（DEPT_EXACT / "
+                          + "FACTORY_STAGE_DEFAULT / GLOBAL_STAGE_DEFAULT 三级均未命中）"
+                          + "⇒ 该 Stage 的后续正式时间**无法证明**：**不产出时间段、不推进游标**，"
+                          + "**不使用 0 或 72h 臆造时长**。该 Stage **保留在求解范围内、不得删除**；"
+                          + "待 3号位 补参数后重算（S-006 /《04》场景7 / 0号位 2026-09-29 §4.4）。",
+                Level = "Warning"
+            });
+        }
+
+        return facts;
     }
 
     /// <summary>
@@ -89,10 +185,26 @@ public static class StageTimingNodeBuilder
     /// <param name="request">求解请求（用其 StageLeadTimes / StageSequenceChains / LogicalProductionDemands / PlanningStart）。</param>
     /// <param name="effectiveStages">本次求解范围内的可达 Stage：MaterialId → StageCode 集合。</param>
     /// <param name="terminalByDemandKey">各 Demand 的末端真实 Task；无真实 Task 的 Demand 不出现在此字典中。</param>
+    /// <param name="pathUndeterminedDemandKeys">
+    /// 可选收集器（S2-01）：**路径未唯一确定且确实有无 Routing Stage 提前期进入 `CompletionTime`** 的
+    /// Demand 键。装配层 <see cref="Build"/> 据此写 `SolveTraceNote`（本方法保持**纯函数、无副作用**）。
+    /// </param>
+    /// <param name="completionTimeUnavailableDemandKeys">
+    /// 可选收集器（S2-01 补）：**既无末端真实 Task、又无任何提前期段** ⇒ `CompletionTime` 退化为
+    /// `PlanningStart` 的 Demand 键（0号位 2026-10-14 §三.2）。同样由 <see cref="Build"/> 写 `SolveTraceNote`。
+    /// </param>
+    /// <param name="missingLeadTimeStages">
+    /// 可选收集器（N8-01）：**在范围内、但三级均未命中合法 `StageLeadTimeParam`** 的
+    /// `(DemandKey, StageCode)`。这些 Stage **不产出时间段**（不虚造时长），由 <see cref="Build"/>
+    /// 写 `STAGE_LEADTIME_MISSING` 的 `SolveTraceNote`（0号位 2026-10-15 第九轮 §3.1/§3.3）。
+    /// </param>
     public static List<DemandCompletionFact> BuildCore(
         DomainSolveRequest request,
         IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
-        IReadOnlyDictionary<string, FinalTaskDraft> terminalByDemandKey)
+        IReadOnlyDictionary<string, FinalTaskDraft> terminalByDemandKey,
+        ICollection<string>? pathUndeterminedDemandKeys = null,
+        ICollection<string>? completionTimeUnavailableDemandKeys = null,
+        ICollection<(string DemandKey, string StageCode)>? missingLeadTimeStages = null)
     {
         var result = new List<DemandCompletionFact>();
         if (request.LogicalProductionDemands.Count == 0)
@@ -123,12 +235,41 @@ public static class StageTimingNodeBuilder
             var segments = new List<StageTimingSegmentFact>();
             DateTime? requiredStageEnd = null;
 
-            // ①「严格改法」（2026-10-12）：传入本需求**末端真实 Task 的选中路径** —— 归一化 OFF 时按
-            //   真实 `RouteCode/PathId` 过滤；两列为空（未排下 / 归一化 ON）⇒ 退回 `DEFAULT` 口径，零行为变化。
-            var routelessStages = GetRoutelessStages(
+            // ①「严格改法」（2026-10-12 / 2026-10-14 S2-01）：传入本需求**末端真实 Task 的选中路径**。
+            //   已确定唯一 Path ⇒ 严格过滤（权威）；仅确定到 Route / 未确定 ⇒ 并集（**候选口径**）。
+            //   归一化 ON（两列为空且载荷全 `DEFAULT/1`）⇒ 唯一 Path ⇒ 已确定，零行为变化。
+            var routeless = ResolveRoutelessStages(
                 demand.MaterialId, effectiveStages, request,
                 terminal?.RouteCode, terminal?.PathId);
-            if (routelessStages.Count > 0 &&
+            var routelessStages = routeless.Stages;
+
+            // ── 0号位 2026-10-14 第七轮正式复核 §八.3 门控（2026-10-15 落码）──
+            //   判词逐字：「必须可由**结果本身及稳定身份**区分**权威已排完成、真正纯无Routing且经合法
+            //     StageLeadTime形成的时间约束、未排占位/候选诊断**」「有StageTiming片段但**无选定合法Path/
+            //     末端Task**时，也可能存在**仅供诊断的时间**」「不接受只写一条Warning或只证明没有FinalTask」。
+            //
+            //   读码实测的**结构事实**：`PathDetermined` 取 `terminal?.RouteCode` ⇒ `terminal == null` 时
+            //   **恒为 false** ⇒ 未排需求的提前期**一律**是候选口径；而此前它照样写进 `StageTimings`
+            //   ⇒ 「(ii) 真正纯无Routing的**合法时间约束**」与「(iii) 有Routing但未排的**占位时间**」
+            //   在 `DemandCompletionFact` 上**完全同形**（`TerminalFinalDraftId == null` 且 `StageTimings` 非空）
+            //   ⇒ 下游无法「由结果本身」区分。
+            //
+            //   门控判据 = **是否有真实 Routing 在求解范围内**（`HasRoutingInScope`），**不是** `PathDetermined`：
+            //     · 未排 **且** 有 Routing（`true`）⇒ 时间无真实依据 ⇒ **不产出** `StageTimings`
+            //       ⇒ 该 Fact 落为「无末端 Task + 无时间段」= 0号位 点名的 (iii) **占位/候选诊断**；
+            //     · 未排 **且** 纯无 Routing（`false`）⇒ 0号位 §10.3 明文认可的「自起点起的纯提前期累计」
+            //       ⇒ **保留**（(ii) 合法时间约束）—— **不**因本门控被取消能力。
+            //   ⇒ 门控后三态在 Fact 上**可判**：
+            //     (i) `TerminalFinalDraftId != null`；(ii) 二者皆无但 `StageTimings.Count > 0`；
+            //     (iii) `TerminalFinalDraftId == null && StageTimings.Count == 0`。
+            //   ⚠ **不静默**：被抑制的候选口径由下方既有 `completionTimeUnavailable` 通道留痕
+            //     （`DEMAND_COMPLETION_TIME_UNAVAILABLE`），其文案已同步覆盖「含候选口径被抑制」这一支。
+            //   ⚠ **零回归**：`terminal != null`（已排下）时本判据恒 false ⇒ 逐字不变；
+            //     纯无 Routing 未排 时 `HasRoutingInScope == false` ⇒ 亦不变。
+            var suppressCandidateLeadTimes = terminal is null && routeless.HasRoutingInScope;
+
+            if (!suppressCandidateLeadTimes &&
+                routelessStages.Count > 0 &&
                 chainByMaterial.TryGetValue(demand.MaterialId, out var chain) &&
                 chain.Stages.Count > 0)
             {
@@ -160,6 +301,19 @@ public static class StageTimingNodeBuilder
                     }
 
                     var (hours, level) = ResolveLeadTime(leadTimeByKey, demand.MaterialId, stageCode);
+
+                    // ── N8-01（0号位 2026-10-15 第九轮 §3.1/§3.3）：缺参**不虚造时间** ──
+                    //   逐字：「对无合法参数 …… 的情形，保留真实 Issue 与诊断，**不使用 0 或 72h 臆造时间**」；
+                    //   反证要求「缺参数→Issue 不虚造 Time」。与 2026-09-29 §4.4 一致：
+                    //   「不得默认 0 小时 …… 对该 Stage 的后续正式时间无法证明时，应显式进入数据/参数 Issue」，
+                    //   且「也不得删除 Stage」。
+                    //   ⇒ 该 Stage **不产出时间段、不推进游标**（编不出时长），改由 Issue 表示（见 `Build`）。
+                    if (string.Equals(level, MissingLevel, StringComparison.Ordinal))
+                    {
+                        missingLeadTimeStages?.Add((demand.LogicalDemandKey, stageCode));
+                        continue;
+                    }
+
                     var end = cursor.AddHours((double)hours);
 
                     segments.Add(new StageTimingSegmentFact
@@ -204,6 +358,32 @@ public static class StageTimingNodeBuilder
                         requiredCompletion = terminal.PlannedEndTime;
                     }
                 }
+            }
+
+            // ── S2-01 留痕判据（见 Build 的 TracePathUndetermined）──
+            //   只有「路径未唯一确定」**且**「确实有提前期段进入了 CompletionTime」才算候选口径；
+            //   无 Routing Stage 一个都没有 ⇒ 时间完全来自真实 Task.End ⇒ 与路径无关，**不误报**。
+            if (!routeless.PathDetermined && segments.Count > 0)
+            {
+                pathUndeterminedDemandKeys?.Add(demand.LogicalDemandKey);
+            }
+
+            // ── 0号位 2026-10-14《APS V1｜致1号位综合正式审核回复 v1.1》§三.2 **代码可核风险（判词成立）** ──
+            //   判词逐字：「`BuildCore`仍用`terminal?.PlannedEndTime ?? PlanningStart`作游标，在`terminal==null`
+            //     且`segments.Count==0`时仍可能生成`CompletionTime=PlanningStart`的`DemandCompletionFact`…」
+            //   ⇒ 此时 `cursor` **从未推进**：既无真实 Task 的 `End`，也无任何无 Routing Stage 提前期依据
+            //     ⇒ `CompletionTime` = `PlanningStart` 是**退化值**，**不是**已排/预计完工/供给可用时间。
+            //   ⚠ 与「整条无真实 Operation Task、但**有** StageLeadTime 链」（`segments.Count>0`，
+            //     0号位 §10.3 明文认可：自起点起的纯提前期累计）**结构上不同**，必须分开留痕。
+            //   ── 2026-10-15（第七轮 §八.3 门控落地后）本判据**覆盖两支**，两者都是「时间无真实依据」：
+            //     · 支A：该物料**纯无 Routing** 且无任何提前期段 ⇒ 游标从未推进；
+            //     · 支B：该物料**有真实 Routing 但未排下** ⇒ 其无 Routing Stage 提前期本是**候选口径**，
+            //       已被上方 `suppressCandidateLeadTimes` 抑制（`segments` 因此为空）⇒ 同样无权威依据。
+            //   ⚠ 两支**共用同一条留痕**（不新造码）：对下游而言「该 Demand 的 `CompletionTime` 不可作权威」
+            //     是同一件事；分列会让 2号位 读模型侧出现两个等价的告警键。文案已覆盖两支。
+            if (terminal is null && segments.Count == 0)
+            {
+                completionTimeUnavailableDemandKeys?.Add(demand.LogicalDemandKey);
             }
 
             result.Add(new DemandCompletionFact
@@ -282,34 +462,65 @@ public static class StageTimingNodeBuilder
     /// 用求解范围（Phase1 可达 Stage）而非全量 BOM StagePath ——
     /// 否则会把 StartOperation/StartStage 之前已完成、本次不求解的 Stage 也算进来，凭空多出提前期。
     /// </summary>
-    // 可见性：`internal`（而非 private）—— 供 `LPS.APS.Tests` 经 `InternalsVisibleTo` **直接覆盖**
-    // 「①严格改法」的三条分支（有选中路径 / 无选中路径退回 DEFAULT / 多路径不得误判）。生产调用点只有 `BuildCore`。
+    /// <remarks>
+    /// **路径确定性三档**（0号位 2026-10-14《再次整改回执正式审核回复》§二 S2-01）：
+    ///   · **已确定**（`PathDetermined = true`）—— 选中 `RouteCode` 在该物料载荷下**唯一**对应一条 `PathId`
+    ///     （显式 `PathId` 命中，或该 `RouteCode` 只有一条 Path）⇒ 按 `(RouteCode, PathId)` **严格过滤**
+    ///     ⇒ 该结果**可作权威完成时间**依据。
+    ///   · **仅确定到 Route**（`PathDetermined = false`，`RouteCode` 非空但该 Route 有多条 Path）
+    ///     ⇒ 按 `RouteCode` 过滤（该 Route 全部 Path 的并集）⇒ **候选口径**。
+    ///   · **未确定**（`RouteCode` 空 / 载荷无该 Route 的工序 / 声称的 `PathId` 不在载荷内）
+    ///     ⇒ 取该物料**全部** RouteCode 的工序并集 ⇒ **候选口径**。
+    ///   ⇒ 后两档**不得**被下游当作**权威承诺时间**（见 <see cref="ResolveRoutelessStages"/> 的
+    ///     `PathDetermined` 与 <see cref="Build"/> 的 `TRACE:STAGE_TIMING_PATH_UNDETERMINED` 留痕）。
+    ///   归一化 ON（V1 现状：全部 op 均为 `DEFAULT/1`）时，三档**逐元素相同** ⇒ **严格 no-op / 零回归**。
+    /// </remarks>
+    // 可见性：`internal`（而非 private）—— 供 `LPS.APS.Tests` 经 `InternalsVisibleTo` **直接覆盖**。
+    // 生产调用点只有 `BuildCore`。保留 5 参签名（既有已提交单测依赖）。
     internal static List<string> GetRoutelessStages(
         int materialId,
         IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
         DomainSolveRequest request,
         string? selectedRouteCode = null,
         long? selectedPathId = null)
+        => ResolveRoutelessStages(materialId, effectiveStages, request, selectedRouteCode, selectedPathId)
+            .Stages;
+
+    /// <summary>
+    /// 「无 Routing Stage」判定结果 + **该判定是否建立在唯一确定的 Path 上**。
+    /// `PathDetermined = false` ⇒ <see cref="Stages"/> 只是**候选/诊断**口径，
+    /// **不得**被下游当作权威承诺时间（0号位 2026-10-14《…正式审核回复》§二 S2-01）。
+    ///
+    /// <see cref="HasRoutingInScope"/>（2026-10-15 新增，第七轮 §八.3）：
+    ///   本求解范围内**是否存在任何 Routing 工序** —— 它是「**真正纯无 Routing**」与
+    ///   「**有真实 Routing 但未排下/路径未定**」的分界，也是 <see cref="BuildCore"/> 门控的判据。
+    ///   ⚠ 为什么不复用 `PathDetermined`：`PathDetermined` 取 `terminal?.RouteCode` ⇒ **未排下的需求恒为
+    ///     false**（无 terminal 就无 RouteCode），于是「物料根本没有 Routing」与「有 Routing 但没排下」
+    ///     被**混成同一档**，无法区分 0号位 第七轮 §八.3 点名的 (ii)/(iii) 两态。
+    /// </summary>
+    internal readonly record struct RoutelessStageResolution(
+        List<string> Stages, bool PathDetermined, bool HasRoutingInScope = false);
+
+    /// <summary>
+    /// 见 <see cref="GetRoutelessStages(int, IReadOnlyDictionary{int, HashSet{string}}, DomainSolveRequest, string?, long?)"/>
+    /// 的 remarks（路径确定性三档）。
+    /// </summary>
+    internal static RoutelessStageResolution ResolveRoutelessStages(
+        int materialId,
+        IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
+        DomainSolveRequest request,
+        string? selectedRouteCode,
+        long? selectedPathId)
     {
         if (!effectiveStages.TryGetValue(materialId, out var inScopeStages) || inScopeStages.Count == 0)
         {
-            return new List<string>();
+            return new RoutelessStageResolution(new List<string>(), true, false);
         }
 
-        // ═══ ①「严格改法」（2026-10-12，答 2号位《技术事项汇总回执》§一 / §九#3）═══
-        //   旧实现把 `op.RouteCode != "DEFAULT"` 写死 ⇒ 只在 **归一化 ON**（`NormalizeToSingleRoute`
-        //   把所有 op 改成 `DEFAULT/1`）时成立。一旦 2号位 停归一化、载荷带来真实 `RouteCode/PathId`，
-        //   该条件**恒假** ⇒ `stagesWithRouting` 恒空 ⇒ **范围内所有 Stage 都被当成「无路由」**
-        //   ⇒ **凭空多出提前期**（2号位 在回执 §一 逐字复述了我方 §4 的这条判断，双方一致）。
-        //
-        //   严格口径：**只认该需求「已选中」那条路径上的工序**。
-        //     选中路径来源 = 本需求末端真实 Task 的 `(RouteCode, PathId)`（`FinalTaskDraft` 已有该两列）。
-        //     · 有选中路径 ⇒ 按 `RouteCode`（+ `PathId`，有值时）过滤 —— 多路径下**不会**把
-        //       未选中路径上的 Stage 误判成「有路由」（那会**漏**提前期，方向与旧实现相反）。
-        //     · **无选中路径**（需求整条没排下 / 该两列未填）⇒ 退回 V1 归一化口径（`DEFAULT`），
-        //       与旧行为**逐字等价** ⇒ 归一化 ON 的今天**零行为变化**（无回归）。
-        //   ⇒ 本改动在归一化 ON 时是**严格 no-op**；只有「归一化 OFF + 真实 RouteCode/PathId」才生效。
-        var restrictToSelectedRoute = !string.IsNullOrWhiteSpace(selectedRouteCode);
+        var hasRoute = !string.IsNullOrWhiteSpace(selectedRouteCode);
+        long? pathId = null;
+        var pathDetermined = hasRoute && TryResolveDeterminedPath(
+            materialId, request, selectedRouteCode!, selectedPathId, out pathId);
 
         var stagesWithRouting = new HashSet<string>(StringComparer.Ordinal);
         foreach (var op in request.RoutingOperations)
@@ -319,28 +530,84 @@ public static class StageTimingNodeBuilder
                 continue;
             }
 
-            if (restrictToSelectedRoute)
+            if (hasRoute && !string.Equals(op.RouteCode, selectedRouteCode, StringComparison.Ordinal))
             {
-                if (!string.Equals(op.RouteCode, selectedRouteCode, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (selectedPathId.HasValue && op.PathId != selectedPathId.Value)
-                {
-                    continue;
-                }
+                continue;
             }
-            else if (op.RouteCode != "DEFAULT")
+
+            if (pathDetermined && pathId.HasValue && op.PathId != pathId.Value)
             {
-                // 归一化口径（V1 现状：全部 op 均为 `DEFAULT/1`）
                 continue;
             }
 
             stagesWithRouting.Add(op.StageCode!);
         }
 
-        return inScopeStages.Where(stage => !stagesWithRouting.Contains(stage)).ToList();
+        // 本范围内**存在** Routing 工序 ⇒ 「有真实 Routing」（与「纯无 Routing」相对）。
+        // 注意：此处按 in-scope 判定，与 `routelessStages` 同源 —— 范围外的 Stage 不计入，
+        //   否则会把本次不求解的 Stage 也算成「有 Routing」（与 `GetRoutelessStages` 的口径一致）。
+        var hasRoutingInScope = inScopeStages.Any(stage => stagesWithRouting.Contains(stage));
+
+        return new RoutelessStageResolution(
+            inScopeStages.Where(stage => !stagesWithRouting.Contains(stage)).ToList(),
+            pathDetermined,
+            hasRoutingInScope);
+    }
+
+    /// <summary>
+    /// 判定「该需求的可执行路径是否**唯一确定**」。
+    ///   已确定 ⇒ `true`，并给出 `(routeCode, pathId?)`（`pathId` 恒有值 —— 唯一 Path 时自动补全）。
+    ///   未确定 ⇒ `false`（`RouteCode` 空 / 载荷无该 Route 的工序 / 声称的 `PathId` 不在载荷内 / 该 Route 多 Path）。
+    /// </summary>
+    internal static bool TryResolveDeterminedPath(
+        int materialId,
+        DomainSolveRequest request,
+        string selectedRouteCode,
+        long? selectedPathId,
+        out long? pathId)
+    {
+        pathId = null;
+        if (string.IsNullOrWhiteSpace(selectedRouteCode))
+        {
+            return false;
+        }
+
+        var pathIds = new HashSet<long>();
+        foreach (var op in request.RoutingOperations)
+        {
+            if (op.MaterialId != materialId)
+            {
+                continue;
+            }
+            if (!string.Equals(op.RouteCode, selectedRouteCode, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            pathIds.Add(op.PathId);
+        }
+
+        if (pathIds.Count == 0)
+        {
+            return false;   // 载荷里没有该 RouteCode 的工序 ⇒ 无从判定
+        }
+
+        if (selectedPathId.HasValue)
+        {
+            if (!pathIds.Contains(selectedPathId.Value))
+            {
+                return false;   // 声称的 PathId 不在载荷内 ⇒ 契约不一致 ⇒ 不可判定（不按"近似路径"放行）
+            }
+            pathId = selectedPathId.Value;
+            return true;
+        }
+
+        if (pathIds.Count == 1)
+        {
+            pathId = pathIds.First();
+            return true;
+        }
+
+        return false;   // 该 RouteCode 下多条 Path ⇒ 单凭 RouteCode 不可判定
     }
 
     /// <summary>
@@ -349,6 +616,10 @@ public static class StageTimingNodeBuilder
     ///
     /// ⚠️ 2026-09-29 口径更正：**值 ≤ 0 不再视同未命中** —— 命中就是命中，0 是参数行写下的值。
     /// （早先那版带 `fact.LeadTimeHours > 0m` 的守卫即被作废的口径，已删。）
+    ///
+    /// ⚠️ 2026-10-15：命中 `MissingLevel` 时**返回值不参与时间累计** —— 调用方（`BuildCore`）
+    /// 见到该 Level 直接走 Issue 分支、不产出时间段（见 `MissingLevel` 注释）。
+    /// 故此处回落值取 `0m` 只是占位，**不是**「按 0 小时排」。
     /// </summary>
     private static (decimal Hours, string Level) ResolveLeadTime(
         Dictionary<(int MaterialId, string StageCode), StageLeadTimeFact> index,
@@ -368,6 +639,6 @@ public static class StageTimingNodeBuilder
             }
         }
 
-        return (FallbackLeadTimeHours, MissingLevel);
+        return (0m, MissingLevel);
     }
 }

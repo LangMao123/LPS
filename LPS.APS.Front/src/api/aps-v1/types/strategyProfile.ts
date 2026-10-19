@@ -58,6 +58,22 @@ export const STRATEGY_PUBLISHABLE_STATUSES: StrategyVersionStatus[] = [
 /** 哪些状态允许 Disable（仅 PUBLISHED 可 Disable；DRAFT 拒绝；DISABLED/ARCHIVED 幂等保护拒绝） */
 export const STRATEGY_DISABLEABLE_STATUSES: StrategyVersionStatus[] = ['PUBLISHED']
 
+/**
+ * V1 实际可产生的状态（DDL 六态里只有这三个有写入路径）。
+ *
+ * SUBMITTED / APPROVED / ARCHIVED 是 `07 v5.1.10:3774`「V1 不做完整审批流闭环
+ * （仅保留审批/发布字段为后续预留）」为后续预留的，后端无任何赋值点：
+ * GovernanceVersionService 只写 Draft(:1670) / Published(:84,:131) / Disabled(:206,:237,:277)，
+ * 另外三个仅出现在读取侧白名单 PublishableStatuses(:63) 与拒绝提示(:193) 中。
+ *
+ * KPI 不要展示这三个 —— 恒为 0 会让用户误读成「还没提交过」，而 V1 根本提交不了。
+ */
+export const STRATEGY_V1_REACHABLE_STATUSES: StrategyVersionStatus[] = [
+  'DRAFT',
+  'PUBLISHED',
+  'DISABLED'
+]
+
 /* ==================== 主表 StrategyProfile ==================== */
 
 /** 策略包主表（不存规则/参数内容，只存 Profile 元信息） */
@@ -76,7 +92,13 @@ export interface StrategyProfileDto {
 
 /* ==================== 版本表 StrategyProfileVersion ==================== */
 
-/** 策略版本（绑定规则集版本 + 参数集版本，可发布可追溯） */
+/** 策略版本（绑定规则集版本 + 参数集版本，可发布可追溯）
+ *
+ * 10-14 起 GET /strategy-profile/{id}/versions 返回列表 DTO（3号位 A组 A4/A5），
+ * 比实体多 4 列（LEFT JOIN 带出），仅列表端点有；单条端点（published-version / default）仍是实体。
+ *   ruleSetVersionCode / parameterSetVersionCode —— 展示用编码（A4）
+ *   ruleSetId / parameterSetId —— 父主表 Id，供编辑态一级下拉直接定位（A5，替代串行反查）
+ */
 export interface StrategyProfileVersionDto {
   id: number
   strategyProfileId: number
@@ -93,6 +115,11 @@ export interface StrategyProfileVersionDto {
   approvedBy?: string | null
   createdAt: IsoDateTime
   createdBy?: string | null
+  /* ===== 以下 4 项仅列表端点返回 ===== */
+  ruleSetVersionCode?: string | null
+  parameterSetVersionCode?: string | null
+  ruleSetId?: number | null
+  parameterSetId?: number | null
 }
 
 /** 创建/更新 DRAFT 输入（对齐后端 StrategyProfileVersion 实体） */
@@ -172,6 +199,9 @@ export interface StrategyRunTraceDto {
   status: StrategyVersionStatus
   ruleSetVersionId: number
   parameterSetVersionId: number
+  /** 展示用编码（10-14 起 trace 响应已带，替代裸 Id 展示） */
+  ruleSetVersionCode?: string | null
+  parameterSetVersionCode?: string | null
   /** 引用本版本的所有 ScheduleRun（仅展示用） */
   referencingRuns: Array<{
     runId: number
@@ -203,6 +233,12 @@ export interface RuleSetDto {
   isActive: boolean
   createdAt: IsoDateTime
   createdBy?: string | null
+  /* ===== 以下 4 项仅「该规则集已有版本行」时才有；无版本则整个 key 缺失（WhenWritingNull）=====
+     判定「是否已配版本」的唯一可靠依据就是 status 在不在——与 rule.ts 的 hasVersion 派生同源。 */
+  status?: string | null
+  currentVersionCode?: string | null
+  draftVersionCode?: string | null
+  lastChangeReason?: string | null
 }
 
 /** RuleSetVersion（GET /rule-set/{id}/versions） */
@@ -218,7 +254,10 @@ export interface RuleSetVersionDto {
   createdAt: IsoDateTime
 }
 
-/** ParameterSet 主表（GET /parameter-sets） */
+/** ParameterSet 主表（GET /parameter-sets）
+ *  2026-10-15：后端已从裸实体换型为 ParameterSetListItemDto（与 RuleSetListItemDto 同构，
+ *  ParameterSetRepository.cs:81-103 OUTER APPLY 最新版本摘要），dev 实测 722 条里 3 条带版本摘要字段。
+ *  未声明 updatedAt/updatedBy：SQL 虽 SELECT 了这两列，但 dev 全为 NULL，序列化时整键被省略。 */
 export interface ParameterSetDto {
   id: number
   parameterSetCode: string
@@ -227,6 +266,13 @@ export interface ParameterSetDto {
   isActive: boolean
   createdAt: IsoDateTime
   createdBy?: string | null
+  /* ===== 以下 5 项仅「该参数集已有版本行」时才有；无版本则整个 key 缺失（WhenWritingNull）=====
+     判定「是否已配版本」的唯一可靠依据就是 status 在不在——与 RuleSetDto / rule.ts 的 hasVersion 同源。 */
+  status?: string | null
+  currentVersionCode?: string | null
+  draftVersionCode?: string | null
+  lastChangeReason?: string | null
+  publishedAt?: IsoDateTime | null
 }
 
 /** ParameterSetVersion（GET /parameter-set/{id}/versions） */

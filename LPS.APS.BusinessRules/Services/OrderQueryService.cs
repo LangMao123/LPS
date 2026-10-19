@@ -21,7 +21,7 @@ public class OrderQueryService
     /// <summary>
     /// 查询订单列表
     /// </summary>
-    public async Task<List<OrderListItemDto>> QueryOrdersAsync(
+    public async Task<PageResult<OrderListItemDto>> QueryOrdersAsync(
         int planVersionId,
         string? orderNo = null,
         string? materialCode = null,
@@ -30,6 +30,10 @@ public class OrderQueryService
         string? domainKey = null,
         string? delayStatus = null,
         string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -37,11 +41,15 @@ public class OrderQueryService
         IReadOnlySet<string>? allowedDomains = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
-        if (take <= 0 || take > 200) take = 50;
+        // take 越界不再静默回落 50（同类静默错数据；4号位 10-17 R3 在 PI 端点发现）。
+        // 非正数 → 默认 50；超上限 → 夹到 200。
+        if (take <= 0) take = 50;
+        if (take > 200) take = 200;
 
         return await _repository.QueryOrdersAsync(
             planVersionId, orderNo, materialCode, customerName,
             factoryCode, domainKey, delayStatus, status,
+            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
             skip, take, ct, allowedFactories, allowedDomains);
     }
 

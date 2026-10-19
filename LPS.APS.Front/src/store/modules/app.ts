@@ -35,6 +35,9 @@ interface AppState {
   fixedMenu: boolean
 }
 
+/** 左侧菜单底色 —— 项目固定值，不随 localStorage 里的历史主题设置漂移（见 initTheme） */
+export const MENU_BG_COLOR = '#001529'
+
 export const useAppStore = defineStore('app', {
   state: (): AppState => {
     return {
@@ -69,7 +72,7 @@ export const useAppStore = defineStore('app', {
         // 左侧菜单边框颜色
         leftMenuBorderColor: 'inherit',
         // 左侧菜单背景颜色
-        leftMenuBgColor: '#001529',
+        leftMenuBgColor: MENU_BG_COLOR,
         // 左侧菜单浅色背景颜色
         leftMenuBgLightColor: '#0f2438',
         // 左侧菜单选中背景颜色
@@ -328,6 +331,10 @@ export const useAppStore = defineStore('app', {
         valueLight: 'light'
       })
       isDark.value = this.getIsDark
+      this.setMenuTheme(MENU_BG_COLOR)
+      // 菜单底色钉回项目固定值：app store 是 persist 的，一旦有人（或调试时）在设置抽屉里
+      // 把菜单主题调成浅色，那份值会长期留在 localStorage 里，ConfigGlobal 挂载时的
+      // setCssVarTheme() 会把它写回 CSS 变量 ⇒ 每次刷新菜单都是白的。启动时强制重置。
       const newTitle = import.meta.env.VITE_APP_TITLE
       newTitle !== this.getTitle && this.setTitle(newTitle)
     }

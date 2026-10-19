@@ -116,12 +116,23 @@ public class QuantityReconciliationTests
     }
 
     [Fact]
-    public void 未排量不得为负_已排超过净量时截零()
+    public void 未排量不得为负_已排超过净量时截零且不算重叠()
     {
         var (remaining, overlap) = QuantityReconciliation.PerDemandRemaining(100m, 250m);
 
         remaining.Should().Be(0m);
-        overlap.Should().BeTrue();
+        // 已排 ≥ 净量 ⇒ 已排满，剩余被截为 0 ⇒ **不是**「部分已排却仍欠量」的重叠形态
+        overlap.Should().BeFalse();
+    }
+
+    [Fact]
+    public void 已排满但被报未排程_不是重叠_剩余为零()
+    {
+        // 1号位 报了未排程，但真实份额已覆盖需求净量 ⇒ 该行是回执口径偏差，不是重叠
+        var (remaining, overlap) = QuantityReconciliation.PerDemandRemaining(10m, 10m);
+
+        remaining.Should().Be(0m);
+        overlap.Should().BeFalse();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -259,5 +270,68 @@ public class QuantityReconciliationTests
         r.DeltaQty.Should().Be(0m);
         r.DemandCount.Should().Be(0);
         r.MissingDemandKeys.Should().BeEmpty();
+        r.UnreportedRemainderQty.Should().Be(0m);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 九、Run 级「未排量」必须分两段：1号位 回执集合 ＋ 未报未排程集合
+    //     （2026-10-19 复核：DOMAIN 行只记前者 ⇒ 把 ③ 两族的缺口读成 0）
+    // ═══════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void 已报未排程的剩余量只进回执段_不进未报段()
+    {
+        var demands = new[] { Demand("P_1", 1000m) };
+        var scheduled = new Dictionary<string, decimal> { ["P_1"] = 800m };
+
+        var r = Reconcile(demands, scheduled, Unsched("P_1"));
+
+        r.UnscheduledQtyTotal.Should().Be(200m);          // 1号位 回执段
+        r.UnreportedRemainderQty.Should().Be(0m);         // 不得重复计量
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty).Should().Be(200m);
+    }
+
+    [Fact]
+    public void 部分已排但未报未排程_剩余量进未报段且回执段为零()
+    {
+        var demands = new[] { Demand("P_1", 1000m) };
+        var scheduled = new Dictionary<string, decimal> { ["P_1"] = 300m };
+
+        var r = Reconcile(demands, scheduled);   // 未报未排程
+
+        r.UnscheduledQtyTotal.Should().Be(0m);
+        r.UnreportedRemainderQty.Should().Be(700m);
+        r.DeltaQty.Should().Be(700m);                     // Δ 仍按回执段算 ⇒ 恒等于未报段的量
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty).Should().Be(r.DemandNetQtyTotal - r.ScheduledQtyTotal);
+    }
+
+    [Fact]
+    public void 凭空蒸发的需求_全额进未报段且闭总量与净量减已排一致()
+    {
+        var demands = new[] { Demand("P_1", 1000m), Demand("P_2", 500m) };
+        var scheduled = new Dictionary<string, decimal> { ["P_1"] = 1000m };
+
+        var r = Reconcile(demands, scheduled);
+
+        r.UnscheduledQtyTotal.Should().Be(0m);
+        r.UnreportedRemainderQty.Should().Be(500m);
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty).Should().Be(500m);
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty)
+            .Should().Be(r.DemandNetQtyTotal - r.ScheduledQtyTotal);
+    }
+
+    [Fact]
+    public void 两段之和恒等于净量减已排_回归本次三节点示例()
+    {
+        // 例1：Q=10 / S=3.3333 / U=6.6667，且该需求已报未排程 ⇒ 未报段为 0
+        var r = Reconcile(
+            new[] { Demand("999201_1", 10m) },
+            new Dictionary<string, decimal> { ["999201_1"] = 3.3333m },
+            Unsched("999201_1"));
+
+        r.UnreportedRemainderQty.Should().Be(0m);
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty).Should().Be(6.6667m);
+        (r.UnscheduledQtyTotal + r.UnreportedRemainderQty)
+            .Should().Be(r.DemandNetQtyTotal - r.ScheduledQtyTotal);
     }
 }

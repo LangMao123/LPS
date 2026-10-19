@@ -20,6 +20,22 @@
     - mode=edit：  编辑 DRAFT，提交后仅调 PUT /version/{id}
 
   提交成功通过 emit('submit') 抛回 StrategyVersionDraftInput，由父组件决定调 store.createDraft / updateDraft
+
+  10-14（3号位 A组 A5）：编辑态一级下拉不再逐个主表串行拉版本反查父 Id（dev 实测 698 主表 → 698 次请求）。
+    改读 versions 列表 DTO 自带的 ruleSetId / parameterSetId，直接赋值给 form，watch 照旧拉该主表的版本列表。
+    版本加载器改为「已选版本仍属该主表则保留」——编辑态回填因此不会丢选中值。
+
+  10-15：一级「规则集」下拉只列已配版本的（原来列全量，选中后二级下拉空——dev 698 条里 695 条无版本行）。
+    取数不再带查询参数（带 pageSize 时后端硬顶 500 且顺序不保证，有版本的 id 1 / 538 被截掉）。
+
+  10-15（3号位 Q1 落码后）：一级「参数集」下拉与规则集同款处理——
+    ① 取数去掉 pageSize（硬顶 500，dev 实测有版本的 PS_DEMO(286) 排在第 571 位会被截掉）；
+    ② 只列 status 非空者（722 条里 719 条无版本行，选中后二级下拉必空）。
+    判「配没配版本」的依据是后端新加的版本摘要字段 status，dev 已实测生效。
+
+  10-15（用户报「选参数集后版本接口报错」）：PS-PROD(1305) 的 versions 端点稳定 37s
+    （后端 SELECT * 读大 LOB，见 listParameterSetVersions 注释与致 3号位 函），
+    30s 默认超时下必然报 timeout —— 该调用单独放宽到 60s。四处加载失败提示一并去 axios 原文。
 -->
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -104,23 +120,38 @@ const parameterSetVersionsLoading = ref(false)
 async function loadRuleSets(): Promise<void> {
   ruleSetsLoading.value = true
   try {
-    ruleSets.value = await strategyProfileApi.listRuleSets({ activeOnly: true, pageSize: 500 })
-  } catch (err) {
-    ElMessage.error(`加载规则集主表失败：${(err as Error).message}`)
+    // 10-15：不下任何查询参数。两个原因——
+    //   ① 带 pageSize 时后端硬顶 500 条且顺序不保证，dev 实测 698 条里只回 id 629~1802，
+    //      唯一有版本的 RS_DEMO(538) 和 TEST-RS(1) 都被截掉，策略包永远绑不上；不带参数回全量 698。
+    //   ② 只列「已配版本」的：dev 698 条里 695 条根本没有版本行，选中后第二级下拉必空，
+    //      用户无从预判。判定口径同 rule.ts 的 hasVersion——status 在不在就是唯一事实。
+    const all: RuleSetDto[] = await strategyProfileApi.listRuleSets()
+    ruleSets.value = all.filter((r) => r.isActive && r.status != null && r.status !== '')
+  } catch {
+    // 10-15：不再把 axios 原文（如 timeout of 30000ms exceeded）抛给用户，大白话即可；
+    // 原始错误在 F12 Network 里查。
+    ElMessage.error('加载规则集主表失败，请稍后重试')
   } finally {
     ruleSetsLoading.value = false
   }
 }
 
 async function loadRuleSetVersions(ruleSetId: number | undefined): Promise<void> {
+  const prev = form.ruleSetVersionId
   ruleSetVersions.value = []
-  form.ruleSetVersionId = undefined
-  if (ruleSetId === undefined) return
+  if (ruleSetId === undefined) {
+    form.ruleSetVersionId = undefined
+    return
+  }
   ruleSetVersionsLoading.value = true
   try {
-    ruleSetVersions.value = await strategyProfileApi.listRuleSetVersions(ruleSetId)
-  } catch (err) {
-    ElMessage.error(`加载规则集版本失败：${(err as Error).message}`)
+    const list: RuleSetVersionDto[] = await strategyProfileApi.listRuleSetVersions(ruleSetId)
+    ruleSetVersions.value = list
+    // 已选版本仍属该主表则保留（编辑态回填走这条）；否则清空——版本必须与主表匹配，否则 FK 违反
+    form.ruleSetVersionId = prev != null && list.some((v) => v.id === prev) ? prev : undefined
+  } catch {
+    ElMessage.error('加载规则集版本失败，请稍后重试')
+    form.ruleSetVersionId = undefined
   } finally {
     ruleSetVersionsLoading.value = false
   }
@@ -129,26 +160,35 @@ async function loadRuleSetVersions(ruleSetId: number | undefined): Promise<void>
 async function loadParameterSets(): Promise<void> {
   parameterSetsLoading.value = true
   try {
-    parameterSets.value = await strategyProfileApi.listParameterSets({
-      activeOnly: true,
-      pageSize: 500
-    })
-  } catch (err) {
-    ElMessage.error(`加载参数集主表失败：${(err as Error).message}`)
+    // 10-15：与 loadRuleSets 同款两条处理。
+    //   ① 不带 pageSize：后端 pageSize 硬顶 500，dev 实测 722 条里带版本的 PS_DEMO(286) 排在第 571 位，
+    //      带上 500 会被截掉——与 10-15 规则集下拉同一个坑（当时 RS_DEMO(538) 就是这么丢的）。
+    //   ② 只列「已配版本」的：722 条里 719 条根本没有版本行，选中后第二级下拉必空，用户无从预判。
+    const all: ParameterSetDto[] = await strategyProfileApi.listParameterSets({ activeOnly: true })
+    parameterSets.value = all.filter((p) => p.isActive && p.status != null && p.status !== '')
+  } catch {
+    ElMessage.error('加载参数集主表失败，请稍后重试')
   } finally {
     parameterSetsLoading.value = false
   }
 }
 
 async function loadParameterSetVersions(parameterSetId: number | undefined): Promise<void> {
+  const prev = form.parameterSetVersionId
   parameterSetVersions.value = []
-  form.parameterSetVersionId = undefined
-  if (parameterSetId === undefined) return
+  if (parameterSetId === undefined) {
+    form.parameterSetVersionId = undefined
+    return
+  }
   parameterSetVersionsLoading.value = true
   try {
-    parameterSetVersions.value = await strategyProfileApi.listParameterSetVersions(parameterSetId)
-  } catch (err) {
-    ElMessage.error(`加载参数集版本失败：${(err as Error).message}`)
+    const list: ParameterSetVersionDto[] =
+      await strategyProfileApi.listParameterSetVersions(parameterSetId)
+    parameterSetVersions.value = list
+    form.parameterSetVersionId = prev != null && list.some((v) => v.id === prev) ? prev : undefined
+  } catch {
+    ElMessage.error('加载参数集版本失败，请稍后重试；若一直失败，请联系系统管理员')
+    form.parameterSetVersionId = undefined
   } finally {
     parameterSetVersionsLoading.value = false
   }
@@ -159,7 +199,7 @@ onMounted(() => {
   loadParameterSets()
 })
 
-/** 选 RuleSet 时清空 RuleSetVersion 并加载下属版本 */
+/** 选 RuleSet 时加载其下属版本（loader 负责清掉不再匹配的旧版本） */
 watch(
   () => form.ruleSetId,
   (newId, oldId) => {
@@ -189,40 +229,10 @@ watch(
       form.effectiveFrom = props.version.effectiveFrom ?? undefined
       form.effectiveTo = props.version.effectiveTo ?? undefined
       form.isDefault = props.version.isDefault
-      // 编辑模式：根据已知 ruleSetVersionId 反查父 RuleSet ID
-      if (form.ruleSetVersionId !== undefined) {
-        try {
-          const allSets = await strategyProfileApi.listRuleSets({ pageSize: 500 })
-          // 找不到精确 ruleSetId 时不强写，让用户重选
-          for (const rs of allSets) {
-            const vers = await strategyProfileApi.listRuleSetVersions(rs.id).catch(() => [])
-            if (vers.some((v: RuleSetVersionDto) => v.id === form.ruleSetVersionId)) {
-              form.ruleSetId = rs.id
-              await loadRuleSetVersions(rs.id)
-              form.ruleSetVersionId = props.version.ruleSetVersionId
-              break
-            }
-          }
-        } catch {
-          /* 静默：用户可手动重选 */
-        }
-      }
-      if (form.parameterSetVersionId !== undefined) {
-        try {
-          const allSets = await strategyProfileApi.listParameterSets({ pageSize: 500 })
-          for (const ps of allSets) {
-            const vers = await strategyProfileApi.listParameterSetVersions(ps.id).catch(() => [])
-            if (vers.some((v: ParameterSetVersionDto) => v.id === form.parameterSetVersionId)) {
-              form.parameterSetId = ps.id
-              await loadParameterSetVersions(ps.id)
-              form.parameterSetVersionId = props.version.parameterSetVersionId
-              break
-            }
-          }
-        } catch {
-          /* 静默 */
-        }
-      }
+      // 10-14（A5）：列表 DTO 已带 ruleSetId / parameterSetId，一级下拉直接定位父主表，
+      // 由 watch 触发版本加载（loader 会保留仍属该主表的已选版本）——零额外请求。
+      if (props.version.ruleSetId != null) form.ruleSetId = props.version.ruleSetId
+      if (props.version.parameterSetId != null) form.parameterSetId = props.version.parameterSetId
     } else {
       form.versionCode = ''
       form.ruleSetId = undefined
@@ -312,6 +322,7 @@ async function onSubmit(): Promise<void> {
         <ElSelect
           v-model="form.ruleSetId"
           placeholder="先选规则集主表"
+          no-data-text="还没有配过版本的规则集，请先到「规则维护」页新建草稿"
           filterable
           :loading="ruleSetsLoading"
           style="width: 100%"
@@ -347,6 +358,7 @@ async function onSubmit(): Promise<void> {
         <ElSelect
           v-model="form.parameterSetId"
           placeholder="先选参数集主表"
+          no-data-text="还没有配过版本的参数集，请先到「规则维护」页新建草稿"
           filterable
           :loading="parameterSetsLoading"
           style="width: 100%"

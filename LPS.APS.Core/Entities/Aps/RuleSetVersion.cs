@@ -27,6 +27,15 @@ public class RuleSetVersion
     public string? DemandPriorityJson { get; set; }
 
     /// <summary>
+    /// 换型规则子块 JSON（详情投影中间态；C-2 整改，2026-10-17）：
+    /// 镜像 <see cref="DemandPriorityJson"/> 投影——读路径经 <c>GovernanceVersionService.ProjectRuleSetContent</c>
+    /// 从 ContentSnapshotJson 的 "SetupTransitionRules" 子块提取到本内存字段，供规则集详情 / published-version 端点
+    /// 回放版本对应的 Setup 主题内容（0号位 复核 7.3「详情接口应能返回 Setup 主题内容」）；发布装配仍走
+    /// <see cref="ContentSnapshotJson"/> 持久化，本字段仅读路径中间态。
+    /// </summary>
+    public string? SetupTransitionRulesJson { get; set; }
+
+    /// <summary>
     /// 发布内容快照 JSON（方案 A 落点，契约 §6.10.5；DDL 由 2号位 按变更申请执行）
     /// 该版本发布时的完整规则内容（含 DemandPriority 子块），可重放载体；PUBLISHED 后不可原地修改。
     /// </summary>

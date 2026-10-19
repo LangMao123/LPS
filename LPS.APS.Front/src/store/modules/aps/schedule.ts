@@ -52,20 +52,23 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
   /**
    * 异常与原因解释页 version-bar 用的优先级分组（10-09 重构：替代硬截 `versions.slice(0, 3)`）
    *  - activeVersion：当前生效版本（PMC 关注的"真·当前"）
-   *  - recentComputed：最近 3 条已求解（夜间批 + 白天手工的产物，对比参考）
+   *  - recentComputed：最近 3 条算完待确认（夜间批 + 白天手工的产物，对比参考）
    *  - failedVersions：失败版本（数量通常 0~1，PMC 排查用）
+   *
+   * 2026-10-16：词表对齐冻结 07 §4.2 —— 原 Computed→CANDIDATE、原 ComputeFailed→FAILED
+   * （2号位 已统一，后端永不返旧值，「或 ComputeFailed」分支是死代码，已删）
    */
   const activeVersion = computed(() => versions.value.find((v) => v.status === 'ACTIVE') ?? null)
   const recentComputed = computed(() =>
-    versions.value.filter((v) => v.status === 'Computed').slice(0, 3)
+    versions.value.filter((v) => v.status === 'CANDIDATE').slice(0, 3)
   )
   const failedVersions = computed(() =>
-    versions.value.filter((v) => v.status === 'FAILED' || v.status === 'ComputeFailed').slice(0, 2)
+    versions.value.filter((v) => v.status === 'FAILED').slice(0, 2)
   )
   /**
    * 渲染列表（按业务优先级去重）：
    *   1) ACTIVE（置顶，PMC 一眼定位"现在跑哪版"）
-   *   2) 最近 3 条 Computed
+   *   2) 最近 3 条算完待确认（CANDIDATE）
    *   3) 失败版本（最多 2 条）
    *   4) 当前已选版本兜底（避免"选了之后按钮列表看不到"）
    */

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Xunit;
 using LPS.APS.Scheduling.Solvers;
 using LPS.APS.Core.Dto;
+using LPS.APS.Application.Models;   // G3 同链串测：2号位 BuildStates（产出端）
 using RoutingOperation = LPS.APS.Core.Entities.APS.RoutingOperation;
 using RoutingDependency = LPS.APS.Core.Entities.APS.RoutingDependency;
 using OperationResourceEligibility = LPS.APS.Core.Entities.APS.OperationResourceEligibility;
@@ -577,8 +578,8 @@ public class ExecutionBatchDraftTests
     /// **AUD-1-004 反证**（0号位《APS_V1_2_20261010.md》§3，P0/CONFIRMED）：生效规则按
     ///   `MaterialId + **明确** ProductionDepartmentId` **精确匹配**；
     ///   `ProductionDepartmentId == null` 的历史行**只作兼容**，**不得**在 Solver 里重新变成
-    ///   「Material 级默认」。真实装载同口径：3号位 `TaskSplitRuleConfigProjector.Project`
-    ///   已按 v5.1.10 收口④**排除** NULL 部门行 ⇒ 快照里根本不存在 NULL 部门规则。
+    ///   「Material 级默认」。真实装载同口径：治理写路径 Create/Update 强制 `ProductionDepartmentId` 必填
+///   （v5.1.10 收口④）⇒ 表里根本不存在 NULL 部门规则（⑧投影已退休，装载由 2号位 表直读）。
     ///
     /// 三类反证（裁词「精确匹配、NULL记录、配置存在但无效均做反证」）：
     ///   ① **精确命中** ⇒ 返该策略（`Valid`）；
@@ -1252,6 +1253,158 @@ public class ExecutionBatchDraftTests
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    //  G3. **同链串测**（2026-10-14，取 2号位 2026-10-14 件 §六 建议「乙」）——
+    //     产出端 = 2号位 `TaskSplitRuleConfigProjector.BuildStates` 的**真实产出**（**非**手工 `StateEntry`），
+    //     消费端 = 1号位 `PhaseOneConstraintBuilder` → `ResolveExecutionBatchPolicy`。
+    //
+    //     为什么不能只靠 G2 组：G2 用手工构造的载体，只证明「消费侧能按四态分支」；
+    //       **不能**证明「产出端真的产出这四态、且两端字段吻合」——
+    //       即 2号位 所谓「产出→消费 是同一条链的**两端各自取证**，未**串测**」。
+    //       （通则：结构等同的类型**不等于**行为等同 ⇒ 手工夹具是「结果一致性」护栏，非接口反证。）
+    //
+    //     ⚠ 与 G2 组分工：G2 = **消费侧**分支正确性（含 C-2 键未覆盖 / C-3 值越域边界）；
+    //       G3 = **两端接口吻合**（四态各一例，输入全部由 `BuildStates` 生成）。
+    //     ⚠ 本组**不触库**（用户红线：Integration 直连生产库，只跑 Unit）。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>G3 串测：本 Run 生效时点（`BuildStates` 的 `asOf`，生产＝Run 冻结时点）。</summary>
+    private static readonly DateTime G3AsOf = new(2026, 10, 14, 8, 0, 0, DateTimeKind.Unspecified);
+
+    /// <summary>
+    /// G3 串测夹具：一条**窗口内**的合规规则行（`Preferred &gt; 0` ⇒ 与发布闸
+    ///   `TaskSplitRuleConfigGovernanceService.IsSnapshotEligible` 同口径 ⇒ 可过闸入版本）。
+    /// </summary>
+    private static BatchPolicyRuleSnapshot G3InWindowRow() => new()
+    {
+        MaterialId = MaterialId,
+        ProductionDepartmentId = DeptId,
+        MinExecutionBatchQty = null,
+        MaxExecutionBatchQty = null,
+        PreferredBatchQty = 1m,
+        AllowSplit = false,
+        AllowMerge = false,
+        EffectiveFrom = G3AsOf.AddHours(-1),
+        EffectiveTo = G3AsOf.AddHours(1)
+    };
+
+    /// <summary>
+    /// G3① **`Valid` 串测**：`BuildStates`（窗口内合规行）产出 `Valid` ⇒ 经装载与消费 ⇒
+    ///   `BatchPolicyMatchState.Valid` ＋ **取到同键参数行** ＋ `MatchSource` **逐字透传**。
+    /// </summary>
+    [Fact]
+    public void 串测_Valid_BuildStates真实产出_经装载与消费_取到策略且来源透传()
+    {
+        var row = G3InWindowRow();
+        var states = TaskSplitRuleConfigProjector.BuildStates(
+            new[] { row }, new[] { (MaterialId, (int?)DeptId) }, G3AsOf);
+        var entry = Assert.Single(states);
+        Assert.Equal(BatchPolicyState.Valid, entry.State);        // 产出端
+
+        var request = BuildRequest(
+            qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { row }, batchPolicyStates: states);
+
+        var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
+        var res = PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy(
+            Demand(startStageCode: "STAGE1"), request, constraints);
+
+        Assert.Equal(PhaseTwoInitialScheduler.BatchPolicyMatchState.Valid, res.State);   // 消费端
+        Assert.NotNull(res.Policy);
+        Assert.Equal(entry.MatchSource, res.MatchSource);        // 产出端 → 消费端 逐字
+    }
+
+    /// <summary>
+    /// G3② **`Invalid` 串测**：`BuildStates`（**窗口外**行 —— 本链 `INVALID` 唯一可达成因＝生效时点）
+    ///   产出 `Invalid` ⇒ 消费侧判 `Invalid` ⇒ 端到端 `BATCH_POLICY_CONFLICT`。
+    ///
+    /// **本用例同时钉死「列表里有行也不得被当 `Valid` 用」**：该行**照生产实况仍在 `BatchPolicies` 里**
+    ///   （`CropToDomain` **不按状态过滤**，2号位 2026-10-14 件 §8.1 实测）⇒ `case Invalid:` **根本不看列表**。
+    /// </summary>
+    [Fact]
+    public async Task 串测_Invalid_BuildStates真实产出_端到端为策略冲突且不取行()
+    {
+        var expired = G3InWindowRow();
+        expired.EffectiveTo = G3AsOf.AddHours(-1);                // 本 Run 时点已过期
+        var states = TaskSplitRuleConfigProjector.BuildStates(
+            new[] { expired }, new[] { (MaterialId, (int?)DeptId) }, G3AsOf);
+        Assert.Equal(BatchPolicyState.Invalid, Assert.Single(states).State);   // 产出端
+
+        // 生产实况：`BatchPolicies` 仍含该行（无状态过滤）⇒ 反证「消费侧不得凭列表命中当 Valid」。
+        var request = BuildRequest(
+            qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { expired }, batchPolicyStates: states);
+
+        var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
+        Assert.Single(constraints.ExecutionBatchPolicies);        // 行确实在载荷里
+        var res = PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy(
+            Demand(startStageCode: "STAGE1"), request, constraints);
+        Assert.Equal(PhaseTwoInitialScheduler.BatchPolicyMatchState.Invalid, res.State);
+        Assert.Null(res.Policy);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.Empty(result.FinalTasks);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("BATCH_POLICY_CONFLICT", unscheduled.Reason);
+        Assert.NotEqual("BATCH_POLICY_MISSING", unscheduled.Reason);
+        Assert.NotEqual("BATCH_POLICY_STATE_UNAVAILABLE", unscheduled.Reason);
+    }
+
+    /// <summary>
+    /// G3③ **`Missing` 串测**：`BuildStates`（⑧块**完全缺配** ⇒ `rules` 空集）产出 `Missing`
+    ///   ⇒ 端到端 `BATCH_POLICY_MISSING`。
+    /// </summary>
+    [Fact]
+    public async Task 串测_Missing_BuildStates真实产出_端到端为缺策略()
+    {
+        var states = TaskSplitRuleConfigProjector.BuildStates(
+            Array.Empty<BatchPolicyRuleSnapshot>(), new[] { (MaterialId, (int?)DeptId) }, G3AsOf);
+        Assert.Equal(BatchPolicyState.Missing, Assert.Single(states).State);   // 产出端
+
+        var request = BuildRequest(
+            qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(), batchPolicyStates: states);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.Empty(result.FinalTasks);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("BATCH_POLICY_MISSING", unscheduled.Reason);
+        Assert.NotEqual("BATCH_POLICY_STATE_UNAVAILABLE", unscheduled.Reason);
+    }
+
+    /// <summary>
+    /// G3④ **`Unavailable` 串测**：`BuildStates`（`unavailableSource` 非空 ＝ 装载失败通道）
+    ///   产出 `Unavailable` ⇒ 映射 `Unknown` ⇒ 端到端 `BATCH_POLICY_STATE_UNAVAILABLE`。
+    /// 0号位 文件3 §2：技术失败**不得直接视为 `MISSING`**（否则误启 `Q_C`）。
+    /// </summary>
+    [Fact]
+    public async Task 串测_Unavailable_BuildStates真实产出_端到端为状态不可获得()
+    {
+        const string loadError = "装载失败：规则数据 JSON 损坏";
+        var states = TaskSplitRuleConfigProjector.BuildStates(
+            new[] { G3InWindowRow() }, new[] { (MaterialId, (int?)DeptId) }, G3AsOf,
+            unavailableSource: loadError);
+        var entry = Assert.Single(states);
+        Assert.Equal(BatchPolicyState.Unavailable, entry.State);   // 产出端
+        // 2026-10-14（2号位）：`MatchSource` 已按 1号位 回执 §三 定稿为**值域常量** —— Unavailable 恒以
+        // `LOAD_ERROR` 起头，装载失败的具体原因作为**明细**随行（只有调用方知道、从条目不可复原 ⇒ 不丢）。
+        Assert.StartsWith(BatchPolicyMatchSource.LoadError, entry.MatchSource);
+        Assert.Contains(loadError, entry.MatchSource, StringComparison.Ordinal);
+
+        var request = BuildRequest(
+            qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(), batchPolicyStates: states);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.Empty(result.FinalTasks);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("BATCH_POLICY_STATE_UNAVAILABLE", unscheduled.Reason);
+        Assert.NotEqual("BATCH_POLICY_MISSING", unscheduled.Reason);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //  H. 逐批选路（RT-003 / RT-004）—— 0号位 (7).md 反证 ⑥
     // ═══════════════════════════════════════════════════════════════════
 
@@ -1683,28 +1836,31 @@ public class ExecutionBatchDraftTests
     }
 
     /// <summary>
-    /// **2026-10-08 复审 NEW-P0-01（0号位《未命名的Markdown文件 (2)(1).md》§二 / §十二）+ §十五 第 1、2 项**：
-    ///   **Batch-001 成功、Batch-002 失败 ⇒ 部分落定 ⇒ 必须判 Domain 失败**。
+    /// **N8-02 反证（2026-10-17 口径翻转）**：**Batch-001 成功、Batch-002 失败 ⇒ 部分落定**
+    ///   ⇒ **合法落定**，`Success == true`，且 `Q / S / U` 三量可读回。
     ///
-    /// ⚠ **本用例此前断言 `Success == true`，那是我方按「代码实现困难」改出来的错口径，已撤销。**
-    ///   冻结基线：`AllocationQty = Σ AllocationTaskShare中的预计合格产出份额`（v1.7:1052）；
-    ///   且「TaskShare数量不闭合」属**有限产能硬错误 ⇒ 必须使 Domain 失败**（v1.7:1026-1034 / v1.6:790）。
-    ///   0号位 §十二 明示：「无法按客户DueDate完成不是Solver失败」与「Allocation只排出一部分数量
-    ///   且 TaskShare 不闭合也可以正式成功」**不是一个概念**。
+    /// ⚠ **本用例此前断言 `Success == false`（「部分落定必须判 Domain 失败」）——该口径已被 0号位 第二十轮 §三 推翻。**
+    ///   原件 `APS_V1_20261017_致2号位第二十轮三项转交与OrderStatus值域正式复核意见_v1.0.md`：
+    ///     · `:56` `AllocationQty = Σ AllocationTaskShare` 等式**继续认可**（不降为不等式）；
+    ///     · `:61` 「该等式**不能用声明应排 Q 强行补齐未落定 Task 份额**，也**不能反向抹去未排 U**」
+    ///            ⇒ **明文否定**原「闭合目标恒为声明量」的口径（那正是「用声明 Q 强行补齐」）；
+    ///     · `:60` 01 基线《未排净量与解释分期》**早已要求**记 应排／已排／未排（如 1000/800/200）。
     ///
-    /// 构造（`Min=4 / Max=6` ⇒ 合法批数**唯一** n=2，无候选择优歧义；`Qty=10` ⇒ 两批各 5 件）：
-    ///   日历**只有一段 10 小时**可用窗，而单批两工序链（5 件 × 60 分钟 × 2 工序）**恰好占满 10 小时**
-    ///   ⇒ Phase2：Batch-001 **落定**、Batch-002 **落不下**（`failedBatchIndex = 1`）；
-    ///   `Parameters.AllowSplit=false` ⇒ Phase4 无 Split 手段，Batch-002 **确定修不成**。
+    /// 构造（`Min=4 / Max=6` ⇒ 合法批数**唯一** n=2，无候选择优歧义；`Qty=10`）：
+    ///   日历**只有一段 10 小时**可用窗，而单批两工序链恰好占满 ⇒ Phase2：Batch-001 **落定**、
+    ///   Batch-002 **落不下**；`Parameters.AllowSplit=false` ⇒ Phase4 无 Split 手段，Batch-002 **确定修不成**。
     ///
-    /// 断言（§十五 第 2 项的机器证据）：
-    ///   · **`Success == false`** —— 部分落定**不得**作为成功正式结果输出；
-    ///   · 失败报文**精确落在数量闭合**上，且**同时**出现「声明量 10」与「落定量 5」
-    ///     ⇒ 直接证明闭合目标**没有被降成 5**（降了就变成 `ΣShare=5 ≤ Quantity=5` ⇒ 静默通过 ⇒ 此处红）；
-    ///   · 失败路径是「全有全无」（Phase5 既有设计）⇒ 不输出半截正式结果。
+    /// 断言（**鉴别性**，不是「结果一致性护栏」）：
+    ///   · **`Success == true`** —— 部分落定是**合法**业务出口（本用例翻转后的第一道断言）；
+    ///   · **`ΣShare < 10`** —— 份额**不等于**声明量（旧口径下恒为 10）⇒ 直接反证「用声明 Q 强行补齐」；
+    ///   · **`ΣShare + U == 10`** —— 三量闭合。⚠ 本式在实现内部**恒真**（生成侧 `closureTarget = Q − U`
+    ///     与本式取**同一 U 来源**）⇒ 它**不是**「份额被放大」的鉴别器（那条由上一项 `ΣShare < 10` 承担）。
+    ///     它的真实作用 = **锁住 U 的出口**：U 未出口时 `U' = 0` 而 `ΣShare` 仍为 `Q − U` ⇒ 破式。
+    ///     即 `U-003`「不得丢数」的回归锁；
+    ///   · `U > 0` 且 `DraftId == "D1"` —— 未排量**带数量**出口（`U-003` 规则清单 v1.9 `:193`「不得丢数」）。
     /// </summary>
     [Fact]
-    public async Task 反证4_5_6_首批成功次批失败_部分落定必须判Domain失败()
+    public async Task 反证4_5_6_首批成功次批失败_部分落定合法落定_三量QS_U可读回()
     {
         // 唯一可用窗 = 恰好容下**一批**两工序链：5 件 × 60 分钟 × 2 工序 = 10 小时（留 30 分钟边界余量，
         //   但远不足以再容下第二批的 10 小时 ⇒ 第二批必然落不下）。
@@ -1724,28 +1880,33 @@ public class ExecutionBatchDraftTests
 
         var result = await _solver.SolveAsync(request);
 
-        // §十五 第 2 项：部分 Execution Batch **不得**经由「降低闭合目标」变成 Success
-        Assert.False(result.Success, "部分落定（声明 10 / 落定 5）必须判 Domain 失败，不得作为成功结果输出");
+        // ① 部分落定**合法**：不得再判 Domain 失败。
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.NotEmpty(result.FinalTasks);
 
-        // 失败报文必须定位到数量闭合，且「声明量 10」与「落定量 5」同时在
-        //   —— 闭合目标仍为**声明数量** 10 的机器证据（本用例只有 1 个参与构成的 Task ⇒ 份额恒为 10）
-        Assert.Contains("ΣShare=10", result.ErrorMessage);
-        // ⚠ R-2/R-3（2026-10-12）后本用例**不再钉死落定量数值**：候选集由「经济区间内的固定点」
-        //   扩为「固定点 + 锚点带 `nMin / nMin+1`」⇒ 本例胜出的批方案由 2 批变为 3 批，
-        //   落定批数量随之由 5 变为 3.3333。**断言的不变量未变**：闭合目标仍是**声明量 10**（未被降成落定量）。
-        Assert.Contains("超过 Quantity=", result.ErrorMessage);
+        // ② 三量：ΣShare + U == 声明量 10（两条独立算路，任一侧漏记即破式）。
+        var totalShare = result.AllocationShares.Sum(s => s.ComponentQty);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.True(unscheduled.UnscheduledQty > 0m,
+            "部分落定 ⇒ 未排量必须 > 0（完全落定才允许为 0）");
+        Assert.Equal(10m, totalShare + unscheduled.UnscheduledQty);
 
-        // 全有全无：失败即不输出任何正式结果（避免下游拿到「半截成功」）
-        Assert.Empty(result.FinalTasks);
-        Assert.Empty(result.AllocationShares);
-        Assert.Empty(result.UnscheduledTasks);
+        // ③ 反证旧口径：份额**不得**等于声明量 10（旧实现恒为 10 ⇒ 此处红）。
+        Assert.True(totalShare < 10m, $"部分落定 ⇒ ΣShare 必须 < 声明量 10，实测 {totalShare}");
+
+        // ④ 未排量**带数量**出口（冻结 `U-003`「不得丢数」），Reason 仍逐字可判。
+        Assert.Equal("Phase 2 初始排程失败，Phase 4 修复未成功", unscheduled.Reason);
+        Assert.Equal(1, result.Summary.UnscheduledCount);
+        Assert.True(result.Summary.ScheduledCount > 0);
     }
 
     /// <summary>
-    /// **2026-10-08 复审 NEW-P0-01 + §十五 第 2 项（第二种部分落定形态）**：
-    ///   **两个执行批在 Phase2 都失败、Phase4 只修好其中一个 ⇒ 仍是部分落定 ⇒ 必须判 Domain 失败**。
+    /// **N8-02 反证（2026-10-17 口径翻转）**：**两个执行批在 Phase2 都失败、Phase4 只修好其中一个**
+    ///   ⇒ 部分落定 ⇒ **合法落定**，`Success == true`，`Q / S / U` 三量可读回。
     ///
-    /// ⚠ 本用例此前断言 `Success == true` + `UnscheduledTasks` 单条，同属**已撤销的错口径**。
+    /// ⚠ 本用例此前断言 `Success == false`，同属**已被 0号位 第二十轮 §三 推翻的错口径**
+    ///   （依据详见 <see cref="反证4_5_6_首批成功次批失败_部分落定合法落定_三量QS_U可读回"/> 的注释）。
     ///
     /// 构造：`Qty=10 / Min=4 / Max=6` ⇒ 2 批（各 5 件）；`opDuration=10m` ⇒ 每批每工序 50 分钟，
     ///   而日历只有 **4 个 30 分钟槽**（两两相隔 30 分钟不可用）⇒ 无任何连续 50 分钟窗
@@ -1753,13 +1914,11 @@ public class ExecutionBatchDraftTests
     ///   `AllowSplit=true` ⇒ Phase4 有限 Split 把每批每工序拆成 2×25 分钟 ⇒ **一批占 4 个槽**
     ///   ⇒ 只有 **1 个批**能被修好，另一个因槽位耗尽仍落不下。
     ///
-    /// 断言：`Success == false`，且失败报文落在「ΣShare 超过落定 Task 的 Quantity」上
-    ///   —— 声明量 10 被分摊到仅存的落定 Task（每件 Quantity=2.5）⇒ 第 3 项硬校验拒绝。
-    ///   **不**断言 ΣShare 的具体数字：参与构成的 Task 按 `FinalDraftId`（随机 Guid）排序，
-    ///   份额在 {3.333, 3.333, 3.334} 之间随机落位 ⇒ 只有「超过」这一性质是稳定的。
+    /// 断言与 反证4_5_6 同构：`Success` + `ΣShare < 10` + `ΣShare + U == 10` + `U > 0`。
+    ///   不钉死 ΣShare 的具体数字（拆分件份额在多个 Task 间分摊，只有「小于声明量」这一性质稳定）。
     /// </summary>
     [Fact]
-    public async Task 反证6_两批都失败只修好一批_部分落定仍必须判Domain失败()
+    public async Task 反证6_两批都失败只修好一批_部分落定合法落定_三量QS_U可读回()
     {
         // 4 个 30 分钟可用槽、两两相隔 30 分钟不可用 ⇒ 总可用 2 小时：
         //   恰好够「1 批 × 2 工序 × 拆 2 份 × 25 分钟 = 4 槽」，不够第 2 批。
@@ -1781,16 +1940,22 @@ public class ExecutionBatchDraftTests
 
         var result = await _solver.SolveAsync(request);
 
-        Assert.False(result.Success, "只修好一个批（部分落定）必须判 Domain 失败");
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.NotEmpty(result.FinalTasks);
 
-        // 声明量 10 分摊到落定批的拆分件（Quantity=2.5）⇒ ΣShare > Quantity ⇒ 第 3 项硬校验拒绝。
-        //   （若闭合目标被降成落定量 5，份额为 5/3=1.667 ≤ 2.5 ⇒ 不会失败 ⇒ 此处红。）
-        Assert.Contains("ΣShare=", result.ErrorMessage);
-        Assert.Contains("超过 Quantity=2.5", result.ErrorMessage);
+        var totalShare = result.AllocationShares.Sum(s => s.ComponentQty);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.True(unscheduled.UnscheduledQty > 0m,
+            "部分落定 ⇒ 未排量必须 > 0（完全落定才允许为 0）");
+        Assert.Equal(10m, totalShare + unscheduled.UnscheduledQty);
+        Assert.True(totalShare < 10m, $"部分落定 ⇒ ΣShare 必须 < 声明量 10，实测 {totalShare}");
 
-        Assert.Empty(result.FinalTasks);
-        Assert.Empty(result.AllocationShares);
-        Assert.Empty(result.UnscheduledTasks);
+        // 判据取**最终任务集合**（`PhaseFiveCompression.cs` 的未排清单组装）⇒ 本例
+        //   「Phase2 两批都没落、Phase4 修好一批」报此原因（区别于「完全没排下」）。
+        Assert.Equal("Phase 4 局部修复后仍有执行批未排下", unscheduled.Reason);
+        Assert.Equal(1, result.Summary.UnscheduledCount);
+        Assert.True(result.Summary.ScheduledCount > 0);
     }
 
     /// <summary>
@@ -1832,8 +1997,8 @@ public class ExecutionBatchDraftTests
     ///
     /// 与 <see cref="反证7_两批全排下_逐工序数量严格闭合且无重复批链"/> 的分工：反证7 断言的是
     ///   **Task 物理数量**闭合（逐工序 Σ=10）；本用例断言的是 **Allocation→份额**闭合（ΣShare=10），
-    ///   两者是冻结文档里**两条不同的等式**。反向半（不等 ⇒ 必须判失败）由
-    ///   <see cref="反证4_5_6_首批成功次批失败_部分落定必须判Domain失败"/> 提供。
+    ///   两者是冻结文档里**两条不同的等式**。反向半（**部分落定** ⇒ 份额按甲式下调到 `Q − U`）由
+    ///   <see cref="反证4_5_6_首批成功次批失败_部分落定合法落定_三量QS_U可读回"/> 提供。
     /// </summary>
     [Fact]
     public async Task NEW_P0_01_全部落定时_份额严格闭合到声明AllocationQty()

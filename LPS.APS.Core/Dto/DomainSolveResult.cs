@@ -172,8 +172,25 @@ public sealed class AllocationTaskShare
 
 public sealed class UnscheduledTaskResult
 {
+    /// <summary>
+    /// 需求键。**值域是 `LogicalDemandKey`，不是 `FinalDraftId`** ——
+    /// 由 Solver 在 `PhaseFiveCompression.ReportUnscheduled` 处原样回传，
+    /// 消费侧必须按需求键域 join（`PeggingOrchestrator` 据此反查 `NetOutputQty`）。
+    /// </summary>
     public string DraftId { get; init; } = string.Empty;
+
+    /// <summary>未排原因码。</summary>
     public string Reason { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 该需求的未排量 U（＝ `NetOutputQty` − 已落定份额之和，≥ 0）。
+    ///
+    /// 【为什么在 Solver 出口给数量】部分落定时「已排量可交、未排量只有键没有量」，
+    /// 下游只能按「完全未排」去猜，与「未排 200 可追溯」的基线要求不符。
+    /// 与 `PeggingOrchestrator` 侧同名同义，供 Allocation 级三量对账 `Σ ShareQty + Σ U = Σ Q`。
+    /// 未填写时按 0 处理（未排量不进份额、不造伪 Task）。
+    /// </summary>
+    public decimal UnscheduledQty { get; init; }
 }
 
 /// <summary>

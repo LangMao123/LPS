@@ -35,6 +35,25 @@ public class GanttDataDto
     /// 任务条（甘特图 X 轴上的矩形）
     /// </summary>
     public IReadOnlyList<GanttTaskDto> Tasks { get; set; } = Array.Empty<GanttTaskDto>();
+
+    /// <summary>
+    /// 是否因业务范围（Domain）不足而被拒绝（fail-closed）。
+    /// true = 当前用户无该 Domain 授权，返回空是"越权"而非"没数据"。
+    /// </summary>
+    public bool ScopeDenied { get; set; }
+
+    /// <summary>
+    /// 是否为空结果（版本不存在 / 越权 / 该版本确无 Task）。
+    /// 与 <see cref="ScopeDenied"/>、<see cref="VersionExists"/> 配合区分三种空态。
+    /// </summary>
+    public bool IsEmpty { get; set; }
+
+    /// <summary>
+    /// 版本是否真实存在。false = 该 planVersionId 不存在（VersionCode 为空串）。
+    /// 显式位，替代「<c>versionCode === ''</c>」这种隐式契约（4号位 10-17 §2.3）。
+    /// 三种空态：版本不存在(<c>false</c>) / 越权(<c>scopeDenied</c>) / 存在但无任务(全 true + isEmpty)。
+    /// </summary>
+    public bool VersionExists { get; set; }
 }
 
 public class GanttResourceDto
@@ -91,9 +110,31 @@ public class GanttTaskDto
     public string Status { get; set; } = string.Empty;
 
     /// <summary>
-    /// 是否延期（PlannedEndTime > CustomerDueDate）
+    /// 是否延期（按**日期**比较：PlannedEndTime 的日期 > CustomerDueDate）。
+    /// 注：CustomerDueDate 为 DATE（到天），PlannedEndTime 为 DATETIME2。
+    /// 修复前直接比较二者会被隐式提升为"完工时刻 vs 交日零点"，导致**当天完工也被判延期**。
     /// </summary>
     public bool IsDelayed { get; set; }
+
+    /// <summary>
+    /// 客户交期（[Order].CustomerDueDate，DATE）。冻结 01:1907 第 2 项要求输出。
+    /// </summary>
+    public DateTime? CustomerDueDate { get; set; }
+
+    /// <summary>
+    /// 延期时长（小时）= PlannedEndTime − CustomerDueDate，仅延期时为正；未延期为 null。
+    /// </summary>
+    public decimal? DelayHours { get; set; }
+
+    /// <summary>
+    /// 是否关键路径（Task.IsCriticalPath，冻结 07:3683 / DDL 08:4249）。
+    /// </summary>
+    public bool IsCriticalPath { get; set; }
+
+    /// <summary>
+    /// 计划工时（Task.Duration 库值，DDL 08:4246）。以库值为准，不用前端时间差反算。
+    /// </summary>
+    public decimal? Duration { get; set; }
 
     /// <summary>
     /// 任务所属域标识（G2-b 档①；U01，从 Order.DomainKey 投影）
@@ -107,15 +148,19 @@ public class GanttTaskDto
 
     /// <summary>
     /// 含良率补偿数量（G2-b 档①；U05 净需求 vs 含良率）
-    /// ⚠️ Task 表当前无此列（FinalTaskDraft.PlannedProcessQty 不落盘），未就绪返回 null，待 2号位 DDL
+    /// 取 Task.PlannedProcessQty（DDL 08:4242 有定义、2号位 PeggingOrchestrator 落盘）。
+    /// 原注释「Task 表当前无此列」有误，已更正（2026-10-17，4号位 R2）。
     /// </summary>
     public decimal? PlannedProcessQty { get; set; }
 
     /// <summary>
-    /// MES 下发资格（G2-b 档①；U16）
-    /// ⚠️ FinalTaskDraft 无 MesEligible 字段，MES 资格判定尚未落库，未就绪返回 false（保守默认）
+    /// MES 下发资格（G2-b 档①；U16）。
+    /// <para><c>true</c>=可下发；<c>false</c>=判定为不可下发；<c>null</c>=未判定（资格判定尚未接入）。</para>
+    /// ⚠️ 该字段**不是任何表的列**——数据库无 `MesEligible` 列，当前由查询层硬编码返回，属接口占位。
+    /// 原为非可空 <c>bool</c> + 恒 <c>false</c>，会导致「判定为否」与「未判定」在契约上不可区分；
+    /// 2026-10-17 改为可空，未接入期统一返回 <c>null</c>（前端按「未接入」展示）。
     /// </summary>
-    public bool MesEligible { get; set; }
+    public bool? MesEligible { get; set; }
 
     /// <summary>
     /// 不可下发原因（G2-b 档①；U17，硬枚举见 v1.2 §二 2.3）
@@ -124,10 +169,12 @@ public class GanttTaskDto
     public IReadOnlyList<string>? MesIneligibleReasons { get; set; }
 
     /// <summary>
-    /// 跨域阻挡标记（G2-b 档①；U14）
-    /// ⚠️ Task 表无此列，未就绪返回 false（保守默认），待 2号位 对齐
+    /// 跨域阻挡标记（G2-b 档①；U14）。
+    /// <para><c>true</c>=被阻挡；<c>false</c>=判定为未阻挡；<c>null</c>=未判定（判定未接入）。</para>
+    /// ⚠️ 该字段**不是任何表的列**——数据库无 `CrossDomainBlocked` 列，当前由查询层硬编码返回，属接口占位。
+    /// 与 <see cref="MesEligible"/> 同因改可空：避免「判定为否」与「未判定」不可区分（2026-10-17）。
     /// </summary>
-    public bool CrossDomainBlocked { get; set; }
+    public bool? CrossDomainBlocked { get; set; }
 
     /// <summary>
     /// 跨域阻挡原因（G2-b 档①；复用 G7 域依赖）

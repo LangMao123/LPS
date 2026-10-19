@@ -14,11 +14,10 @@ import type {
   GanttTaskDto,
   OrderBasicInfo,
   OrderScheduleDetailDto,
-  PlanOverviewDto,
   PlanVersionSummaryDto,
   ScheduleSummaryDto
 } from '../types'
-import type { DomainKey, OrderSummaryStatus, TaskStatus } from '../types'
+import type { OrderSummaryStatus, TaskStatus } from '../types'
 import { ORDER_SUMMARY_STATUSES, TASK_STATUSES } from '../types'
 
 /* ========== 时间工具 ========== */
@@ -488,48 +487,6 @@ export const mockGantt = (planVersionId: number): GanttDataDto => ({
   tasks: TASKS
 })
 
-/* ========== Overview（占位） ========== */
-
-const DOMAIN_KEYS: DomainKey[] = ['FAMILY_INJECTION', 'FAMILY_ASSEMBLY', 'FAMILY_TEST']
-
-export const mockOverview: PlanOverviewDto = {
-  activeVersions: DOMAIN_KEYS.map((dk, i) => ({
-    domainKey: dk,
-    planVersionId: 1001 + i,
-    versionCode: `V-2026-001-${dk}`,
-    status: 'ACTIVE',
-    activatedAt: hourOffset(-2),
-    sourceScheduleRunId: 5001 + i,
-    planHorizonStart: dayOffset(-7),
-    planHorizonEnd: dayOffset(83)
-  })),
-  orderSummary: [
-    { status: 'ON_TIME', count: 42 },
-    { status: 'AT_RISK', count: 8 },
-    { status: 'DELAYED', count: 6 },
-    { status: 'ESTIMATED_ONLY', count: 3 },
-    { status: 'UNSCHEDULED', count: 1 }
-  ],
-  resourceSummary: RESOURCES.map((r, i) => ({
-    resourceId: r.resourceId,
-    resourceCode: r.resourceCode,
-    resourceName: r.resourceName,
-    utilization: Math.round((60 + i * 4) * 100) / 100,
-    isBottleneck: i % 3 === 0,
-    unavailableWindows: [{ from: dayOffset(3, 8), to: dayOffset(3, 12) }]
-  })),
-  domainIssues: [
-    {
-      domainKey: 'FAMILY_TEST',
-      issueType: 'PI_POSITION_ISSUE',
-      message: 'PI-2026-3320 缺 XC 数量，Stage-3 不可定位',
-      occurredAt: hourOffset(-4)
-    }
-  ],
-  estimatedOnlyOrderCount: 3,
-  pendingCandidateCount: 1
-}
-
 /* ========== Orders（页面 2 订单/需求计划） ========== */
 
 /** 订单静态维度表（mock 用，10 个物料 × 5 个客户 × 2 个工厂） */
@@ -696,7 +653,7 @@ export const mockOrderList = (
     planVersionId?: number
     domainKey?: string
   }
-): { items: OrderBasicInfo[]; total: number; pageIndex: number; pageSize: number } => {
+): { items: OrderBasicInfo[]; total: number; page: number; pageSize: number } => {
   const all = Array.from({ length: 60 }, (_, i) => mockOrderDetail(i + 1).basic)
   let filtered = all
   if (filter?.orderNo) {
@@ -741,7 +698,7 @@ export const mockOrderList = (
   return {
     items: filtered.slice(start, start + pageSize),
     total: filtered.length,
-    pageIndex,
+    page: pageIndex,
     pageSize
   }
 }

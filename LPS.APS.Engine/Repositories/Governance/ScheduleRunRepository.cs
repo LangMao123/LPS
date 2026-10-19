@@ -123,7 +123,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
                      [SourceScheduleRunId], [CreatedBy], [CreatedAt])
                 OUTPUT INSERTED.[Id]
                 VALUES (@VersionCode, 'RECOVERY', @DomainKey,
-                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'Created',
+                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'BUILDING',
                         @SourceScheduleRunId, @CreatedBy, @CreatedAt)";
 
             foreach (var shell in shells)
@@ -213,7 +213,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
                      [SourceScheduleRunId], [CreatedBy], [CreatedAt])
                 OUTPUT INSERTED.[Id]
                 VALUES (@VersionCode, 'CANDIDATE', @DomainKey,
-                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'Created',
+                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'BUILDING',
                         @SourceScheduleRunId, @CreatedBy, @StartedAt)";
 
             var shellId = await connection.QueryFirstOrDefaultAsync<int>(insertShellSql,

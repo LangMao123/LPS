@@ -80,21 +80,29 @@ public class RuleSetRepository : IRuleSetRepository
     {
         // R2（催办单 2026-09-22）：列表主表 LEFT JOIN 最新版本摘要。
         // 版本摘要语义：
-        //  - CurrentVersionCode = 最新 PUBLISHED 版本码
-        //  - DraftVersionCode   = 最新 DRAFT 版本码
+        //  - CurrentVersionId / CurrentVersionCode = 最新 PUBLISHED 版本 Id + 版本码（C-4 身份补全）
+        //  - DraftVersionId   / DraftVersionCode   = 最新 DRAFT 版本 Id + 版本码（C-4 身份补全）
         //  - Status / LastChangeReason / PublishedAt / RetiredAt(EffectiveTo) = 最新版本
         // DomainKey 无真源（线上无规则集↔域关联），未纳入（已提报 0号位 裁决）。
         var sql = new StringBuilder(@"
             SELECT r.[Id], r.[RuleSetCode], r.[RuleSetName], r.[Description], r.[IsActive],
                    r.[CreatedAt], r.[CreatedBy], r.[UpdatedAt], r.[UpdatedBy],
-                   v.CurrentVersionCode, v.DraftVersionCode, v.Status, v.LastChangeReason,
+                   v.CurrentVersionId, v.CurrentVersionCode,
+                   v.DraftVersionId, v.DraftVersionCode,
+                   v.Status, v.LastChangeReason,
                    v.PublishedAt, v.RetiredAt
             FROM [dbo].[RuleSet] r
             OUTER APPLY (
                 SELECT TOP 1
+                       (SELECT TOP 1 [Id] FROM [dbo].[RuleSetVersion]
+                         WHERE [RuleSetId] = r.[Id] AND [Status] = 'PUBLISHED'
+                         ORDER BY [Id] DESC) AS CurrentVersionId,
                        (SELECT TOP 1 [VersionCode] FROM [dbo].[RuleSetVersion]
                          WHERE [RuleSetId] = r.[Id] AND [Status] = 'PUBLISHED'
                          ORDER BY [Id] DESC) AS CurrentVersionCode,
+                       (SELECT TOP 1 [Id] FROM [dbo].[RuleSetVersion]
+                         WHERE [RuleSetId] = r.[Id] AND [Status] = 'DRAFT'
+                         ORDER BY [Id] DESC) AS DraftVersionId,
                        (SELECT TOP 1 [VersionCode] FROM [dbo].[RuleSetVersion]
                          WHERE [RuleSetId] = r.[Id] AND [Status] = 'DRAFT'
                          ORDER BY [Id] DESC) AS DraftVersionCode,

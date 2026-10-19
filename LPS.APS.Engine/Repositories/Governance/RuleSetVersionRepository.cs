@@ -1,6 +1,7 @@
 using System.Data;
 using Dapper;
 using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
 using Microsoft.Extensions.Logging;
@@ -42,6 +43,25 @@ public class RuleSetVersionRepository : IRuleSetVersionRepository
             ORDER BY [VersionCode]";
 
         var results = await _connectionManager.QueryAsync<RuleSetVersion>(
+            sql, new { RuleSetId = ruleSetId }, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<RuleSetVersionSummaryDto>> GetSummariesByRuleSetIdAsync(long ruleSetId, CancellationToken ct = default)
+    {
+        // 2026-10-15 4号位 来文 Q2（同款缺陷·潜伏）：与参数集列表同源 SELECT * 整列搬大 LOB。
+        // 显式列仅取摘要字段（冻结 DDL v5.1.8.3 已确认列；ContentSnapshotJson/DemandPriorityJson/Remarks 不取——同上理）。
+        const string sql = @"
+            SELECT [Id], [RuleSetId], [VersionCode], [Status],
+                   [EffectiveFrom], [EffectiveTo], [PublishedAt], [PublishedBy],
+                   [ApprovedAt], [ApprovedBy], [CreatedAt], [CreatedBy]
+            FROM [dbo].[RuleSetVersion]
+            WHERE [RuleSetId] = @RuleSetId
+            ORDER BY [VersionCode]";
+
+        var results = await _connectionManager.QueryAsync<RuleSetVersionSummaryDto>(
             sql, new { RuleSetId = ruleSetId }, db: DatabaseId.APS);
 
         return results.ToList();

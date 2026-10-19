@@ -24,6 +24,7 @@ public class PeggingTraceRepository : IPeggingTraceRepository
         string? commitmentStatus = null,
         string? orderNo = null,
         string? supplyDocumentNo = null,
+        long? rootOrderId = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -71,8 +72,15 @@ FROM PeggingSupplyAllocation
 WHERE PlanVersionId = @PlanVersionId
     AND (@MaterialCode IS NULL OR MaterialCode LIKE '%' + @MaterialCode + '%')
     AND (@SupplyType IS NULL OR SupplyType = @SupplyType)
-    AND (@CommitmentStatus IS NULL OR CommitmentStatus = @CommitmentStatus)
+    -- 3口径对齐（4号位 10-19）：汇总把 NULL 显示为 'UNKNOWN'(:186 ISNULL)，列表原用等值比较对 NULL 永查 0 条；
+    -- 现特判 UNKNOWN→匹配 IS NULL，汇总与列表同一语义。
+    AND (@CommitmentStatus IS NULL
+         OR (@CommitmentStatus = 'UNKNOWN' AND CommitmentStatus IS NULL)
+         OR CommitmentStatus = @CommitmentStatus)
+    -- orderNo 已知失效面（4号位 10-19 §二）：RootOrderNo/CurrentOrderNo dev v2 全 NULL（写入侧未回填，归 2号位），
+    -- LIKE 恒 false；请改用 rootOrderId（RootOrderId 100% 非空）。两列回填前 orderNo 有值数据上仍有效，不删参。
     AND (@OrderNo IS NULL OR RootOrderNo LIKE '%' + @OrderNo + '%' OR CurrentOrderNo LIKE '%' + @OrderNo + '%')
+    AND (@RootOrderId IS NULL OR RootOrderId = @RootOrderId)
     AND (@SupplyDocumentNo IS NULL OR SupplyDocumentNo LIKE '%' + @SupplyDocumentNo + '%')
     AND (@HasFactories = 0 OR DemandFactoryCode IN @AllowedFactories)
 ORDER BY AllocationSequence
@@ -86,6 +94,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             CommitmentStatus = commitmentStatus,
             OrderNo = orderNo,
             SupplyDocumentNo = supplyDocumentNo,
+            RootOrderId = rootOrderId,
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,

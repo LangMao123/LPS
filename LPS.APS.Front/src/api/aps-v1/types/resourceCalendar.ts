@@ -114,12 +114,26 @@ export interface ManualCapacitySlotDto {
   isActive: boolean
 }
 
-/** 人工槽主档查询入参（GET /api/manual-capacity/slots） */
+/** 人工槽主档查询入参（GET /api/manual-capacity/slots，5号位 10-12 加分页） */
 export interface ManualSlotQuery {
   departmentId?: number
   operationName?: string
   /** 默认 false（不含软删） */
   includeInactive?: boolean
+  /** 分页：5号位 10-12 函确认 pageSize 默认 20、上限 200（越界回落 20） */
+  pageIndex?: number
+  pageSize?: number
+}
+
+/** 人工槽主档分页响应（10-12 收：与后端 PageResult<Page> 字段对齐，模块级本地包装）
+ *  - 字段名用 `page`（不是 pageIndex），与 TaskSplitRuleConfig / ManualETA / business-fact-issues 同款
+ *  - 替代此前通用 PageResult<T>（types/common.ts:62-67 已删，@see 4号位-2026-10-12-三函闭环RC22-ME13-E24-给5号位.md）
+ */
+export interface ManualCapacitySlotPageResult<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
 }
 
 /**
@@ -157,41 +171,54 @@ export interface ManualSlotCalendarBulkRequest {
 /* ==================== 展示用派生类型 ==================== */
 
 /**
- * Calendar 配置状态（v1.3 §九 / 对接函 §三.5：无有效日历 = 不可用）
- *  - CONFIGURED   已配（窗口数 > 0）
- *  - NOT_CONFIGURED 未配（窗口数组为空 = Solver 判不可排）
- *  - UNKNOWN      未查证（列表页尚未逐行查询；G4 待后端补 hasCalendar 后消除该态）
+ * Calendar 配置状态（**本级**窗口有无；不是三级合并后的可排判定）
+ *  - CONFIGURED   已配（本级窗口数 > 0）
+ *  - NOT_CONFIGURED 未配（本级窗口数组为空）
+ *  - UNKNOWN      未查证（本级尚未查询）
+ *
+ * ⚠️ v1.4 §23 + 废止清单 O-024 已废止「本级无窗口 = 不可排」：
+ *    本级 MISSING 允许继承上级已认证窗口，仅三级计算后仍无权威合法窗口才判不可排。
+ *    故 NOT_CONFIGURED 的 description 只陈述本级事实，**不得断言不可用**（10-14 RC25 收）
  */
 export type CalendarConfigStatus = 'CONFIGURED' | 'NOT_CONFIGURED' | 'UNKNOWN'
 
 export const CALENDAR_CONFIG_META: Record<
   CalendarConfigStatus,
-  { label: string; tagType: 'success' | 'danger' | 'info'; description: string }
+  { label: string; tagType: 'success' | 'warning' | 'danger' | 'info'; description: string }
 > = {
   CONFIGURED: {
     label: '已配',
     tagType: 'success',
-    description: '已有有效窗口，可参与排产'
+    description: '本级已单独设过可用时段'
   },
   NOT_CONFIGURED: {
     label: '未配',
-    tagType: 'danger',
-    description: '无有效日历即不可用（不按 7×24 缺省兜底）'
+    tagType: 'warning',
+    description: '本级没单独登记；所属工厂或部门开放了，它照样能排产'
   },
   UNKNOWN: {
     label: '未查证',
     tagType: 'info',
-    description: '尚未查询该对象的窗口；点开后才判定'
+    description: '尚未查询该对象的本级窗口'
   }
 }
 
-/** 资源（设备）候选行 —— 过渡数据源用（正式端点缺失，见发函 G1） */
-export interface ResourceCandidate {
+/**
+ * 资源（设备）主表行（GET /api/resource）—— 10-12 收口：原过渡 `ResourceCandidate` 已撤
+ *  - 真源：`dbo.Resource` 镜像表（@see lps/LPS.APS.Core/Entities/Aps/Resource.cs）
+ *  - 端点：5号位 ResourceController.cs:34，权限码 ResourceCalendarView
+ *  - 字段对齐后端 ResourceListItemDto（@see lps/LPS.APS.Application/Services/Dto/ResourceCalendarDtos.cs:106-118）
+ *  - 含 hasCalendar：v1.3 §九 无有效日历=不可用的"已配/未配"状态在列表阶段即可判定（无须逐行再查）
+ */
+export interface Resource {
   resourceId: number
   resourceCode: string
   resourceName: string
-  productionDepartmentId?: number
+  /** MACHINE / LINE / MANUAL_STATION */
+  resourceType?: string
+  productionDepartmentId: number
   productionDepartmentName?: string
-  /** 过渡数据源标记（true = 来自计划版本甘特资源池，可能遗漏未排资源） */
-  isFallbackSource?: boolean
+  isActive?: boolean
+  /** 已配日历窗口 = ResourceCalendarSlot 有任一记录；空 = 不可排（v1.3 §九） */
+  hasCalendar?: boolean
 }

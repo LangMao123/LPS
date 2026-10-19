@@ -47,7 +47,7 @@ public class OrderQueryController : ControllerBase
     /// 查询订单列表
     /// </summary>
     [HttpGet]
-    public async Task<ApiResponse<List<OrderListItemDto>>> QueryOrders(
+    public async Task<ApiResponse<PageResult<OrderListItemDto>>> QueryOrders(
         [FromQuery] int planVersionId,
         [FromQuery] string? orderNo = null,
         [FromQuery] string? materialCode = null,
@@ -56,6 +56,10 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? domainKey = null,
         [FromQuery] string? delayStatus = null,
         [FromQuery] string? status = null,
+        [FromQuery] string? productionInstructionNo = null,
+        [FromQuery] string? productFamilyCode = null,
+        [FromQuery] DateTime? dueDateFrom = null,
+        [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 50,
         [FromQuery] int pageIndex = 0,
@@ -78,9 +82,9 @@ public class OrderQueryController : ControllerBase
 
             // 校验：非空入参必须落在授权范围（Global 全放行，无范围全拒绝）
             if (!string.IsNullOrEmpty(factoryCode) && !scope.Allows(DataScopeTypes.Factory, factoryCode))
-                return ApiResponse<List<OrderListItemDto>>.Fail(403, "Factory 范围越界");
+                return ApiResponse<PageResult<OrderListItemDto>>.Fail(403, "Factory 范围越界");
             if (!string.IsNullOrEmpty(domainKey) && !scope.Allows(DataScopeTypes.Domain, domainKey))
-                return ApiResponse<List<OrderListItemDto>>.Fail(403, "Domain 范围越界");
+                return ApiResponse<PageResult<OrderListItemDto>>.Fail(403, "Domain 范围越界");
 
             // 过滤：空参按授权范围收窄结果集，避免越权返回全域数据
             var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
@@ -89,19 +93,20 @@ public class OrderQueryController : ControllerBase
             var result = await _service.QueryOrdersAsync(
                 planVersionId, orderNo, materialCode, customerName,
                 factoryCode, domainKey, delayStatus, status,
+                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
                 skip, take, cancellationToken,
                 allowedFactories, allowedDomains);
 
-            return ApiResponse<List<OrderListItemDto>>.Success(result);
+            return ApiResponse<PageResult<OrderListItemDto>>.Success(result);
         }
         catch (ArgumentException ex)
         {
-            return ApiResponse<List<OrderListItemDto>>.Fail(400, ex.Message);
+            return ApiResponse<PageResult<OrderListItemDto>>.Fail(400, ex.Message);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to query orders");
-            return ApiResponse<List<OrderListItemDto>>.Fail(500, $"Query failed: {ex.Message}");
+            return ApiResponse<PageResult<OrderListItemDto>>.Fail(500, $"Query failed: {ex.Message}");
         }
     }
 

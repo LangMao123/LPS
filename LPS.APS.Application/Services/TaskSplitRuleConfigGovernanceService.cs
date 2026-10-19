@@ -10,6 +10,7 @@ using LPS.APS.Core.Entities.Auth;
 using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
+using Microsoft.Extensions.Logging;
 using TaskSplitRuleConfig = LPS.APS.Core.Entities.APS.TaskSplitRuleConfig;
 
 namespace LPS.APS.Application.Services;
@@ -43,15 +44,18 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly IAuditLogRepository _auditLogRepository;
     private readonly IDataScopeService _dataScopeService;
+    private readonly ILogger<TaskSplitRuleConfigGovernanceService> _logger;
 
     public TaskSplitRuleConfigGovernanceService(
         DatabaseConnectionManager connectionManager,
         IAuditLogRepository auditLogRepository,
-        IDataScopeService dataScopeService)
+        IDataScopeService dataScopeService,
+        ILogger<TaskSplitRuleConfigGovernanceService> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _auditLogRepository = auditLogRepository ?? throw new ArgumentNullException(nameof(auditLogRepository));
         _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc />
@@ -133,6 +137,7 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
         SaveTaskSplitRuleConfigRequest input, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         Validate(input);
+        WarnIfConfirmedDegenerateOneOneOne(input);
         await EnsureDepartmentScopeAsync(input.ProductionDepartmentId!.Value, actorUserId, ct);
 
         // P1-03（0号位 审核 §五 P1-03）：治理 DML（APS_Production）与审计（APS_Auth）跨库，无 2PC——
@@ -143,7 +148,14 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
         // P1-02（0号位 审核 §五 P1-02）：原「唯一有效期检查」与 INSERT 分离存在 TOCTOU 竞态——两个并发请求
         // 同时通过「无重叠」检查后都 INSERT，导致同一 (MaterialId, Dept) 同一时点两条有效规则。
         // ⇒ 检查+写放入同一事务，并持 (MaterialId, DeptId) 独占应用锁（sp_getapplock，事务 Owner 自动释放，零 DDL）。
-        var now = DateTime.UtcNow;
+        // 【2026-10-14 时区整改】原为 DateTime.UtcNow —— 本服务是 2号位 辖区**唯一**的 UTC 孤岛：
+        // 该 now 同时写 TaskSplitRuleConfig.CreatedAt/UpdatedAt（两列 DEFAULT 均为 (getdate())）与
+        // AuditLog.OccurredAt。全仓其余治理/审计写入点（GovernanceVersionService 13 处、RunLifecycleService、
+        // SetupRuleService、StageLeadTimeParamGovernanceService、AuthService、RbacManagementService，
+        // 以及 AuthDbContext 拦截器）一律 DateTime.Now。UTC 与 DDL 声明的列口径相悖 ⇒ 统一回本地。
+        // 依据：APS 内部口径「时间戳一律本地（DateTime.Now / GETDATE()），禁 UTC」；0号位 2026-10-13
+        // PM回复1013-1 §5「涉及UTC/本地时间的差异先进行字段级核对」—— 本次核对已完成（见台账 §T-1014a）。
+        var now = DateTime.Now;
         var id = await _connectionManager.ExecuteInTransactionAsync(async (conn, tx) =>
         {
             await AcquireExclusiveLockAsync(conn, tx, input.MaterialId, input.ProductionDepartmentId!.Value);
@@ -217,6 +229,7 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
         }
 
         Validate(input);
+        WarnIfConfirmedDegenerateOneOneOne(input);
 
         var existing = await GetByIdAsync(id);
         if (existing is null)
@@ -236,7 +249,7 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
         await _auditLogRepository.EnsureWritableAsync(ct);
 
         // P1-02：Update 与 Create 同竞态（重叠检查与 UPDATE 分离）——同样放入事务 + (MaterialId, DeptId) 应用锁串行化。
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         await _connectionManager.ExecuteInTransactionAsync(async (conn, tx) =>
         {
             await AcquireExclusiveLockAsync(conn, tx, input.MaterialId, input.ProductionDepartmentId!.Value);
@@ -331,7 +344,7 @@ WHERE Id = @Id";
         // P1-03：审计前置预检（同 Create/Update，先于 DML，审计库不可写则整操作失败、业务零变更）。
         await _auditLogRepository.EnsureWritableAsync(ct);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         await _connectionManager.ExecuteAsync(
             "UPDATE TaskSplitRuleConfig SET IsActive = 0, UpdatedAt = @UpdatedAt WHERE Id = @Id",
             new { UpdatedAt = now, Id = id },
@@ -368,74 +381,6 @@ WHERE Id = @Id";
         };
     }
 
-    /// <inheritdoc />
-    public async Task<IReadOnlyList<BatchPolicyRuleSnapshot>> GetActiveRulesForSnapshotAsync(CancellationToken ct = default)
-    {
-        // ④ NULL 部门不生效：既有 NULL 部门历史规则不默认为所有部门生效（不投快照），治理写路径也已拒绝新增/更新 NULL 部门规则。
-        var rows = (await _connectionManager.QueryAsync<TaskSplitRuleConfig>(
-            $"SELECT {SelectColumns} FROM TaskSplitRuleConfig WHERE IsActive = 1 AND ProductionDepartmentId IS NOT NULL ORDER BY MaterialId, ProductionDepartmentId, Id",
-            null,
-            db: DatabaseId.APS)).ToList();
-
-        // CANDIDATE-P0-01（0号位 审核）：发布前对全部拟生效行统一验证——存量绕过新 API 写入的非法行不得静默进快照
-        // （候选 v1.9 §「本轮新增治理项」/ 字段 v5.1.10：非法行明确阻断发布，严禁默默当有效；反证 #6）。
-        var invalidIds = rows.Where(r => !IsSnapshotEligible(r)).Select(r => r.Id).ToList();
-        if (invalidIds.Count > 0)
-        {
-            throw new SetupRuleDataRedLineException(
-                $"存在不符合发布有效规则的存量执行批拆分规则（Id={string.Join(",", invalidIds)}），阻断参数集发布；请先治理（停用或修正）。");
-        }
-
-        // R02（0号位 再审核反证）：同 (MaterialId, ProductionDepartmentId) 分组内生效窗口重叠（半开区间 [EffectiveFrom, EffectiveTo)、
-        // NULL 无界、严格 < 相切不重叠，与写路径 EnsureUniqueEffectiveWindowAsync 同口径）→ 阻断发布并列 Id，杜绝重复键快照。
-        // 纯计算归 TaskSplitRuleConfigProjector.FindOverlappingWindowIds（单测钉死，零 DB）。
-        var overlapIds = TaskSplitRuleConfigProjector.FindOverlappingWindowIds(rows);
-        if (overlapIds.Count > 0)
-        {
-            throw new SetupRuleDataRedLineException(
-                $"存在同键生效窗口重叠的存量执行批拆分规则（Id={string.Join(",", overlapIds)}），阻断参数集发布；请先治理（修正窗口或停用）。");
-        }
-
-        return TaskSplitRuleConfigProjector.Project(rows);
-    }
-
-    /// <summary>快照发布资格校验（与治理写路径 Validate 同口径）：Preferred 必填且 &gt; 0、Min/Max 非负、Min ≤ Max、Preferred 处于 [Min, Max]。</summary>
-    private static bool IsSnapshotEligible(TaskSplitRuleConfig r)
-    {
-        // 3-NEW-P0-03（0号位 再审核）：Min/Max 非负校验——存量负值行阻断发布，严禁默默当有效。
-        if (r.MinExecutionBatchQty.HasValue && r.MinExecutionBatchQty.Value < 0)
-        {
-            return false;
-        }
-
-        if (r.MaxExecutionBatchQty.HasValue && r.MaxExecutionBatchQty.Value < 0)
-        {
-            return false;
-        }
-
-        if (!r.PreferredBatchQty.HasValue || r.PreferredBatchQty.Value <= 0)
-        {
-            return false;
-        }
-
-        if (r.MinExecutionBatchQty.HasValue && r.MaxExecutionBatchQty.HasValue
-            && r.MaxExecutionBatchQty.Value < r.MinExecutionBatchQty.Value)
-        {
-            return false;
-        }
-
-        if (r.MinExecutionBatchQty.HasValue && r.PreferredBatchQty.Value < r.MinExecutionBatchQty.Value)
-        {
-            return false;
-        }
-
-        if (r.MaxExecutionBatchQty.HasValue && r.PreferredBatchQty.Value > r.MaxExecutionBatchQty.Value)
-        {
-            return false;
-        }
-
-        return true;
-    }
 
     private async Task<TaskSplitRuleConfigDto?> GetByIdAsync(int id)
         => await _connectionManager.QueryFirstOrDefaultAsync<TaskSplitRuleConfigDto>(
@@ -505,6 +450,39 @@ WHERE Id = @Id";
         {
             throw new SetupRuleDataRedLineException("EffectiveTo 不能早于 EffectiveFrom。");
         }
+    }
+
+    /// <summary>
+    /// **B-006 已确认异常 `1/1/1` 的写路径告警**（Min = Max = Preferred = 1，三者都显式给出且同为 1）。
+    ///
+    /// 依据逐字（规则清单 **B-006**，**生效**）：「…`PreferredBatchQty`业务正数必填，经济软Min/Max及Preferred
+    /// 数值须自洽并**由3号位治理**和授权车间维护。**发布数据质量校验不等于Solver对生产批量经济区间偏离的硬拒排**；
+    /// 历史NULL物理兼容，**已确认异常`1/1/1`经核实后治理防重入**」。
+    ///
+    /// ⇒ 「**防重入**」必须落在**写的时候**。发布侧旧⑧块注入已退出、装载改由 2号位 按表直读——
+    /// 若只在历史发布读取路径检出（已随某次发布进快照后才看见），「防重入」已经晚了；
+    /// 若落装载直读路径则须由 2号位 在装载时按同一判据告警，3号位 写路径补的是「防重入」前置可见性。
+    ///
+    /// ⚠ **只告警，不阻断**：`1/1/1` 本身**自洽**（满足 Min ≤ Max 且 Preferred ∈ [Min, Max]），
+    /// 属**经济区间偏离**、不是自洽性违规 ⇒ **不得**并入 <see cref="Validate"/> 的阻断项，
+    /// 否则等于单方替 3号位 拒收业务数据（与 B-006「不等于硬拒排」直接冲突）。
+    /// 判据复用 <see cref="TaskSplitRuleConfigProjector.IsConfirmedDegenerateOneOneOne"/> ——
+    /// 与发布闸那条告警**同源一份判据**，两处不会漂移。
+    /// </summary>
+    private void WarnIfConfirmedDegenerateOneOneOne(SaveTaskSplitRuleConfigRequest input)
+    {
+        if (!TaskSplitRuleConfigProjector.IsConfirmedDegenerateOneOneOne(
+                input.MinExecutionBatchQty, input.MaxExecutionBatchQty, input.PreferredBatchQty))
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "执行批拆分规则写入请求含 B-006 已确认异常 1/1/1（Min=Max=Preferred=1）："
+            + "MaterialId={MaterialId}, ProductionDepartmentId={ProductionDepartmentId}。"
+            + "按 B-006 属「经济区间偏离」，写路径**不阻断**；请 3号位 按「经核实后治理防重入」处置。",
+            input.MaterialId,
+            input.ProductionDepartmentId);
     }
 
     /// <summary>

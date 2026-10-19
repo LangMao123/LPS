@@ -1,6 +1,7 @@
 using System.Text.Json;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Entities.APS;
+using LPS.APS.Core.Exceptions;
 
 namespace LPS.APS.Application.Models;
 
@@ -36,8 +37,9 @@ public static class SetupTransitionRuleProjector
 
     /// <summary>
     /// 消费端便捷入口（S-8：Project 输入源 = 快照子块，并入反序列化一行到位）：
-    /// ContentSnapshotJson 的 SetupTransitionRules 子块 → 消费快照。语义同 ExtractRules（fail-open）：
-    /// 子块缺失/为空/JSON 损坏 → 空列表（无规则 DEFAULT 兜底），随后 Project 筛 IsActive。
+    /// ContentSnapshotJson 的 SetupTransitionRules 子块 → 消费快照。语义同 <see cref="ExtractRules"/>：
+    /// **缺子块 / null / 显式 [] / 空串 → 空列表**（版本可不配置换型规则，合法未配置），随后 Project 筛 IsActive；
+    /// **JSON 损坏 → 抛 <see cref="SetupRuleDataRedLineException"/>**（2026-10-14 由 fail-open 改 fail-fast，见 ExtractRules 注释）。
     /// </summary>
     public static List<SetupTransitionRuleSnapshot> ProjectFromSnapshot(string? contentSnapshotJson)
         => Project(ExtractRules(contentSnapshotJson));
@@ -72,7 +74,23 @@ public static class SetupTransitionRuleProjector
 
     /// <summary>
     /// 从 RuleSetVersion.ContentSnapshotJson 提取 Setup 规则列表（反序列化 "SetupTransitionRules" 子块）。
-    /// 子块缺失/为 null/JSON 损坏 → 返回空列表（治理读路径 fail-open，写路径 DRAFT 态重建）。
+    ///
+    /// **三态（2026-10-14 与 ⑧ 块 <see cref="TaskSplitRuleConfigProjector.ExtractRules"/> 同轨）**：
+    /// ① 缺子块 / null / 空串 → 空列表（该版本未配置换型规则，**合法未配置**，非装载失败）；
+    /// ② 显式空配置 <c>"SetupTransitionRules":[]</c> → 空列表（明确空配置，合法）；
+    /// ③ **JSON 结构损坏 → 抛 <see cref="SetupRuleDataRedLineException"/>**（显式失败，不再静默空列表）。
+    ///
+    /// **为什么 ③ 必须 fail-fast**：「完全没有换型规则」与「本有配置但内容损坏」是两件事，前者是合法
+    /// 缺配（无规则 = DEFAULT 兜底 0 分钟），后者是**数据事故**。原 fail-open 把二者压成同一个空列表 ⇒
+    /// 损坏版本一路静默降级成「无规则」，1号位 消费侧（<c>PhaseOneConstraintBuilder</c> Setup 分支）
+    /// 据此按 0 分钟排出**看似成立、实则丢失换型时间**的计划，且全链无任何告警位可察觉。
+    /// 依据：1号位 2026-10-13《BatchPolicy三态载体择定…回执》§五「**应同轨**」；
+    /// 边界照该件 §5.3（**仅 JSON 损坏抛异常**；缺子块／<c>null</c>／显式 <c>[]</c> **仍空列表**）。
+    ///
+    /// ⚠ 与 ⑧ 块的一处**非对称**：本方法的调用方除装载链（<see cref="ProjectFromSnapshot"/>）外，
+    /// 还有治理读写链 <c>SetupRuleService</c>（11 处，List/GetById/Create/Update/Delete/Copy/校验）。
+    /// 该服务类头已声明「数据红线 → <see cref="SetupRuleDataRedLineException"/>（422）」⇒ 抛异常**在其既定契约内**，
+    /// 且修掉了治理侧原有的静默隐患（读到损坏快照时先当空列表、再经 <see cref="SetRules"/> 重建 ⇒ **其余子块被静默丢弃**）。
     /// </summary>
     public static List<SetupTransitionRule> ExtractRules(string? contentSnapshotJson)
     {
@@ -84,7 +102,8 @@ public static class SetupTransitionRuleProjector
         try
         {
             using var doc = JsonDocument.Parse(contentSnapshotJson);
-            if (!doc.RootElement.TryGetProperty(SetupTransitionRulesBlockName, out var block))
+            if (!doc.RootElement.TryGetProperty(SetupTransitionRulesBlockName, out var block)
+                || block.ValueKind == JsonValueKind.Null)
             {
                 return new List<SetupTransitionRule>();
             }
@@ -92,9 +111,10 @@ public static class SetupTransitionRuleProjector
             var rules = block.Deserialize<List<SetupTransitionRule>>(JsonOptions);
             return rules ?? new List<SetupTransitionRule>();
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            return new List<SetupTransitionRule>();
+            throw new SetupRuleDataRedLineException(
+                $"ContentSnapshotJson.SetupTransitionRules 子块 JSON 损坏，无法装载换型规则快照：{ex.Message}", ex);
         }
     }
 

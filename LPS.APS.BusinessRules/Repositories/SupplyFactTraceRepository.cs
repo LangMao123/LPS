@@ -147,6 +147,9 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             FactoryCode = factoryCode,
             DocumentType = documentType,
             DocumentNo = documentNo,
+            // P0 修复（4号位 10-19）：本段 SQL 有 @HasFactories 条件但参数对象漏传 → 端点必 500
+            //（"必须声明标量变量 @HasFactories"）。第一段查询本就正确，本段照抄了 SQL 未照抄参数。
+            HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take

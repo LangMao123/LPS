@@ -1,6 +1,5 @@
 using FluentAssertions;
 using LPS.APS.Application.Models;
-using LPS.APS.Core.Dto;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Core.Exceptions;
 using Xunit;
@@ -9,7 +8,8 @@ namespace LPS.APS.Tests.Unit;
 
 /// <summary>
 /// TaskSplitRuleConfigProjector 单元测试（Batch Policy 投影/编解码，0号位 2026-10-07 裁决本轮落码）。
-/// 无状态纯函数，直接钉死：IsActive/生效区间筛除、去审计字段投影、ContentSnapshotJson 子块编解码 + fail-open。
+/// 无状态纯函数，直接钉死：IsActive/生效区间筛除、去审计字段投影、ContentSnapshotJson 子块编解码 + fail-fast。
+/// （注：本类注释原写 "fail-open"，与实现不符 —— ⑧块投影器自 §T-1014b 起已改为 **fail-fast**：JSON 损坏抛异常而非静默返回空。2026-10-14 订正。）
 /// </summary>
 public class TaskSplitRuleConfigProjectorTests
 {
@@ -29,123 +29,6 @@ public class TaskSplitRuleConfigProjectorTests
             MaxExecutionBatchQty = max,
             AllowSplit = allowSplit,
         };
-
-    [Fact]
-    public void Project_筛除IsActivefalse()
-    {
-        var rules = new[]
-        {
-            Rule(id: 1, materialId: 100, deptId: 900, isActive: true),
-            Rule(id: 2, materialId: 200, deptId: 900, isActive: false),
-        };
-
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: DateTime.Now);
-
-        result.Should().ContainSingle().Which.MaterialId.Should().Be(100);
-    }
-
-    [Fact]
-    public void Project_筛除生效区间外()
-    {
-        var now = DateTime.Now;
-        var rules = new[]
-        {
-            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
-            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now.AddDays(1)),
-            Rule(id: 3, materialId: 300, deptId: 900, effectiveTo: now.AddDays(-1)),
-        };
-
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
-
-        result.Should().ContainSingle().Which.MaterialId.Should().Be(100);
-    }
-
-    [Fact]
-    public void Project_半开区间_EffectiveTo等于asOf_已过期排除()
-    {
-        // P0-04（0号位 审核）：投影与治理写路径统一半开 [EffectiveFrom, EffectiveTo)——截止点恰好等于 asOf 视为已过期。
-        var now = new DateTime(2026, 10, 9, 11, 0, 0);
-        var rules = new[]
-        {
-            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddHours(-1), effectiveTo: now),
-            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now, effectiveTo: now.AddHours(1)),
-        };
-
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
-
-        result.Should().ContainSingle().Which.MaterialId.Should().Be(200);
-    }
-
-    [Fact]
-    public void Project_半开区间_相切窗口同一瞬间至多一条有效()
-    {
-        // P0-04：相切窗口 [10:00,11:00) + [11:00,12:00) 在 11:00 恰好只命中第二条（杜绝投影重复键）。
-        var now = new DateTime(2026, 10, 9, 11, 0, 0);
-        var rules = new[]
-        {
-            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddHours(-1), effectiveTo: now),
-            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now, effectiveTo: now.AddHours(1)),
-        };
-
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
-
-        result.Should().ContainSingle().Which.MaterialId.Should().Be(200);
-    }
-
-    [Fact]
-    public void Project_投影业务键与参数_去审计兼容字段_4技术字段恒null()
-    {
-        // v5.1.10 收口①②：实体上即便有历史 4 字段值，投影快照亦恒 null（不投 Solver 技术预算/策略列，主链不得消费）。
-        var rule = Rule(id: 7, materialId: 200, deptId: 300, min: 10m, max: 50m, allowSplit: false);
-        rule.PreferredBatchQty = 25m;
-        rule.AllowMerge = true;
-        rule.MaxOptimizationSplitCount = 3;
-        rule.MaxBatchCandidates = 5;
-        rule.BottleneckSplitStrategy = "PREFER_SPLIT";
-        rule.NonBottleneckStrategy = "PREFER_LARGE_BATCH";
-
-        var result = TaskSplitRuleConfigProjector.Project(new[] { rule }).Single();
-
-        result.MaterialId.Should().Be(200);
-        result.ProductionDepartmentId.Should().Be(300);
-        result.MinExecutionBatchQty.Should().Be(10m);
-        result.MaxExecutionBatchQty.Should().Be(50m);
-        result.PreferredBatchQty.Should().Be(25m);
-        result.AllowSplit.Should().BeFalse();
-        result.AllowMerge.Should().BeTrue();
-        result.MaxOptimizationSplitCount.Should().BeNull();
-        result.MaxBatchCandidates.Should().BeNull();
-        result.BottleneckSplitStrategy.Should().BeNull();
-        result.NonBottleneckStrategy.Should().BeNull();
-    }
-
-    [Fact]
-    public void Project_筛除NULL部门历史记录_不默认为所有部门生效()
-    {
-        // v5.1.10 收口④：NULL 部门历史记录不默认为所有部门的生效规则——即便 IsActive + 生效窗内亦不投快照。
-        var now = DateTime.UtcNow;
-        var rules = new[]
-        {
-            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
-            Rule(id: 2, materialId: 200, deptId: null, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
-        };
-
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
-
-        result.Should().ContainSingle().Which.MaterialId.Should().Be(100);
-    }
-
-    [Fact]
-    public void SetRules_保留其它子块_原子替换BatchPolicy()
-    {
-        var original = "{\"Lock\":{\"x\":1},\"BatchPolicy\":[{\"MaterialId\":1}]}";
-        var snapshots = new List<BatchPolicyRuleSnapshot> { new() { MaterialId = 200, AllowSplit = false } };
-
-        var merged = TaskSplitRuleConfigProjector.SetRules(original, snapshots);
-
-        TaskSplitRuleConfigProjector.ExtractRules(merged).Should().ContainSingle().Which.MaterialId.Should().Be(200);
-        merged.Should().Contain("\"Lock\"");
-    }
 
     [Fact]
     public void ExtractRules_B010三态_缺失与空配置返回空列表_损坏抛红线异常()
@@ -200,5 +83,128 @@ public class TaskSplitRuleConfigProjectorTests
         var c = Rule(id: 3, materialId: 200, deptId: 10, effectiveFrom: new DateTime(2026, 1, 1), effectiveTo: null);
 
         TaskSplitRuleConfigProjector.FindOverlappingWindowIds(new[] { a, b, c }).Should().BeEmpty();
+    }
+
+    // ── B-006 已确认异常 `1/1/1`（2026-10-14 落）────────────────────────────────────────────────
+    // 规则清单 B-006（**生效**）逐字：「…**发布数据质量校验不等于Solver对生产批量经济区间偏离的硬拒排**；
+    // 历史NULL物理兼容，**已确认异常`1/1/1`经核实后治理防重入**」。
+    // 下面三条**必须一起看**才完整 —— 只钉前两条会诱导后人把它塞进发布闸：
+    //   ① `1/1/1` 必须**可检出**（否则 B-006 的「经核实后治理」无从谈起）；
+    //   ② 检出**不得误伤**同类（缺 Preferred 属另一类，全等但非 1 不属本类）；
+    //   ③ `1/1/1` **不得**并入 IsSnapshotEligible（它是**经济区间偏离**、本身自洽；并入会让发布闸对
+    //      全量存量行一次性 fail-closed，与「不等于硬拒排」直接冲突）。
+
+    private static TaskSplitRuleConfig RuleWithQty(
+        int id, decimal? min, decimal? max, decimal? preferred, int materialId = 100, int? deptId = 900)
+        => new()
+        {
+            Id = id,
+            MaterialId = materialId,
+            ProductionDepartmentId = deptId,
+            IsActive = true,
+            MinExecutionBatchQty = min,
+            MaxExecutionBatchQty = max,
+            PreferredBatchQty = preferred,
+            AllowSplit = true,
+            AllowMerge = true,
+        };
+
+    [Theory]
+    [InlineData(1, 1, 1, true)]
+    [InlineData(1, 1, null, false)]   // 缺 Preferred ⇒ 属 IsSnapshotEligible 的阻断类，不是本类
+    [InlineData(1, 1, 2, false)]
+    [InlineData(null, 1, 1, false)]
+    [InlineData(1, 2, 1, false)]
+    [InlineData(2, 2, 2, false)]      // 全等但非 1 ⇒ 不是 B-006 点名的那个组合
+    public void IsConfirmedDegenerateOneOneOne_只认三者全显式为1(int? min, int? max, int? preferred, bool expected)
+    {
+        TaskSplitRuleConfigProjector
+            .IsConfirmedDegenerateOneOneOne(min, max, preferred)
+            .Should().Be(expected);
+    }
+
+    [Fact]
+    public void FindConfirmedDegenerateOneOneOneIds_只报全1行_不误伤他行()
+    {
+        var rows = new[]
+        {
+            RuleWithQty(11, 1, 1, 1),      // 命中
+            RuleWithQty(12, 10, 100, 50),  // 正常规则
+            RuleWithQty(13, 1, 1, null),   // 缺 Preferred ⇒ 另一类（发布闸已阻断），不属本类
+            RuleWithQty(14, 2, 2, 2),      // 全等但非 1
+            RuleWithQty(15, 1, 1, 1),      // 命中
+        };
+
+        TaskSplitRuleConfigProjector.FindConfirmedDegenerateOneOneOneIds(rows)
+            .Should().Equal(11, 15);
+    }
+
+    [Fact]
+    public void IsSnapshotEligible_全1行_判合格_不得被并进阻断闸()
+    {
+        // 反证：1/1/1 本身自洽（Min ≤ Max、Preferred ∈ [Min, Max]）⇒ 在发布闸看来是"合格"的。
+        // B-006 明令「发布数据质量校验不等于…硬拒排」⇒ 这个 true 是**正确行为**、不是缺陷。
+        // 1/1/1 的可见性由 FindConfirmedDegenerateOneOneOneIds（发布告警）承担，**不**由本闸承担。
+        TaskSplitRuleConfigProjector.IsSnapshotEligible(1, 1, 1).Should().BeTrue();
+    }
+
+    // ── 快照顶层键名漂移检测（2026-10-14 落）──────────────────────────────────────────────────────
+    // 为什么需要它：8 块里 ①–⑥ 走强类型反序列化（键名不符 ⇒ 抛异常，fail-fast），
+    // 而 ⑦块 SetupTransitionRules／⑧块 BatchPolicy 的投影器是**单点 TryGetProperty** ——
+    // 键名拼错 ⇒ **静默返回空列表**，与「合法未配置」在运行时**不可区分**。8 块键名**一个都没冻结**。
+    // 本检测器只负责把"出现了不该有的键"暴露成日志，**不阻断发布、不改快照**。
+
+    [Fact]
+    public void FindUnknownSnapshotBlockNames_已知8键_全不报()
+    {
+        // 逐字取自 FrozenStrategySnapshotProvider（①–⑥）＋ GovernanceVersionService（⑦⑧）。
+        const string json = """
+            {
+              "DemandPriority": {}, "Lock": {}, "Supply": {}, "Procurement": {},
+              "SolverStrategy": {}, "CandidateGuardrail": {},
+              "SetupTransitionRules": [], "BatchPolicy": []
+            }
+            """;
+
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames(json).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void FindUnknownSnapshotBlockNames_未知键与拼错键_报出且去重()
+    {
+        // 关键用例：`SetupTransitionRule`（少个 s）就是 ⑦块最典型的手滑 —— 它**不报错**、静默当未配置。
+        const string json = """
+            {
+              "DemandPriority": {},
+              "SetupTransitionRule": [],
+              "Batchpolicy": [],
+              "SetupTransitionRule": []
+            }
+            """;
+
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames(json)
+            .Should().BeEquivalentTo(new[] { "SetupTransitionRule", "Batchpolicy" });
+    }
+
+    [Fact]
+    public void FindUnknownSnapshotBlockNames_空快照_不报不抛()
+    {
+        // 空/未配置的快照是**合法状态**（新版本尚未注入任何子块），不得被当成"键名漂移"。
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames(null).Should().BeEmpty();
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames("").Should().BeEmpty();
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames("   ").Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("[]")]                       // 根是数组
+    [InlineData("123")]                      // 根是标量
+    [InlineData("null")]                     // 根是 null
+    [InlineData("{ this is not json ")]      // 整体损坏
+    public void FindUnknownSnapshotBlockNames_非对象根或损坏JSON_不抛_返回空(string json)
+    {
+        // 根不是对象 ⇒ 不是「8 块」形态，不承载"未知键"这个信号；
+        // JSON 整体损坏 ⇒ 由各子块投影器按既有 fail-fast 语义处置（见 ExtractRules），
+        // 本函数**不重复承载**该信号（否则同一损坏被报两次、第二次语义还不同）。
+        TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames(json).Should().BeEmpty();
     }
 }

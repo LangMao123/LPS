@@ -17,6 +17,7 @@ public interface IPeggingTraceRepository
         string? commitmentStatus = null,
         string? orderNo = null,
         string? supplyDocumentNo = null,
+        long? rootOrderId = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,

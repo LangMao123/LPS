@@ -18,24 +18,14 @@ public class OverviewQueryService : IOverviewQueryService
     }
 
     /// <summary>
-    /// 查询当前ACTIVE计划版本信息
+    /// 查询当前ACTIVE计划版本信息（R1-a：按 Domain 列表，每 Domain 至多一条）
     /// </summary>
-    public async Task<OverviewActivePlanDto?> GetActivePlanAsync(
+    public async Task<List<OverviewActivePlanDto>> GetActivePlanAsync(
         string? domainKey = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedDomains = null)
     {
         return await _repository.GetActivePlanAsync(domainKey, ct, allowedDomains);
-    }
-
-    /// <summary>
-    /// 查询任务状态摘要
-    /// </summary>
-    public async Task<OverviewTaskSummaryDto> GetTaskSummaryAsync(
-        int planVersionId,
-        CancellationToken ct = default)
-    {
-        return await _repository.GetTaskSummaryAsync(planVersionId, ct);
     }
 
     /// <summary>

@@ -16,10 +16,13 @@ namespace LPS.APS.Tests.Integration;
 ///
 /// 【被测】IOrderLoadingService.LoadOrdersToActivePlanVersionsAsync（新增代码）：
 ///   查 Status='ACTIVE' 的 PlanVersion → 逐个调 sp_SyncOrdersToPartitionTable 装订单。
+///   （口径回退 B 2026-10-15：正式采用记 Status='ACTIVE'，与冻结 DDL 08:8723／08:4057 同口径。）
 ///   场景：白天 ERP 每小时同步后，把新订单压进 ACTIVE PV 的 [Order]，供用户选单做插单试排。
 ///
 /// 【本测试自建自清】当前库无 ACTIVE PlanVersion（全 TEST/Computed），故测试临时建一个
-///   FAMILY_X 域（有效 DomainDefinition）的 PlanVersion 并置 ACTIVE，验证后清理。
+///   FAMILY_X 域（有效 DomainDefinition）的 PlanVersion 并置 Status='ACTIVE'，验证后清理。
+///   ⚠️ 该行 Status 必须为 'ACTIVE'（与被测查询口径一致）；测试自身标记一律用 VersionCode 前缀
+///   （TEST-P0-ORDERPOOL-），清理亦按此前缀，不碰真实数据。
 ///
 /// 【清理范围】测试 PV 的 [Order] 行 + PlanVersion 行（按测试 VersionCode 前缀精准删，不碰真实数据）。
 /// </summary>
@@ -61,7 +64,7 @@ public class OrderLoadingIntegrationTest
                 (VersionCode, VersionCategory, PlanHorizonStart, PlanHorizonEnd, ComputeMode,
                  Status, BatchNo, DomainKey, CreatedBy, CreatedAt)
               OUTPUT INSERTED.Id
-              VALUES (@VersionCode, 'TEST', GETDATE(), DATEADD(DAY, 90, GETDATE()), 'FULL',
+              VALUES (@VersionCode, 'DAILY_BASELINE', GETDATE(), DATEADD(DAY, 90, GETDATE()), 'FULL',
                       'ACTIVE', 'P0TEST', @DomainKey, 'P0TEST', GETDATE())",
             new { VersionCode = versionCode, DomainKey = TestDomainKey },
             db: DatabaseId.APS);

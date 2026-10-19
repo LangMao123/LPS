@@ -350,7 +350,7 @@ public class RealSchedulingIntegrationTest
                     PlanHorizonStart = DateTime.Now,
                     PlanHorizonEnd = DateTime.Now.AddDays(30),
                     ComputeMode = "SIMULATION",
-                    Status = "Created",
+                    Status = "BUILDING",
                     CreatedBy = "TEST_USER"
                 },
                 db: DatabaseId.APS);

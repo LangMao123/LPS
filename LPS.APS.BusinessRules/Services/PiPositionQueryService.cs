@@ -33,7 +33,10 @@ public class PiPositionQueryService
         IReadOnlySet<string>? allowedFactories = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
-        if (take <= 0 || take > 500) take = 100;
+        // take 越界不再静默回落 100（4号位 10-17 R3：传 1000 实返 100，调用方误以为"就这么多"）。
+        // 语义：非正数 → 取默认 100；超过上限 → 夹到上限 500（可预测，不返回与请求无关的第三个数）。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAsync(
             planVersionId, productionInstructionNo, materialCode,

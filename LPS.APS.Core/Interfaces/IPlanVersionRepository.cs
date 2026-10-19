@@ -7,7 +7,11 @@ namespace LPS.APS.Core.Interfaces;
 /// 对应表：APS_Production.dbo.PlanVersion（冻结 DDL v5.1.2 §3.2）
 /// 边界：仅更新确认/激活列（Status / ActivatedAt / ActivatedBy / ArchivedAt）；不重写 2号位结果持久化流转。
 /// </summary>
-/// <remarks>开发者：3号位</remarks>
+/// <remarks>
+/// 开发者：3号位
+/// 【2026-10-15 口径回退（A 作废，改走 B）】正式采用记 <c>Status</c>（冻结 DDL 08:8723 逐字）；
+/// <c>VersionCategory</c> 是**出生即定**的版本类别，治理动作不得翻转。详见 PlanVersionRepository 类头注释。
+/// </remarks>
 public interface IPlanVersionRepository
 {
     /// <summary>按 Id 读取 PlanVersion（不存在返回 null）</summary>
@@ -33,7 +37,7 @@ public interface IPlanVersionRepository
     /// <summary>按 SourceScheduleRunId 取最新 PlanVersion（Run 引用追溯；无则 null）</summary>
     System.Threading.Tasks.Task<PlanVersion?> GetLatestByScheduleRunIdAsync(int scheduleRunId, CancellationToken ct = default);
 
-    /// <summary>按 DomainKey 取当前 ACTIVE 计划版本（B-1：白天 Candidate 解析 Base；无则 null）</summary>
+    /// <summary>按 DomainKey 取当前 ACTIVE（Status='ACTIVE'）计划版本（B-1：白天 Candidate 解析 Base；无则 null）</summary>
     System.Threading.Tasks.Task<PlanVersion?> GetActiveByDomainKeyAsync(string domainKey, CancellationToken ct = default);
 
     /// <summary>按 SourceScheduleRunId 取全部 PlanVersion（G8：Run 域级状态汇总；按 DomainKey 分组倒序）</summary>

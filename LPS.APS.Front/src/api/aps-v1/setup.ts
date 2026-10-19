@@ -1,12 +1,12 @@
 /**
- * APS V1 4号位 — Setup 换型规则 API（13 端点，v1.5 Setup 专项）
+ * APS V1 4号位 — Setup 换型规则 API（13 端点）
  *
- * @owner 3号位（后端 API 待落地，4号位 先做前端预备 + mock fallback）
- * @see 冻结文档/APS_V1_4号位页面与业务操作开发实施包_v1.5_20260916_Setup换型规则专项冻结对齐版.md §11.1
+ * @owner 3号位（Setup 维护 API，Setup 专项指导 v1.2 §19.1）
+ * @see frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
  * @see frontNew/docs/3号位催办单-2026-09-17-Setup维护API-12端点.md
  * @see frontNew/src/api/aps-v1/types/setup.ts
  *
- * 13 端点清单（按 v1.5 §11.1 表，前缀 /api/governance）：
+ * 13 端点清单（按 3号位催办单-2026-09-17 契约，前缀 /api/governance）：
  *   1.  GET    /setup-rules/exact?ruleSetVersionId=...              EXACT 规则列表
  *   2.  POST   /setup-rules/exact                                    新增 EXACT
  *   3.  PUT    /setup-rules/exact/{id}                               修改 EXACT
@@ -174,7 +174,7 @@ const MOCK_DEFAULT_RULES: SetupRuleDto[] = [
   }
 ]
 
-/** mock 0 分钟兜底统计（§5.3） */
+/** mock 0 分钟兜底统计 */
 const MOCK_UNCOVERED_STATS: SetupUncoveredStatDto[] = [
   {
     departmentCode: 'DEPT_A',
@@ -208,7 +208,7 @@ const MOCK_UNCOVERED_STATS: SetupUncoveredStatDto[] = [
   }
 ]
 
-/** mock 共同合法设备推荐（§3.3；key = operationCode_fromMaterialId_toMaterialId，偏差 #5 后传 Id） */
+/** mock 共同合法设备推荐（key = operationCode_fromMaterialId_toMaterialId，偏差 #5 后传 Id） */
 const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
   OP20_1_2: {
     operationCode: 'OP20',
@@ -217,12 +217,14 @@ const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
       {
         resourceCode: 'MC001',
         resourceName: '设备 001',
+        resourceId: 1001,
         departmentCode: 'DEPT_A',
         stageCode: 'STAGE_1'
       },
       {
         resourceCode: 'MC002',
         resourceName: '设备 002',
+        resourceId: 1002,
         departmentCode: 'DEPT_A',
         stageCode: 'STAGE_1'
       }
@@ -235,12 +237,14 @@ const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
       {
         resourceCode: 'MC002',
         resourceName: '设备 002',
+        resourceId: 1002,
         departmentCode: 'DEPT_A',
         stageCode: 'STAGE_1'
       },
       {
         resourceCode: 'MC003',
         resourceName: '设备 003',
+        resourceId: 1003,
         departmentCode: 'DEPT_B',
         stageCode: 'STAGE_2'
       }
@@ -253,6 +257,7 @@ const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
       {
         resourceCode: 'MC003',
         resourceName: '设备 003',
+        resourceId: 1003,
         departmentCode: 'DEPT_B',
         stageCode: 'STAGE_2'
       }
@@ -260,7 +265,7 @@ const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
   }
 }
 
-/** mock 版本 Diff（§6.3） */
+/** mock 版本 Diff */
 const MOCK_DIFF: SetupDiffDto = {
   ruleSetVersionId: 2002,
   otherVersionId: 2001,
@@ -384,7 +389,7 @@ export const setupApi = {
     })
   },
 
-  /* ===== 9. 共同合法设备推荐（§3.3） ===== */
+  /* ===== 9. 共同合法设备推荐 ===== */
   async getOperationResourceEligibility(
     query: OperationResourceEligibilityQuery
   ): Promise<OperationResourceEligibilityDto> {
@@ -405,7 +410,7 @@ export const setupApi = {
     })
   },
 
-  /* ===== 10. 0 分钟兜底统计（§5） ===== */
+  /* ===== 10. 0 分钟兜底统计 ===== */
   async getUncoveredStats(query: SetupUncoveredQuery): Promise<SetupUncoveredStatDto[]> {
     if (APS_USE_MOCK) {
       let arr = MOCK_UNCOVERED_STATS

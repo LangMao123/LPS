@@ -142,10 +142,11 @@ public class PublishedVersionAndStrategyProfileDiffTests
             {
                 Id = 5, ParameterSetId = 20, VersionCode = "P1",
                 Status = GovernanceVersionStatus.Published,
-                ContentSnapshotJson = SnapshotWithLock()
+                // 方案 A（2026-10-16）：仓储 DB 侧 OPENJSON 已提取 Lock 块，mock 返回「已提取」实体
+                LockJson = """{"Trigger":{"UseRemainingTimeThreshold":false,"ProtectDelayed":true},"Sticky":{}}"""
             }
         };
-        _parameterSetRepo.Setup(r => r.GetByParameterSetIdAsync(20, It.IsAny<CancellationToken>())).ReturnsAsync(versions);
+        _parameterSetRepo.Setup(r => r.GetDetailByParameterSetIdAsync(20, It.IsAny<CancellationToken>())).ReturnsAsync(versions);
 
         // Act
         var result = await _service.GetPublishedParameterSetVersionAsync(20, CancellationToken.None);

@@ -28,6 +28,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   ApiError,
+  EXPLANATION_OBJECT_TYPES,
   explanationApi,
   type BusinessFactIssue,
   type ExplanationObjectType,
@@ -80,6 +81,7 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   /**
    * 按根因 objectType 分组的解释事实（5 码：v5.1.10 :4858）
    *  - 取代表旧 6 码（TASK/ORDER/PI/PO/RESOURCE/STAGE）→ 新 5 码（ORDER/TASK/RESOURCE/STAGE/DOMAIN）
+   *  - 注意：10-12 函 §二 要求「未入字典的值不丢弃」，未识别部分在下方 unrecognizedObjectTypeFacts 单列展示
    */
   const factsByObjectType = computed(() => {
     const facts = data.value?.scheduleExplanationFacts ?? []
@@ -100,6 +102,32 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
       groups[key].sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity])
     })
     return groups
+  })
+
+  /**
+   * 未识别 ObjectType 的解释事实（10-12 函 §二「未入字典的值不丢弃」）
+   *  - 触发场景：dev 实际产出超出 v5.1.10 §八.1 5 码（如 DEMAND、PURCHASE、SHIPMENT 等）
+   *  - 处理：factsByObjectType 不会把它们纳入任何已知分组（避免静默丢失 / 冒充正式编码）；
+   *          本 getter 把它们独立收集，view 用「待核对」中性样式展示（灰标签 + 提示语）
+   *  - 关联答复：5号位 10-12 函 §二：DEMAND 暂以待核对形式展示，等 Q1 批准生效后该部分自动归 OBJECT_TYPE_LABELS.DEMAND
+   *  - 待核对不冒充正式码：UI 不显示"已发布"/"已冻结"等措辞，仅作"中性观察"
+   */
+  const unrecognizedObjectTypeFacts = computed<ScheduleExplanationFact[]>(() => {
+    const facts = data.value?.scheduleExplanationFacts ?? []
+    const sevOrder = { ERROR: 0, WARN: 1, INFO: 2 } as const
+    return facts
+      .filter((f) => !(EXPLANATION_OBJECT_TYPES as readonly string[]).includes(f.objectType))
+      .sort((a, b) => {
+        const sa = sevOrder[a.severity] ?? 99
+        const sb = sevOrder[b.severity] ?? 99
+        if (sa !== sb) return sa - sb
+        return (b.occurredAt ?? '').localeCompare(a.occurredAt ?? '')
+      })
+  })
+  /** 未识别 ObjectType 去重后的 raw 值集合（用于 UI 标签展示，如 "DEMAND"、"SHIPMENT"） */
+  const unrecognizedRawObjectTypes = computed<string[]>(() => {
+    const items = unrecognizedObjectTypeFacts.value
+    return [...new Set(items.map((f) => f.objectType))]
   })
 
   /**
@@ -233,6 +261,8 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     severityCounts,
     totalFacts,
     factsByObjectType,
+    unrecognizedObjectTypeFacts,
+    unrecognizedRawObjectTypes,
     businessFactIssues,
     businessFactIssuesTotal,
     businessFactIssuesPage,

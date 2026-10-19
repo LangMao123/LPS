@@ -303,10 +303,11 @@ public sealed class BatchPolicyRuleSnapshot
 
     /// <summary>
     /// 生效窗口起点（半开区间 <c>[EffectiveFrom, EffectiveTo)</c>；null = 无下界）。
-    /// **2026-10-13 新增**：发布侧 <c>TaskSplitRuleConfigProjector.Project</c> 填充（此前被丢弃），
+    /// **2026-10-13 新增**：由 <c>TaskSplitRuleConfig</c> 表直读装载（发布侧⑧投影已退休）填充，
     /// 装载期按**本 Run 生效时点**重判 —— 「发布时有效、Run 时已失效」的行因此可被显式判成
     /// <see cref="BatchPolicyState.Invalid"/>，而不再被原样下发为有效。
-    /// 依据：冻结 06 集成接口 v1.37 <c>:25</c>（业务键含**生效时点**）＋ 规则清单 v1.8 <c>B-013</c>。
+    /// 依据：冻结 06 集成接口 **v1.36 <c>:17</c>**（＝v1.37 <c>:25</c> 同一段；业务键含**生效时点**）
+    /// ＋ 规则清单 **v1.7 <c>B-013</c>**（1号位 2026-10-14《BatchPolicy三态载体…回执》§五 逐字核对）。
     /// 旧快照（如 PSV 807）无此字段 ⇒ 反序列化为 null ⇒ 无界，**向后兼容、零行为变化**。
     /// </summary>
     public DateTime? EffectiveFrom { get; set; }
@@ -328,11 +329,11 @@ public sealed class BatchPolicyRuleSnapshot
 /// <summary>
 /// ⑧块 Batch Policy **三态＋不可用**（2→1 最小技术合同，2026-10-13）。
 ///
-/// 依据（逐字）：06 集成接口 v1.37 <c>:25</c>（G2-T01 补正）——2号位须按
+/// 依据（逐字）：06 集成接口 **v1.36 <c>:17</c>**（G2-T01 补正）——2号位须按
 /// <c>MaterialId + ProductionDepartmentId + 运行版本/Scope/生效时点</c> 的业务键**准确区分并传递**
 /// <c>VALID/MISSING/INVALID</c> 三态；「现有2→1合同确实不能无歧义表达三态时，仅允许经1/2号位契约审核确认
 /// **最小DTO或逻辑状态载体**，**不得增加Batch表**或**把所有物料规则发送Solver**；此处不预命名新字段。」
-/// ＋ 规则清单 v1.8 <c>B-013</c>（「不创第二Batch数据库真相」）
+/// ＋ 规则清单 **v1.7 <c>B-013</c>**（「不创第二Batch数据库真相」）
 /// ＋ 0号位 2026-10-13《未命名的Markdown文件3》<c>§2</c>（**新增第 4 类「不可用（技术失败）」**：
 /// 「接口未传递状态、规则数据装载失败或 DTO 无法表达三态，**不得直接视为 MISSING**」）。
 ///
@@ -346,17 +347,67 @@ public enum BatchPolicyState
     Valid = 0,
 
     /// <summary>经完整核对后本业务键**确无匹配规则**（含「⑧块整体为空（完全缺配）」与「本部门无命中而别的部门有记录」）
-    /// ⇒ 06 <c>:281</c> 允许 1号位 走 B-010 取 <c>Q_C</c> 作本 Run 软 Preferred 兜底。</summary>
+    /// ⇒ 06 §「明确MTS PI来源时的运行时数量硬上限与缺配兜底」允许 1号位 走 B-010 取 <c>Q_C</c> 作本 Run 软 Preferred 兜底。</summary>
     Missing = 1,
 
     /// <summary>**本键有规则但不合法/冲突/失效且未治理隔离**（含「发布时有效、本 Run 生效时点已失效」）
-    /// ⇒ 06 <c>:281</c> 逐字「**不得假装 MISSING 兜底，应暴露 Issue 等待治理**」⇒ 1号位 Fail Closed，**不启 Q_C**。</summary>
+    /// ⇒ 06 同节逐字「**存在INVALID匹配时，不得假装MISSING兜底，应暴露Issue等待治理**」⇒ 1号位 Fail Closed，**不启 Q_C**。</summary>
     Invalid = 2,
 
     /// <summary>**不可用（技术失败）**：接口未传递状态／规则数据装载失败／DTO 无法表达三态
     /// ⇒ 0号位 文件3 <c>§2</c>「**不得直接视为 MISSING**」⇒ 1号位 Fail Closed，**不启 Q_C**。
     /// 过渡形态：载体整体缺席（<c>SolverStrategySnapshot.BatchPolicyStates is null</c>）亦按本类处置。</summary>
     Unavailable = 3
+}
+
+/// <summary>
+/// <see cref="BatchPolicyStateSnapshot.MatchSource"/> 的**封闭取值域**（9 值，1号位 2026-10-14 定稿；
+/// 见《APS_V1_20261014_BatchPolicy三态载体_六条答复的回执与两处非对称处置_1号位致2号位_v1.0_20261014.md》§三）。
+///
+/// **为什么要有常量而不是自由文本**：<c>MatchSource</c> 是 B-013 逐字要求的「**真实匹配来源**」，
+/// 它要被消费侧当作**可判定的域值**使用（1号位 的 C-3 将按本值域做 Fail Closed 校验），自由文本使该判定不可能。
+///
+/// **强制落点（1号位 §一.1 定稿，2号位 已确认）**：值域校验**只作用于 <see cref="BatchPolicyState.Valid"/> 的条目**
+/// —— 另三态的出口由 <see cref="BatchPolicyState"/> 决定，<c>MatchSource</c> 只进诊断文本
+/// ⇒ 对它们强制值域无安全收益，且有把「技术失败」按「业务无效」处置的误伤风险（0号位 文件3 §2 所禁）。
+///
+/// **取值规则（2号位 产出侧）**：除 <see cref="LoadError"/> 外**一律是裸常量** —— 各态所需的附加信息
+/// （物料/部门/是否跨部门）本就在条目的业务键字段里，重复塞进 <c>MatchSource</c> 只会破坏值域封闭。
+/// <see cref="LoadError"/> 是**唯一例外**：装载失败的具体原因**只有调用方知道、且从条目上不可复原**
+/// ⇒ 以 <c>"LOAD_ERROR: &lt;原因&gt;"</c> 形式带出（值域以**前导常量**锚定，原因不丢失）。
+/// </summary>
+public static class BatchPolicyMatchSource
+{
+    /// <summary><c>Valid</c> 的**唯一合法值**：精确业务键命中且在生效窗口内。</summary>
+    public const string SnapshotHit = "SNAPSHOT_HIT";
+
+    /// <summary><c>Missing</c>：⑧块整体为空（完全缺配）／精确业务键无命中（⑧块有行但本键无行）。</summary>
+    public const string NoRuleForMaterial = "NO_RULE_FOR_MATERIAL";
+
+    /// <summary><c>Missing</c>：本部门无命中而**别的部门**存在记录（06 v1.36 <c>:17</c> 逐字归 MISSING）。</summary>
+    public const string OtherDeptOnly = "OTHER_DEPT_ONLY";
+
+    /// <summary><c>Missing</c>／<c>Invalid</c>：命中一条已停用（<c>IsActive = false</c>）的行。
+    /// （发布侧⑧投影已退休；装载由 2号位 按 <c>TaskSplitRuleConfig</c> 表直读，是否过滤 Inactive 按其装载口径。）</summary>
+    public const string Inactive = "INACTIVE";
+
+    /// <summary><c>Missing</c>：业务键不完整（本 Run 未解析到该物料的 <c>ProductionDepartmentId</c>）⇒ 无命中。</summary>
+    public const string NoDept = "NO_DEPT";
+
+    /// <summary><c>Invalid</c>：本键有规则但本 Run 生效时点不在 <c>[EffectiveFrom, EffectiveTo)</c> 内
+    /// —— **本链 <c>Invalid</c> 唯一可达成因**（发布时有效、Run 时已失效、未治理隔离）。</summary>
+    public const string OutOfWindow = "OUT_OF_WINDOW";
+
+    /// <summary><c>Invalid</c>：**预留** —— <c>PreferredBatchQty</c> 缺失／≤ 0。
+    /// 当前链路上不可达（发布闸 <c>IsSnapshotEligible</c> 已阻断；装载期走「一致性护栏 ⇒ Unavailable」而非本值）。</summary>
+    public const string PreferredNull = "PREFERRED_NULL";
+
+    /// <summary><c>Invalid</c>：**预留** —— 同键生效窗口重叠。<c>FindOverlappingWindowIds</c> 已在发布闸阻断。</summary>
+    public const string WindowConflict = "WINDOW_CONFLICT";
+
+    /// <summary><c>Unavailable</c>：装载失败／技术失败。**唯一带明细的取值** —— 形如
+    /// <c>"LOAD_ERROR: &lt;原因&gt;"</c>；前导常量恒为本值。</summary>
+    public const string LoadError = "LOAD_ERROR";
 }
 
 /// <summary>
@@ -375,6 +426,8 @@ public sealed class BatchPolicyStateSnapshot
     /// <summary>状态。</summary>
     public BatchPolicyState State { get; set; }
 
-    /// <summary>**真实匹配来源**（B-013 逐字要求「状态、**真实匹配来源**与 <c>Q_C</c>」）—— 供 1号位 追溯本状态据以判定的来源事实。</summary>
+    /// <summary>**真实匹配来源**（B-013 逐字要求「状态、**真实匹配来源**与 <c>Q_C</c>」）—— 供 1号位 追溯本状态据以判定的来源事实。
+    /// 取值域见 <see cref="BatchPolicyMatchSource"/>（9 值封闭；<see cref="BatchPolicyMatchSource.LoadError"/> 允许
+    /// <c>"LOAD_ERROR: &lt;原因&gt;"</c> 形式带明细）。</summary>
     public string MatchSource { get; set; } = "";
 }

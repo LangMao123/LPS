@@ -346,6 +346,7 @@ public sealed class SetupRuleService : ISetupRuleService
 
             resources.Add(new OperationResourceInfoDto
             {
+                ResourceId = resource.Id,
                 ResourceCode = resource.ResourceCode,
                 ResourceName = resource.ResourceName,
                 DepartmentCode = department?.DeptCode,
@@ -479,7 +480,7 @@ public sealed class SetupRuleService : ISetupRuleService
         };
     }
 
-    /// <inheritdoc />
+    /// <inheritdoc />11
     public async Task PublishAsync(long versionId, string? changeReason, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         // 404 前置：版本不存在直接拒（发布语义上属资源缺失）
@@ -498,16 +499,16 @@ public sealed class SetupRuleService : ISetupRuleService
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, CancellationToken ct = default)
-        => _masterDataLookup.LookupDepartmentsAsync(search, cancellationToken: ct);
+    public Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, int limit = 200, CancellationToken ct = default)
+        => _masterDataLookup.LookupDepartmentsAsync(search, limit, cancellationToken: ct);
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<ResourceLookupItem>> LookupResourcesAsync(string? search, CancellationToken ct = default)
-        => _masterDataLookup.LookupResourcesAsync(search, cancellationToken: ct);
+    public Task<IReadOnlyList<ResourceLookupItem>> LookupResourcesAsync(string? search, int limit = 200, CancellationToken ct = default)
+        => _masterDataLookup.LookupResourcesAsync(search, limit, cancellationToken: ct);
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<MaterialLookupItem>> LookupMaterialsAsync(string? search, bool activeOnly = false, CancellationToken ct = default)
-        => _masterDataLookup.LookupMaterialsAsync(search, activeOnly, cancellationToken: ct);
+    public Task<IReadOnlyList<MaterialLookupItem>> LookupMaterialsAsync(string? search, bool activeOnly = false, int limit = 200, CancellationToken ct = default)
+        => _masterDataLookup.LookupMaterialsAsync(search, activeOnly, limit, cancellationToken: ct);
 
     /// <inheritdoc />
     public Task<IReadOnlyList<SetupUncoveredStatDto>> GetUncoveredStatsAsync(

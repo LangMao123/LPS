@@ -29,12 +29,16 @@ TestResults/
 *.bak
 
 # ===== 敏感配置（千万别传，里面有密码）=====
+# 真实口令只许放在这些「本地覆盖」文件里（它们永远不进 GitHub）；
+# 其余进入仓库的 appsettings.*.json 一律只写占位符，例如 Password=yourPassword。
 appsettings.Development.json
 appsettings.Local.json
-appsettings.Test.Local.json
+appsettings.*.Local.json
+appsettings.*.Development.json
 settings.json.claude
 .env
 .env.local
+.env.*.local
 
 # ===== 你要求的 SQL、MD、DOC 文档（留在 SVN，不上传 GitHub）=====
 *.sql

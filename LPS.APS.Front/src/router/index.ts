@@ -5,7 +5,7 @@ import { Layout, getParentLayout } from '@/utils/routerHelper'
 import { useI18n } from '@/hooks/web/useI18n'
 import { apsV1Routes } from './modules/aps'
 import { setupApsRouteGuard } from './guard'
-import { NO_RESET_WHITE_LIST } from '@/constants'
+import { NO_RESET_WHITE_LIST, APS_HOME_PATH } from '@/constants'
 
 const { t } = useI18n()
 
@@ -13,7 +13,8 @@ export const constantRouterMap: AppRouteRecordRaw[] = [
   {
     path: '/',
     component: Layout,
-    redirect: '/dashboard/analysis',
+    // 10-16：默认落地改为「排产总览」（APS_HOME_PATH），不再进 framework 演示页「分析页」
+    redirect: APS_HOME_PATH,
     name: 'Root',
     meta: {
       hidden: true
@@ -92,6 +93,15 @@ export const constantRouterMap: AppRouteRecordRaw[] = [
   }
 ]
 
+/* 框架自带的演示菜单（首页/文档/引导/组件/功能/hooks/多级菜单/综合示例/错误页面）
+ *  10-16 用户裁决：「这几个菜单都隐藏掉吧，感觉没有用」——它们与 APS 业务无关，
+ *  占着侧边栏上半屏还容易误点。做法是给**父节点**加 meta.hidden：
+ *  - 必须藏父节点而不是子节点：helper.ts 的 hasOneShowingChild 在「子项全被藏」时会
+ *    回退成渲染**父节点**自己的标题（/guide 与 /external-link 只有 1 个子项，藏子项会剩空壳）。
+ *  - 用 hidden 而非删除：路由仍在表里，老链接 / 调试直接输 URL 照样能打开
+ *    （`/` 仍 redirect 到 /dashboard/analysis）。
+ *  - 恢复任一项 = 删掉那一行 hidden。
+ */
 export const asyncRouterMap: AppRouteRecordRaw[] = [
   {
     path: '/dashboard',
@@ -101,7 +111,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: t('router.dashboard'),
       icon: 'vi-ant-design:dashboard-filled',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -128,7 +139,7 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
   {
     path: '/external-link',
     component: Layout,
-    meta: {},
+    meta: { hidden: true },
     name: 'ExternalLink',
     children: [
       {
@@ -145,7 +156,7 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     path: '/guide',
     component: Layout,
     name: 'Guide',
-    meta: {},
+    meta: { hidden: true },
     children: [
       {
         path: 'index',
@@ -165,7 +176,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: t('router.component'),
       icon: 'vi-bx:bxs-component',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -430,7 +442,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: t('router.function'),
       icon: 'vi-ri:function-fill',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -479,7 +492,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: 'hooks',
       icon: 'vi-ic:outline-webhook',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -539,7 +553,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     name: 'Level',
     meta: {
       title: t('router.level'),
-      icon: 'vi-carbon:skill-level-advanced'
+      icon: 'vi-carbon:skill-level-advanced',
+      hidden: true
     },
     children: [
       {
@@ -599,7 +614,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: t('router.example'),
       icon: 'vi-ep:management',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -667,7 +683,8 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     meta: {
       title: t('router.errorPage'),
       icon: 'vi-ci:error',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {
@@ -701,10 +718,17 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
     component: Layout,
     redirect: '/authorization/user',
     name: 'Authorization',
+    // 10-16 4号位：**框架自带的演示版权限管理，隐藏**。
+    //  这 4 页（Department / User / Menu / Role）走 mock 数据，未接本项目后端，
+    //  真正的用户/角色/权限码/业务范围维护在 APS 的「角色与权限」分组
+    //  （aps.ts 的 /rbac → /aps/rbac-users | rbac-roles | rbac-permissions | rbac-scopes）。
+    //  用 hidden 而非删除：路由仍可直达（老链接 / 调试不会 404），只是不再出现在侧边栏。
+    //  恢复显示 = 删掉这一行 hidden。
     meta: {
       title: t('router.authorization'),
       icon: 'vi-eos-icons:role-binding',
-      alwaysShow: true
+      alwaysShow: true,
+      hidden: true
     },
     children: [
       {

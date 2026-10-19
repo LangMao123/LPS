@@ -29,7 +29,9 @@ public interface IRuleSetRepository
     /// <summary>
     /// 规则集列表查询（含最新版本摘要，R2 扩展：催办单 2026-09-22）
     /// 与 <see cref="GetListAsync"/> 同过滤/分页语义，另 LEFT JOIN 最新版本
-    /// （CurrentVersionCode/DraftVersionCode/Status/LastChangeReason/PublishedAt/RetiredAt）。
+    /// （CurrentVersionId/CurrentVersionCode、DraftVersionId/DraftVersionCode、
+    ///  Status/LastChangeReason/PublishedAt/RetiredAt）。
+    /// 注：CurrentVersionId/DraftVersionId 为 C-4 身份补全（准确 VersionId，2026-10-17 落码）。
     /// 真源：版本摘要取自 RuleSetVersion（VersionCode 字符串；DomainKey 无真源未纳入）。
     /// </summary>
     /// <param name="activeOnly">true=仅启用（IsActive=1）；null=不区分</param>

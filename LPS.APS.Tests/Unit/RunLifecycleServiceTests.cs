@@ -100,7 +100,7 @@ public class RunLifecycleServiceTests
             VersionCode = "V-CAND-5",
             VersionCategory = "CANDIDATE",
             DomainKey = domainKey,
-            Status = "Computed",
+            Status = "CANDIDATE",
             SourceScheduleRunId = sourceScheduleRunId,
             CreatedAt = DateTime.Now,
         };
@@ -314,7 +314,7 @@ public class RunLifecycleServiceTests
         await _service.ConfirmCandidateAsync(5, 1, "u1", "基于 Base ACTIVE 的新 Candidate", CancellationToken.None);
 
         // Assert：确认成功，仅记审计，不写 Activated、不转 ACTIVE、不触碰同域 ACTIVE
-        version.Status.Should().Be("Computed");
+        version.Status.Should().Be("CANDIDATE");
         _auditRepo.Verify(r => r.AddAsync(
             It.Is<AuditLog>(l =>
                 l.ActionCode == "ConfirmCandidate"
@@ -335,7 +335,7 @@ public class RunLifecycleServiceTests
         // Assert（P0-05）：确认不污染 ActivatedAt/ActivatedBy，状态保持 CANDIDATE，不写库
         version.ActivatedAt.Should().BeNull();
         version.ActivatedBy.Should().BeNull();
-        version.Status.Should().Be("Computed");
+        version.Status.Should().Be("CANDIDATE");
         _planVersionRepo.Verify(r => r.UpdateAsync(It.IsAny<PlanVersion>(), It.IsAny<CancellationToken>()), Times.Never);
         _auditRepo.Verify(r => r.AddAsync(
             It.Is<AuditLog>(l =>
@@ -368,11 +368,11 @@ public class RunLifecycleServiceTests
     // ==================== ActivateCandidateAsync ====================
 
     [Fact]
-    public async Task Activate_非CANDIDATE状态_抛异常()
+    public async Task Activate_非CANDIDATE身份_抛异常()
     {
-        // Arrange
+        // Arrange（门禁判**身份** VersionCategory —— 这一条 D7 是对的，保留）
         var version = CandidateVersion(5);
-        version.Status = "ACTIVE";
+        version.VersionCategory = "RESCHEDULE";
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
 
         // Act
@@ -463,8 +463,10 @@ public class RunLifecycleServiceTests
         // Act
         await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
-        // Assert：CANDIDATE → ACTIVE + 走原子替换（非单版本 UpdateAsync），不因同域 ACTIVE 拒绝
+        // Assert：Status Computed → ACTIVE + 走原子替换（非单版本 UpdateAsync），不因同域 ACTIVE 拒绝
+        // 采用记在 Status；身份 VersionCategory 出生即定，激活**不动**它
         version.Status.Should().Be("ACTIVE");
+        version.VersionCategory.Should().Be("CANDIDATE");
         version.ActivatedAt.Should().NotBeNull();
         version.ActivatedBy.Should().Be("u1");
         _planVersionRepo.Verify(r => r.ReplaceActiveAsync(version, "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
@@ -474,7 +476,7 @@ public class RunLifecycleServiceTests
                 l.ActionCode == "ActivateCandidate"
                 && l.EntityType == "PlanVersion"
                 && l.EntityId == "5"
-                && l.OldValue == "Computed"
+                && l.OldValue == "CANDIDATE"
                 && l.NewValue == "ACTIVE"),
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -492,8 +494,9 @@ public class RunLifecycleServiceTests
         // Act
         await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
 
-        // Assert：激活 = 正式采用，CANDIDATE → ACTIVE + 写 ActivatedAt/ActivatedBy + 原子替换
+        // Assert：激活 = 正式采用，Status Computed → ACTIVE + 写 ActivatedAt/ActivatedBy + 原子替换
         version.Status.Should().Be("ACTIVE");
+        version.VersionCategory.Should().Be("CANDIDATE");
         version.ActivatedAt.Should().NotBeNull();
         version.ActivatedBy.Should().Be("u1");
         _planVersionRepo.Verify(r => r.ReplaceActiveAsync(version, "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
@@ -502,7 +505,7 @@ public class RunLifecycleServiceTests
                 l.ActionCode == "ActivateCandidate"
                 && l.EntityType == "PlanVersion"
                 && l.EntityId == "5"
-                && l.OldValue == "Computed"
+                && l.OldValue == "CANDIDATE"
                 && l.NewValue == "ACTIVE"),
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -526,6 +529,91 @@ public class RunLifecycleServiceTests
         await act.Should().ThrowAsync<InvalidOperationException>();
         _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
             It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ==================== GetRunDomainStatusAsync（G8 域级状态；先判 Status 再判身份） ====================
+
+    /// <summary>构造某 Run 下属的 PlanVersion（身份 VersionCategory 与进度 Status 两列分别指定）</summary>
+    private static PlanVersion DomainVersion(
+        int id, string versionCategory, string status, string domainKey = "D1")
+        => new()
+        {
+            Id = id,
+            VersionCode = $"V-{id}",
+            VersionCategory = versionCategory,
+            DomainKey = domainKey,
+            Status = status,
+            ComputedAt = DateTime.Now,
+            CreatedAt = DateTime.Now,
+        };
+
+    [Theory]
+    // 判定**只看 Status**，VersionCategory 不参与 —— 词表对齐后 Status 自己就表达了「算完待采用」，
+    // 原先那条 `_ when pv.VersionCategory=='CANDIDATE'` 兜底已删（它会把夜间日基线算完态误判成候选）。
+    // 采用/归档 ⇒ 该域本次已落定；注意身份仍是 CANDIDATE（出生即定，激活不翻转它）
+    [InlineData("CANDIDATE", "ACTIVE", "COMPLETED")]
+    [InlineData("CANDIDATE", "ARCHIVED", "COMPLETED")]
+    // 算完待采用（**不分身份**：白天候选与夜间日基线同判）⇒ 待人工确认
+    [InlineData("CANDIDATE", "CANDIDATE", "CANDIDATE")]
+    [InlineData("DAILY_BASELINE", "CANDIDATE", "CANDIDATE")]
+    // 失败：写点与读点同值（2026-10-15 前写点写 ComputeFailed、读点判 FAILED ⇒ 此分支永不可达，已修）
+    [InlineData("DAILY_BASELINE", "FAILED", "FAILED")]
+    [InlineData("CANDIDATE", "FAILED", "FAILED")]
+    // 未定：待领 / 在算
+    [InlineData("DAILY_BASELINE", "BUILDING", "RUNNING")]
+    [InlineData("DAILY_BASELINE", "Computing", "RUNNING")]
+    public async Task 域级状态_只按Status判定(string versionCategory, string status, string expected)
+    {
+        // Arrange：单域 Run（D1）+ 该域一个 PlanVersion
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(FullRun(1, expectedJson: """["D1"]"""));
+        _planVersionRepo.Setup(r => r.GetByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<PlanVersion> { DomainVersion(7, versionCategory, status) });
+
+        // Act
+        var domains = await _service.GetRunDomainStatusAsync(1, CancellationToken.None);
+
+        // Assert
+        domains.Should().HaveCount(1);
+        domains[0].DomainKey.Should().Be("D1");
+        domains[0].PlanVersionId.Should().Be(7);
+        domains[0].Status.Should().Be(expected);
+    }
+
+    /// <summary>
+    /// 回归钉（2026-10-15，B）：激活写点产出的实体，喂给域级状态读点，必须判 COMPLETED。
+    /// 原 bug：读点先判 VersionCategory=='CANDIDATE'，而每一行已采用的 VersionCategory 恒为 CANDIDATE
+    ///        ⇒ 「ACTIVE ⇒ COMPLETED」分支永不可达，激活后域级视图永远显示「候选待确认」。
+    /// 本用例同时钉死两件事：① 激活写的是 Status，VersionCategory 不动；② 写点与读点口径一致。
+    /// </summary>
+    [Fact]
+    public async Task 激活写点与域级读点口径一致_激活后判COMPLETED()
+    {
+        // Arrange：走完整激活路径（已确认 + 来源 Run 可激活）
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConfirmedLogs());
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(CandidateRun(2));
+
+        // Act
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // 写点产出：Status Computed → ACTIVE；身份 VersionCategory 不动（仍 CANDIDATE）
+        version.Status.Should().Be("ACTIVE");
+        version.VersionCategory.Should().Be("CANDIDATE");
+
+        // 把写点产出的实体原样作为读点输入（同一域 D1）
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(FullRun(1, expectedJson: """["D1"]"""));
+        _planVersionRepo.Setup(r => r.GetByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<PlanVersion> { version });
+
+        var domains = await _service.GetRunDomainStatusAsync(1, CancellationToken.None);
+
+        // Assert：读点看出「已正式采用 ⇒ COMPLETED」，不再是「候选待确认」
+        domains.Should().HaveCount(1);
+        domains[0].Status.Should().Be("COMPLETED");
     }
 
     // ==================== RecoverFailedRunAsync ====================
@@ -669,8 +757,9 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(new RuleSetVersion { Id = 20, VersionCode = "RS-20" });
         _parameterSetRepo.Setup(r => r.GetByIdAsync(30, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new ParameterSetVersion { Id = 30, VersionCode = "PS-30" });
+        // 该 Run 产出并已被正式采用：Status = ACTIVE（采用记在 Status），身份为夜间日基线
         _planVersionRepo.Setup(r => r.GetLatestByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new PlanVersion { Id = 7, Status = "ACTIVE", DomainKey = "D1" });
+            .ReturnsAsync(new PlanVersion { Id = 7, VersionCategory = "DAILY_BASELINE", Status = "ACTIVE", DomainKey = "D1" });
 
         // Act
         var trace = await _service.GetRunReferenceTraceAsync(1, CancellationToken.None);
@@ -685,6 +774,7 @@ public class RunLifecycleServiceTests
         trace.ParameterSetVersionCode.Should().Be("PS-30");
         trace.ExpectedDomainKeysJson.Should().Be("""["D1"]""");
         trace.PlanVersionId.Should().Be(7);
+        // PlanVersionStatus 回显 Status 列（采用后为 ACTIVE；本 DTO 不含身份列）
         trace.PlanVersionStatus.Should().Be("ACTIVE");
     }
 
@@ -705,7 +795,7 @@ public class RunLifecycleServiceTests
             Actor = "u1",
         };
 
-    /// <summary>构造 Domain=D1 的 Base ACTIVE 计划版本（白天 Candidate 锚定）</summary>
+    /// <summary>构造 Domain=D1 的 Base ACTIVE 计划版本（白天 Candidate 锚定；采用记在 Status，身份为日基线）</summary>
     private static PlanVersion ActiveBase(int id = 50, string? domainKey = "D1")
         => new()
         {
@@ -814,9 +904,9 @@ public class RunLifecycleServiceTests
     [Fact]
     public async Task Create_Base非ACTIVE_抛异常()
     {
-        // Arrange
+        // Arrange（B：Base 门禁判 Status）
         var baseVersion = ActiveBase();
-        baseVersion.Status = "Created";
+        baseVersion.Status = "BUILDING";
         _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>())).ReturnsAsync(baseVersion);
 
         // Act

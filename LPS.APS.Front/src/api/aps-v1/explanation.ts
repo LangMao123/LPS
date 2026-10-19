@@ -31,6 +31,19 @@
  *    - 新增 listBusinessFactIssues(opts) 给 store 翻页用
  *    - 后端契约建议改 PageResult<T>（@see ./types/common.ts:62-67，TaskSplitRuleConfig 已用同模式）
  *    - 函件：frontNew/docs/4号位-2026-10-10-business-fact-issues分页severity排序total-给5号位.md
+ *
+ * 10-12 收口（5号位 — 零契约变更）：
+ *  - 后端 BOM Issues 表引用 由 `MES_APS_BOM_Workset_Issues`（DatabaseId.ODS 直连）改为
+ *    `ext_MES_APS_BOM_Workset_Issues` 同义词（DatabaseId.APS 单连接，经 linked server [mes] 指向 ODS 源表）
+ *  - 单连接简化：仓储两处 BOM 查询 (QueryBomWorksetIssuesAsync + CountBomWorksetIssuesAsync)
+ *    不再跨库分连接，端点 URL / PageResult 结构 / severity 排序 / skip 修复行为与 10-10 落地一致
+ *  - 2.B 更正：前封 §二"跨服务器不可行"判断不再成立（同义词下单连接可跨表 UNION）；
+ *    性能未压测，维持 2.A（保持当前实现），2.B 升级为 V1.5 评估项
+ *  - **前端零动作**：E23 静态 / E24 动态契约不变；端点 URL / Query 参数 / 响应 page 字段未动
+ *  - **排障注意**：dev 若再报 business-fact-issues / MES_APS_BOM_Workset_Issues 相关错误，
+ *    应查 linked server [mes] 与同义词 APS_Production.dbo.ext_MES_APS_BOM_Workset_Issues，
+ *    而非 ODS 直连（命名沿用 ext_* 防腐层惯例）
+ *  - 函件：frontNew/docs/5号位-2026-10-12-business-fact-issues回执更新-同义词落地2B可行性更正-给4号位.md
  */
 
 import { apsHttp, APS_USE_MOCK } from './http'

@@ -70,13 +70,14 @@ const {
   saving,
   error,
   lastFilter,
-  activeCount,
-  cancelledCount,
   distinctPoNos,
   distinctMaterialCodes,
   pageIndex,
   pageSize,
-  total
+  total,
+  // 10-12 ME13：KPI 三卡读累计值（cumulative），不再读 list.length（翻页会跳）
+  totalActive,
+  totalCancelled
 } = storeToRefs(store)
 
 /* ===== 权限门控（v1.2 §23.1 权限码门控）=====
@@ -398,21 +399,22 @@ onMounted(() => {
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
 
     <!-- ===== KPI ===== -->
+    <!-- 10-12 ME13 收：KPI 三卡读累计值（cumulative），翻页不跳 -->
     <div class="kpi-row">
       <div class="kpi-card" style="border-top-color: #3b82f6">
         <div class="kpi-label">总记录数</div>
-        <div class="kpi-value" style="color: #3b82f6">{{ list.length }}</div>
-        <div class="kpi-ratio">最近一次筛选</div>
+        <div class="kpi-value" style="color: #3b82f6">{{ total }}</div>
+        <div class="kpi-ratio">最近一次筛选（后端 total 全集）</div>
       </div>
       <div class="kpi-card" style="border-top-color: #059669">
         <div class="kpi-label">启用</div>
-        <div class="kpi-value" style="color: #059669">{{ activeCount }}</div>
-        <div class="kpi-ratio">当前生效</div>
+        <div class="kpi-value" style="color: #059669">{{ totalActive }}</div>
+        <div class="kpi-ratio">cumulative（翻页不跳）</div>
       </div>
       <div class="kpi-card" style="border-top-color: #94a3b8">
         <div class="kpi-label">已取消</div>
-        <div class="kpi-value" style="color: #94a3b8">{{ cancelledCount }}</div>
-        <div class="kpi-ratio">已取消</div>
+        <div class="kpi-value" style="color: #94a3b8">{{ totalCancelled }}</div>
+        <div class="kpi-ratio">cumulative（翻页不跳）</div>
       </div>
     </div>
 

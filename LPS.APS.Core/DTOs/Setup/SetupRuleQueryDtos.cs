@@ -20,6 +20,9 @@ public sealed class OperationResourceEligibilityDto
 /// <summary>工序资源资格明细元素（#9）</summary>
 public sealed class OperationResourceInfoDto
 {
+    /// <summary>资源主键（Resource.Id；4号位 契约补 resourceId，前端提交 ResourceId 口径）</summary>
+    public int ResourceId { get; set; }
+
     /// <summary>资源编码</summary>
     public string ResourceCode { get; set; } = string.Empty;
 
@@ -205,6 +208,9 @@ public sealed class DepartmentLookupItem
 
     /// <summary>生产单元 holon 码（= ProductionDepartment.Holon；与 DeptCode 内嵌 HL 码同源）</summary>
     public string? Holon { get; set; }
+
+    /// <summary>部门归属工厂（= ProductionDepartment.FactoryId；可空=早期未明确归厂的部门；2026-10-14 应 4号位 工厂→部门联动需求补返回）</summary>
+    public int? FactoryId { get; set; }
 }
 
 /// <summary>主数据 Code→Id 读端点响应：设备下拉项（masterId=表主键 Id，code=ResourceCode）</summary>

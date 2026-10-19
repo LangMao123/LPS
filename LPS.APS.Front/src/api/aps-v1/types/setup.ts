@@ -1,14 +1,13 @@
 /**
- * APS V1 4号位 — Setup 换型规则 DTO（v1.5 Setup 专项）
+ * APS V1 4号位 — Setup 换型规则 DTO
  *
- * @see 冻结文档/APS_V1_4号位页面与业务操作开发实施包_v1.5_20260916_Setup换型规则专项冻结对齐版.md
- *  - §3.2 EXACT 输入字段（7 元组）
- *  - §4.3 DEFAULT 输入字段（5 元组）
- *  - §5.2/§5.3 0 分钟兜底统计查询/输出
- *  - §6.2/§6.3 版本 Diff 列表字段 + setupRuleChanges
- *  - §7.1/§7.2 数据结构红线 + 业务红线
- *  - §8.2 SetupRule 实体必加字段
- *  - §11.1 13 端点契约
+ * @see frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
+ *  - §五 第一优先 EXACT 输入字段（部门+大工艺+当前工序+设备+前产品+后产品）
+ *  - §四 DEFAULT 输入字段（生产部门+大工艺+当前工序+设备）
+ *  - §五 第三优先 0 分钟兜底统计
+ *  - §九 建议最小规则数据结构（EXACT / DEFAULT）
+ *  - §十 规则唯一性和冲突
+ *  - §19.2 4号位页面职责与 Diff/发布状态
  *
  * 设计要点：
  *  - 字段名用 camelCase（与后端 PascalCase 通过 API 层映射对齐）
@@ -92,8 +91,8 @@ export const SETUP_VERSION_STATUS_META: Record<
 }
 
 /**
- * Setup 来源枚举（§9 命中优先级，前端只展示不计算）
- * 5 值对齐 1号位 实际产出（v1.5 SetupSource 输出链回执 2026-09-21）：
+ * Setup 来源枚举（命中优先级，前端只展示不计算）
+ * 5 值对齐 1号位 实际产出（SetupSource 输出链回执 2026-09-21）：
  *   - INITIAL: 无上一产品（班头首单/冷启动）→ 0 分钟，普通/灰 Tag，**非数据质量问题**
  *   - 0号位 Q4 裁决：INITIAL 与 NONE 严格分开，不得合并
  *   - 缺 INITIAL 会把正常班头首单误标红 Tag「无规则兜底」，误导车间
@@ -105,19 +104,19 @@ export const SETUP_SOURCE_META: Record<
   SetupSource,
   { label: string; tag: 'info' | 'success' | 'warning' | 'danger' }
 > = {
-  EXACT: { label: '明确转换规则（EXACT）', tag: 'success' },
-  DEFAULT: { label: '默认换型规则（DEFAULT）', tag: 'info' },
+  EXACT: { label: '明确产品转换', tag: 'success' },
+  DEFAULT: { label: '默认换型规则', tag: 'info' },
   NONE: { label: '无规则兜底（0 分钟）', tag: 'danger' },
   SAME_PRODUCT: { label: '同产品连续（0 分钟）', tag: 'warning' },
   INITIAL: { label: '冷启动首单（0 分钟）', tag: 'info' }
 }
 
-/* ==================== 主实体 SetupRule（§8.2） ==================== */
+/* ==================== 主实体 SetupRule ==================== */
 
 /**
- * Setup 规则实体（对齐后端 SetupRule 表 §8.2）
+ * Setup 规则实体（对齐后端 SetupRule 表）
  *
- * 唯一性约束（§8.3）：
+ * 唯一性约束：
  *  - EXACT: (RuleSetVersionId, DepartmentCode, StageCode, OperationCode, ResourceCode, FromMaterialCode, ToMaterialCode)
  *  - DEFAULT: (RuleSetVersionId, DepartmentCode, StageCode, OperationCode, ResourceCode)
  *
@@ -159,7 +158,7 @@ export interface SetupRuleDto {
   updatedBy?: string | null
 }
 
-/* ==================== EXACT 规则输入（§3.2） ==================== */
+/* ==================== EXACT 规则输入 ==================== */
 
 /**
  * EXACT 规则创建/更新输入（Id-口径 v1.1，对齐后端 SetupRuleExactInput）
@@ -168,7 +167,7 @@ export interface SetupRuleDto {
  *  - 后端模型绑定按字段名精确匹配，传 *Code 会被静默丢弃 → Id 为 0 → 422 数据红线
  *  - Code→Id 映射来源：编辑态取 SetupRuleDto 双返回的 Id；新建态需主数据端点（P0 缺口，已提请 3号位）
  *
- * 红线（§7.1）：
+ * 红线：
  *  - FromMaterialId != ToMaterialId（同产品连续 = 0 分钟，不存规则）
  *  - SetupMinutes > 0
  *  - FromMaterialId/ToMaterialId 都必填（缺省/0 → 422）
@@ -188,16 +187,16 @@ export interface SetupRuleExactInput {
   setupMinutes: number
 }
 
-/* ==================== DEFAULT 规则输入（§4.3） ==================== */
+/* ==================== DEFAULT 规则输入 ==================== */
 
 /**
  * DEFAULT 规则创建/更新输入（Id-口径 v1.1，对齐后端 SetupRuleDefaultInput）
  *
  * ⚠️ 写路径传 Id（部门/设备），大工艺/工序传 Code；
  * ⚠️ 后端 [JsonExtensionData] 拦截：请求体出现任何含 "material" 的键 → 422
- *   （DEFAULT 严禁携带产品字段，与 EXACT 互斥，§7.1 红线）——前端 payload 不得含 fromMaterial/toMaterial 任何键。
+ *   （DEFAULT 严禁携带产品字段，与 EXACT 互斥）——前端 payload 不得含 fromMaterial/toMaterial 任何键。
  *
- * 红线（§7.1）：SetupMinutes > 0
+ * 红线：SetupMinutes > 0
  */
 export interface SetupRuleDefaultInput {
   ruleSetVersionId: number
@@ -210,9 +209,9 @@ export interface SetupRuleDefaultInput {
   setupMinutes: number
 }
 
-/* ==================== 0 分钟兜底统计（§5） ==================== */
+/* ==================== 0 分钟兜底统计 ==================== */
 
-/** 0 分钟兜底统计查询参数（§5.2） */
+/** 0 分钟兜底统计查询参数 */
 export interface SetupUncoveredQuery {
   /** 选定的 Run（必填） */
   runId: number
@@ -224,7 +223,7 @@ export interface SetupUncoveredQuery {
   resourceCode?: string
 }
 
-/** 0 分钟兜底统计输出行（§5.3） */
+/** 0 分钟兜底统计输出行 */
 export interface SetupUncoveredStatDto {
   departmentCode: string
   stageCode: string
@@ -238,12 +237,12 @@ export interface SetupUncoveredStatDto {
   lastOccurrence?: IsoDateTime
 }
 
-/* ==================== 共同合法设备推荐（§3.3） ==================== */
+/* ==================== 共同合法设备推荐 ==================== */
 
 /**
  * 共同合法设备推荐查询参数
  *
- * 算法定义（§7.2）：
+ * 算法定义：
  *  当前工序下前后产品的共同合法设备集合 =
  *    当前 Operation 合法资源 ∩ 同部门同 Stage 任一 Operation 合法资源
  */
@@ -260,21 +259,32 @@ export interface OperationResourceEligibilityDto {
   operationCode: string
   /** 共同合法设备 Code 列表 */
   resourceCodes: string[]
-  /** 可选：每个设备的详细信息（名称、部门、Stage 等） */
+  /**
+   * 可选：每个设备的详细信息（名称、部门、Stage 等）
+   *
+   * 10-15 4号位：本集合**不受后端 lookups 的 TOP 200 截断**（服务层
+   * SetupRuleService.GetEligibilityAsync 直接按 ids 取全量），且已按 Department Scope
+   * 过滤 —— 它是 EXACT 设备下拉的权威数据源，比 lookups/resources 更可信。
+   *
+   * resourceId：**3号位 10-15 已投影**（`OperationResourceInfoDto.ResourceId`，非空 int；
+   * 契约登记 S-11-d）。dev 实测生效：工序 M102 + 前后产品返 `resourceId: 13394`，
+   * 与 `lookups/resources?search=763-2` 的 `masterId=13394` 一致。故声明为必填。
+   */
   resources?: Array<{
     resourceCode: string
     resourceName?: string
     departmentCode?: string
     stageCode?: string
+    resourceId: number
   }>
 }
 
-/* ==================== 版本 Diff（§6） ==================== */
+/* ==================== 版本 Diff ==================== */
 
 /** Setup 规则变更类型 */
 export type SetupRuleChangeType = 'added' | 'modified' | 'removed'
 
-/** Setup 规则变更行（§6.3 setupRuleChanges 数组元素） */
+/** Setup 规则变更行（setupRuleChanges 数组元素） */
 export interface SetupRuleChangeDto {
   ruleType: SetupRuleType
   /** added: 新规则；modified: 修改后；removed: 被删规则 */
@@ -291,7 +301,7 @@ export interface SetupRuleChangeDto {
   after?: Partial<SetupRuleDto>
 }
 
-/** 版本 Diff 结果（§6.2 + §6.3） */
+/** 版本 Diff 结果 */
 export interface SetupDiffDto {
   ruleSetVersionId: number
   otherVersionId: number
@@ -312,7 +322,7 @@ export interface SetupDiffDto {
   comparedAt?: IsoDateTime
 }
 
-/* ==================== RuleSetVersion 下拉源（§11.1 #11） ==================== */
+/* ==================== RuleSetVersion 下拉源（契约 #11） ==================== */
 
 /**
  * RuleSetVersion 简化 DTO（Setup 维护页 DRAFT 选择器用）
@@ -324,7 +334,7 @@ export interface SetupRuleSetVersionDto {
   id: number
   ruleSetId: number
   versionCode: string
-  /** 版本治理六态原文（09-20 lps 核实；仅 DRAFT 可编辑 Setup 规则，§7.2 业务红线） */
+  /** 版本治理六态原文（09-20 lps 核实；仅 DRAFT 可编辑 Setup 规则，） */
   status: SetupVersionStatus
   effectiveFrom?: IsoDateTime | null
   effectiveTo?: IsoDateTime | null
@@ -336,7 +346,7 @@ export interface SetupRuleSetVersionDto {
 /* ==================== Dialog 预填（Code 形态，页面 2.3 跳转用） ==================== */
 
 /**
- * Setup Dialog 预填字段（§5.4 "去补 EXACT/DEFAULT" 路由 query 带入，Code 形态）
+ * Setup Dialog 预填字段（「缺失规则查询」跳转路由 query 带入，Code 形态）
  *
  * 注：写输入已改 Id-口径（v1.1），但跳转源（0 分钟兜底统计行）只有 Code；
  * Dialog 内部做 Code→Id 解析（编辑态双返回 / mock 映射；真实模式待主数据端点，P0 缺口）。
@@ -350,14 +360,14 @@ export interface SetupDialogPrefill {
   toMaterialCode?: string
 }
 
-/* ==================== 发布请求体（§11.1 #13） ==================== */
+/* ==================== 发布请求体（契约 #13） ==================== */
 
 /** POST /rule-set-versions/{id}/publish 请求体（复用 v1.4 范式） */
 export interface PublishSetupRuleSetVersionRequest {
   changeReason: string
 }
 
-/* ==================== 权限码（v1.5 §11.1） ==================== */
+/* ==================== 权限码（Setup 专项指导 v1.2 §19.1） ==================== */
 
 /**
  * Setup 模块权限码（与后端 PermissionCodes.cs 对齐）

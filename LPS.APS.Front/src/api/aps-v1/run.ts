@@ -9,7 +9,6 @@
  */
 
 import { apsHttp, APS_USE_MOCK } from './http'
-import { findMockActivatableCandidate } from './candidate'
 import type {
   RecoverFailedRunInput,
   RecoverFailedRunResult,
@@ -261,21 +260,6 @@ export const runApi = {
    *   - objectRefIds 砍掉（后端无此字段）；reason → Remark
    */
   async triggerReschedule(input: TriggerRescheduleInput): Promise<TriggerRescheduleResult> {
-    if (APS_USE_MOCK) {
-      // mock：模拟 1.5s 异步，生成 RunId + CandidatePlanVersionId
-      await new Promise((resolve) => setTimeout(resolve, 1500))
-      // 归一到一个 CANDIDATES 里已存在的候选，保证跳转 Candidate 页能加载对比详情
-      // （原 `2000 + domainKey.length` 是孤立 ID，如 FAMILY_INJECTION → 2016，list 查不到 + CANDIDATES[2016] 不存在）
-      const mockCand = findMockActivatableCandidate(input.domainKey)
-      const domainHash = input.domainKey.length
-      return {
-        newRunId: 6000 + domainHash,
-        candidatePlanVersionId: mockCand?.header.candidatePlanVersionId ?? 2001,
-        basePlanVersionId: input.basePlanVersionId ?? mockCand?.header.basePlanVersionId ?? 1001,
-        startedAt: isoNow(),
-        estimatedDurationSeconds: 30
-      }
-    }
     // 真实模式：字段映射为后端 CreateCandidateRunRequest（camelCase）
     //  - remark **停传**（2026-09-21 3号位 回执 §一.3：CandidateRunCreateSpec 无 Remark 属性，后端维持丢弃）
     //  - scope 条件透传（§10A；缺省不发 → 后端静默放行，旧调用兼容）

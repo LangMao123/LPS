@@ -26,6 +26,24 @@ public class ApsBomStagePathRaw
     public string BatchNo { get; set; } = string.Empty;
 
     /// <summary>
+    /// ODS 侧 `MES_APS_BOM_Workset.Id`（跨库引用，非 FK）；2号位搬运时透传。
+    ///
+    /// 【为什么必须有】冻结 DDL 明文要求（`08 v5.1.8.7 :2008`「WorksetId BIGINT NULL，
+    ///   v5.0.26 ODS 侧 Workset.Id（跨库引用，非FK）；2号位搬运时透传；NULL=兼容旧批次」；
+    ///   `07 v5.1.13 :2595` 同旨）。它是「请求＋边实例」隔离的**第二层锚点**：
+    ///   `WorksetId → MES_APS_BOM_Workset.RequestDetailId`（`08 :363` 明文
+    ///   「RequestDetailId **不进** StageDetail，维持通过 WorksetId 反查的既有设计」）。
+    ///
+    /// 【语义】`StageScopeType='EDGE'` 时 = 该行所属的**具体 BOM 边实例**
+    ///   （`08 :459-463`：「每条 Workset 行分别写 StageDetail（WorksetId=Workset.Id），
+    ///   同一 BOM 边出现 N 次写 N 组」）；`StageScopeType='ROOT'` 时 = 该 RequestDetail 下
+    ///   Level=1 的**代表性锚点** `MIN(Workset.Id)`（`08 :359`），不表示「由某条 BOM 边派生」。
+    ///
+    /// 【实测】ODS 源表该列 **0 NULL**（2026-10-16：EDGE 2,052,683 行 / ROOT 321,127 行，NULL 均为 0）。
+    /// </summary>
+    public long? WorksetId { get; set; }
+
+    /// <summary>
     /// MES系统的BOM编号
     /// </summary>
     public string BOMNO { get; set; } = string.Empty;

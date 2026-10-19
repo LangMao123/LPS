@@ -36,8 +36,8 @@ public interface IRunLifecycleService
     Task ConfirmCandidateAsync(int planVersionId, int actorUserId, string actor, string? remark, CancellationToken ct = default);
 
     /// <summary>
-    /// 激活 Candidate（确认后正式采用：CANDIDATE → ACTIVE）。
-    /// 前置：DomainKey 非空（V1 必填语义）；同域已有 ACTIVE 则报错（UQ_PlanVersion_OneActivePerDomain 应用层预检）。
+    /// 激活 Candidate（确认后正式采用：Status Computed → ACTIVE，同域旧 ACTIVE 原子归档；VersionCategory 不动）。
+    /// 前置：DomainKey 非空（V1 必填语义）；同域已有 ACTIVE 走原子替换（归档旧 + 置新，P0-06），非报错。
     /// </summary>
     /// <param name="planVersionId">Candidate 计划版本 Id</param>
     /// <param name="actorUserId">操作人用户 Id（JWT 解析，用于业务范围校验）</param>

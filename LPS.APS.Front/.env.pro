@@ -29,7 +29,10 @@ VITE_USE_BUNDLE_ANALYZER=true
 VITE_USE_ALL_ELEMENT_PLUS_STYLE=false
 
 # 是否开启mock
-VITE_USE_MOCK=true
+# 10-15 4号位 置 false：线上包绝不能带 mock。true 会同时开启 viteMockServe（把 mock/ 全量塞进
+# 生产包）并让 api/aps-v1/*.ts 里所有 APS_USE_MOCK 分支返回 MOCK_* 桩数据，页面上看到的数字全是假的。
+# 要临时看桩数据只在本地起 dev 时开，不要改这里。
+VITE_USE_MOCK=false
 
 # 是否切割css
 VITE_USE_CSS_SPLIT=true

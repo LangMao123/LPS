@@ -1,15 +1,16 @@
 /**
- * APS V1 4号位 — Candidate 对比与确认 Pinia store（页面 5）
+ * APS V1 4号位 — Candidate 列表与确认 Pinia store（页面：候选版本确认）
  *
- * 状态：
- *  - list：本会话内可见的 Candidate 列表
- *  - currentComparison：当前选中的 Candidate 对比详情
- *  - lastConfirmResult：上一次确认结果（U13：Actor/Time 可追溯）
- *  - loading / error：UI 态
+ * 2026-10-16 按后端已部署 DTO 重排：
+ *  - 列表改走 5号位 `/api/overview/candidate-summary`（此前绕道 governance/runs，字段全不匹配）
+ *  - 对比走 3号位 `compare-with` 双参端点；basePlanVersionId 由列表项提供
+ *  - header（domainKey / createdAt / runType / canActivate）只有列表端点给，对比端点不给，
+ *    故 currentComparison 是「列表项 + 对比结果」合并出的视图模型，不是后端原样透传
+ *  - confirm / activate 后端只回 message + 服务端时间，没有 actor/时间戳等回执字段，
+ *    页面展示的就是这两项，不补任何前端自造字段
  *
- * 写接口：
- *  - confirm() → 走 Controller，后端产生新的 ACTIVE 版本，不直接 UPDATE PlanVersion
- *  - 4号位文档第 9 节：CTP/INSERT_IMPACT_ANALYSIS 永远无此接口（U11/U12）
+ * 权限码门控（v1.2 §23.1）：aps.candidate.confirm / aps.candidate.activate，
+ * 可激活性一律以后端 CandidateBriefDto.canActivate 为准，前端不自行推断。
  */
 
 import { defineStore } from 'pinia'
@@ -17,46 +18,58 @@ import { computed, ref } from 'vue'
 import {
   candidateApi,
   ApiError,
+  type CandidateActionAck,
   type CandidateActivateInput,
-  type CandidateActivateResult,
-  type CandidateComparisonDto,
+  type CandidateBriefDto,
+  type CandidateComparisonView,
   type CandidateConfirmInput,
-  type CandidateConfirmResult,
   type DomainKey
 } from '@/api/aps-v1'
 import { useApsAuthStore } from './auth'
 import { useDomainStore } from './domain'
 import { assertScope, ScopeViolationError, filterByScope } from './scope'
 
+/** 列表卡片用（已由 store 从 CandidateBriefDto 归一，模板不必处理 null 字段名） */
 export interface CandidateListItem {
   candidatePlanVersionId: number
   candidateVersionCode: string
-  domainKey: DomainKey
+  domainKey: string | null
   status: string
   createdAt: string
-  /** P0-05：是否允许激活为 ACTIVE（后端判定） */
+  createdByUserName: string | null
+  runType: string | null
+  /** compare-with 端点的第二个路径参数；后端未给时列表仍展示但不可点开对比 */
+  basePlanVersionId: number | null
+  /** 后端 §12.3 激活红线前置校验结果 */
   canActivate: boolean
-  /** P0-05：触发本次候选的 RunType */
-  runType?: 'FULL_SCHEDULE' | 'LOCAL_RESCHEDULE' | 'MANUAL_RESCHEDULE' | 'INSERT_ORDER_WHATIF'
-  /** v1.4 §十二：调用 compare-with 端点的第二个路径参数
-   *  - 当前 list 端点不返回（@see candidate.ts list() 注释）
-   *  - 5号位 补齐 17 字段后会补到 CandidateBriefDto
-   *  - 当前在 store.loadComparison 上做"参数缺失 → 报清晰错"的兜底
-   */
-  basePlanVersionId?: number
-  impactSummary: { impactedOrderCount: number; newDelayCount: number }
+}
+
+/** 待确认候选数（Overview 底部条与本页共用同一端点） */
+function toListItem(b: CandidateBriefDto): CandidateListItem {
+  return {
+    candidatePlanVersionId: b.planVersionId,
+    candidateVersionCode: b.versionCode ?? `#${b.planVersionId}`,
+    domainKey: b.domainKey,
+    status: b.status ?? '',
+    createdAt: b.createdAt,
+    createdByUserName: b.createdByUserName,
+    runType: b.runType,
+    basePlanVersionId: b.basePlanVersionId,
+    canActivate: b.canActivate
+  }
 }
 
 export const useCandidateStore = defineStore('aps.candidate', () => {
   // ===== state =====
   const list = ref<CandidateListItem[]>([])
-  const currentComparison = ref<CandidateComparisonDto | null>(null)
-  const lastConfirmResult = ref<CandidateConfirmResult | null>(null)
+  const pendingCount = ref<number | null>(null)
+  const currentComparison = ref<CandidateComparisonView | null>(null)
   const loading = ref(false)
   const listLoading = ref(false)
   const confirming = ref(false)
   const activating = ref(false)
-  const lastActivateResult = ref<CandidateActivateResult | null>(null)
+  /** 最近一次写端点回执（只有后端给的 message + 服务端时间） */
+  const lastAck = ref<{ action: 'confirm' | 'activate'; ack: CandidateActionAck } | null>(null)
   const error = ref<string | null>(null)
 
   // ===== getters =====
@@ -66,122 +79,70 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
   /** 当前选中的 Header（用于确认按钮处展示） */
   const currentHeader = computed(() => currentComparison.value?.header ?? null)
 
-  /** 权限码门控：仅持有 aps.candidate.confirm 可"确认采用"（v1.2 §23.1）
-   *  - dev seed：aps.planner（17 码）+ aps.admin.system（34 码）持有
-   *  - aps.viewer.management 仅持 *.view → 按钮 v-if 隐藏
-   *  - 不用角色判断的原因：v1.2 DDL 把 RULE_ADMIN/RULE_PUBLISHER 合并为 aps.admin.aps，
-   *    该角色无 aps.candidate.confirm 权限码（候选确认属 PMC 领域操作）
-   */
   const apsAuth = useApsAuthStore()
   const roleAllowedToConfirm = computed(() => apsAuth.has('aps.candidate.confirm'))
-
-  /** 权限码门控：仅持有 aps.candidate.activate 可"正式采用"（v1.2 §23.1）
-   *  - 与 confirm 同样的角色（PMC + SYSTEM_ADMIN 持双码），但前端分开判断
-   *  - 防呆：未来若 0号位 拆分 confirm/activate 权限边界，前端无需联动改
-   */
   const roleAllowedToActivate = computed(() => apsAuth.has('aps.candidate.activate'))
 
-  /** 是否可"采用"（U11/U12 + 角色门控）
-   * 审核报告 P0-05：直接依据后端返回的 canActivate 判定，不再推断 sourceRefType
-   *  - canActivate=true  → LOCAL_RESCHEDULE / MANUAL_RESCHEDULE 触发
-   *  - canActivate=false → INSERT_ORDER_WHATIF 触发（CTP/INSERT_IMPACT_ANALYSIS 仅试算）
-   */
+  /** 是否可"确认采用"：后端 canActivate + 状态为 CANDIDATE + 角色持确认码 */
   const canConfirm = computed(() => {
-    const h = currentComparison.value?.header
+    const h = currentHeader.value
     if (!h) return false
     if (!roleAllowedToConfirm.value) return false
     return h.canActivate && h.status === 'CANDIDATE'
   })
 
-  /** 是否可"激活"（CANDIDATE → ACTIVE，每域单一正式采用版本）
-   *  - 与 confirm 同 canActivate 门控（U11/U12）
-   *  - 但角色门控用 aps.candidate.activate（与 confirm 码分开，未来可拆）
-   *  - 仅 CANDIDATE 状态可激活（ACTIVE / REJECTED / FAILED 都不允许）
-   *  - 不强制要求先 confirm：confirm 是留痕，activate 是落地，两者独立
-   */
+  /** 是否可"激活"（CANDIDATE → ACTIVE）；与确认分开判权限码，便于将来拆边界 */
   const canActivate = computed(() => {
-    const h = currentComparison.value?.header
+    const h = currentHeader.value
     if (!h) return false
     if (!roleAllowedToActivate.value) return false
     return h.canActivate && h.status === 'CANDIDATE'
   })
 
-  /** 不可激活原因（用于 Tooltip 提示） */
-  const cannotActivateReason = computed<string | null>(() => {
-    const h = currentComparison.value?.header
-    if (!h) return null
-    if (!roleAllowedToActivate.value)
-      return '当前角色无激活权限（需 aps.candidate.activate，PMC 及以上）'
-    if (!h.canActivate) {
-      return h.runType === 'INSERT_ORDER_WHATIF'
-        ? 'WHATIF 候选（P0-05）：由 CTP / INSERT_IMPACT_ANALYSIS 触发，仅试算，不可激活为 ACTIVE'
-        : '当前 Candidate 不允许激活（U11/U12）'
-    }
-    if (h.status !== 'CANDIDATE') return `状态 ${h.status} 不允许激活（仅 CANDIDATE 可激活）`
-    return null
-  })
-
-  /** 当前是否 WHATIF（不可激活） */
+  /** 试算只读：后端判不可激活、且来源是插单试算运行 */
   const isWhatif = computed(() => {
-    const h = currentComparison.value?.header
+    const h = currentHeader.value
     return !!h && !h.canActivate && h.runType === 'INSERT_ORDER_WHATIF'
   })
 
-  /** Pkg-4 (v1.2 §10/§13)：domainKey → 人类可读 name（找不到回退 key 本身）
-   *  - 通过 useDomainStore 解析；只读不写
-   *  - Candidate scope 断言仍只校验 header.domainKey，不参与本函数
-   */
-  const domainStore = useDomainStore()
-  const humanLabel = (domainKey: DomainKey | undefined | null): string => {
-    if (!domainKey) return '—'
-    return domainStore.label(domainKey)
-  }
-
-  /** Pkg-4：当前 Comparison 的共享资源占用明细（v1.2 §10/§13） */
-  const currentSharedResourceOccupancies = computed(
-    () => currentComparison.value?.taskChangeSummary.sharedResourceOccupancies ?? []
-  )
-
-  /** Pkg-4：当前 Comparison 的 Quantity-Time 切片（v1.2 §11，跨域依赖必须保留分段） */
-  const currentQuantityTimeSlices = computed(
-    () => currentComparison.value?.header.quantityTimeSlices ?? []
-  )
-
-  /** Pkg-4：根据 resourceRefId 反查当前 Comparison 中的 resourceCode（用于影响订单表格的"阻挡资源"列） */
-  const resourceCodeByRefId = (resourceRefId: number | undefined): string => {
-    if (resourceRefId === undefined) return '—'
-    const occ = currentSharedResourceOccupancies.value.find(
-      (o) => o.resourceRefId === resourceRefId
-    )
-    return occ?.resourceCode ?? `#${resourceRefId}`
-  }
-
-  /** 用于在 Header 里显示原因（"禁止激活"时附原因） */
-  const cannotConfirmReason = computed<string | null>(() => {
-    const h = currentComparison.value?.header
+  function cannotReason(kind: 'confirm' | 'activate'): string | null {
+    const h = currentHeader.value
     if (!h) return null
-    if (!roleAllowedToConfirm.value) return '当前角色无激活权限（仅 PMC 及以上）'
+    const hasRole = kind === 'confirm' ? roleAllowedToConfirm.value : roleAllowedToActivate.value
+    if (!hasRole) return '当前账号没有该操作权限'
+    if (h.status !== 'CANDIDATE') return `当前状态为「${h.status}」，只有待确认的候选版本可以操作`
     if (!h.canActivate) {
-      return h.runType === 'INSERT_ORDER_WHATIF'
-        ? 'WHATIF 候选（P0-05）：由 CTP / INSERT_IMPACT_ANALYSIS 触发，仅试算，不可激活为 ACTIVE'
-        : '当前 Candidate 不允许激活（U11/U12）'
+      return isWhatif.value
+        ? '插单试算产生的候选版本只能查看，不能采用'
+        : '后端判定该候选版本当前不可激活'
     }
-    if (h.status !== 'CANDIDATE') return `状态 ${h.status} 不允许激活`
     return null
-  })
+  }
+
+  const cannotConfirmReason = computed(() => cannotReason('confirm'))
+  const cannotActivateReason = computed(() => cannotReason('activate'))
+
+  const domainStore = useDomainStore()
+  /** domainKey → 中文名；后端未给或字典里没有时回退原值 */
+  const humanLabel = (domainKey: string | undefined | null): string =>
+    domainStore.label(domainKey as DomainKey | undefined | null)
 
   // ===== actions =====
   /**
-   * 加载 Candidate 列表
-   *  - P1-15：按 dataScope.domainKeys 预过滤（前端防御；3号位后端会二次校验）
-   *  - 空 scope → 不过滤
+   * 加载 Candidate 列表（5号位 candidate-summary）
+   *  - 按 dataScope.domainKeys 预过滤（前端防御；后端亦有二次校验）
+   *  - 端点不返回 diff 统计，故列表不展示影响订单/新增延期
    */
   async function loadList(): Promise<void> {
     listLoading.value = true
     error.value = null
     try {
-      const raw = await candidateApi.list()
-      list.value = filterByScope(raw, apsAuth.dataScope, (c) => ({ domainKey: c.domainKey }))
+      const summary = await candidateApi.list()
+      pendingCount.value = summary.pendingCount
+      const items = (summary.candidates ?? []).map(toListItem)
+      list.value = filterByScope(items, apsAuth.dataScope, (c) => ({
+        domainKey: c.domainKey ?? undefined
+      }))
     } catch (err) {
       handleError(err)
     } finally {
@@ -190,28 +151,44 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
   }
 
   /**
-   * 加载 Candidate 对比详情（双参：candidateId + baseId）
-   *  - v1.4 §十二：compare-with 端点必填双参（CompareCandidateWithBase L583）
-   *  - 当前 in-flight：list 端点暂未返回 basePlanVersionId（5号位 17 字段收口中）
-   *  - 上层应先查 list → 取 listItem.basePlanVersionId → 再调本方法
-   *  - 真实模式缺 basePlanVersionId：抛错让 UI 走"等 5号位"提示，不静默失败
+   * 加载候选 vs 基准 对比（双参：candidateId + baseId）
+   *  - basePlanVersionId 来自列表项；缺失时不发请求，给出可读原因
+   *  - 返回值是「列表项 + 对比结果」合并的视图模型（header 的域/时间/运行类型只有列表端点给）
    */
   async function loadComparison(
     candidatePlanVersionId: number,
-    basePlanVersionId?: number
+    basePlanVersionId?: number | null
   ): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      if (!basePlanVersionId) {
-        throw new Error(
-          `加载 Candidate #${candidatePlanVersionId} 详情需要 basePlanVersionId；当前 list 端点未返回（5号位 17 字段收口中，请参考 4号位-2026-09-18-Candidate17字段催办-给5号位.md）`
-        )
+      const brief = list.value.find((c) => c.candidatePlanVersionId === candidatePlanVersionId)
+      const baseId = basePlanVersionId ?? brief?.basePlanVersionId
+      if (!brief) {
+        throw new Error('该候选版本已不在待确认列表中，请刷新后重试')
       }
-      currentComparison.value = await candidateApi.getComparison(
-        candidatePlanVersionId,
-        basePlanVersionId
-      )
+      if (!baseId) {
+        throw new Error('该候选版本没有关联的基准计划版本，暂时无法对比')
+      }
+      const cmp = await candidateApi.getComparison(candidatePlanVersionId, baseId)
+      currentComparison.value = {
+        header: {
+          candidatePlanVersionId: cmp.candidateSummary.planVersionId,
+          candidateVersionCode: cmp.candidateSummary.versionCode || brief.candidateVersionCode,
+          basePlanVersionId: cmp.baseSummary.planVersionId,
+          baseVersionCode: cmp.baseSummary.versionCode,
+          domainKey: brief.domainKey,
+          status: cmp.candidateSummary.status || brief.status,
+          createdAt: brief.createdAt,
+          createdByUserName: brief.createdByUserName,
+          sourceScheduleRunId: null,
+          runType: brief.runType,
+          canActivate: brief.canActivate,
+          computedAt: cmp.candidateSummary.computedAt
+        },
+        taskChangeSummary: cmp.taskChangeSummary,
+        impactSummary: cmp.impactSummary
+      }
     } catch (err) {
       handleError(err)
       currentComparison.value = null
@@ -220,18 +197,13 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
     }
   }
 
-  /**
-   * 确认 Candidate（U10/U13）
-   *  - P0-05：canActivate 判定 + 角色门控
-   *  - P1-15：dataScope.domainKey 断言（前端防御；3号位后端会二次校验）
-   */
+  /** 人工确认：仅 canActivate=true 且状态 CANDIDATE 的候选可确认 */
   async function confirm(input: CandidateConfirmInput): Promise<void> {
     if (!canConfirm.value) {
-      error.value = cannotConfirmReason.value ?? '当前 Candidate 不允许确认（U11/U12 不可激活）'
+      error.value = cannotConfirmReason.value ?? '当前候选版本不允许确认'
       return
     }
-    // P1-15：业务范围断言（防止"指定 Domain 确认人确认其它 Domain Candidate"—— §二十五.7）
-    const header = currentComparison.value?.header
+    const header = currentHeader.value
     if (header?.domainKey) {
       try {
         assertScope(apsAuth.dataScope, { domainKey: header.domainKey })
@@ -246,7 +218,7 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
     confirming.value = true
     error.value = null
     try {
-      lastConfirmResult.value = await candidateApi.confirm(input)
+      lastAck.value = { action: 'confirm', ack: await candidateApi.confirm(input) }
     } catch (err) {
       handleError(err)
     } finally {
@@ -255,20 +227,16 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
   }
 
   /**
-   * 激活 Candidate（CANDIDATE → ACTIVE，v1.2 §十三 P0-08）
-   *  - 与 confirm 同 canActivate + scope 门控
-   *  - 与 confirm 不同：不需要先 confirm（confirm 是留痕，activate 是落地，两者独立）
-   *  - 成功后 lastActivateResult 暴露给 UI（U13：Actor/Time 可追溯）
-   *  - 失败：scope 违例 / 非 CANDIDATE 状态（400）/ Domain 已存在 ACTIVE（409）/
-   *          无权限（403）
+   * 激活候选版本（CANDIDATE → ACTIVE）
+   *  - 不强制先确认：确认是留痕，激活是落地，两者独立
+   *  - 成功后刷新列表并按当前候选的基准版本重拉对比
    */
   async function activate(input: CandidateActivateInput): Promise<void> {
     if (!canActivate.value) {
-      error.value = cannotActivateReason.value ?? '当前 Candidate 不允许激活'
+      error.value = cannotActivateReason.value ?? '当前候选版本不允许激活'
       return
     }
-    // P1-15：业务范围断言（同 confirm）
-    const header = currentComparison.value?.header
+    const header = currentHeader.value
     if (header?.domainKey) {
       try {
         assertScope(apsAuth.dataScope, { domainKey: header.domainKey })
@@ -283,9 +251,7 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
     activating.value = true
     error.value = null
     try {
-      lastActivateResult.value = await candidateApi.activate(input)
-      // 激活成功后刷新 list + 重拉当前 comparison（status 应变 ACTIVE）
-      // v1.4 §十二：compare-with 需 basePlanVersionId，沿用当前 comparison 的 baseId
+      lastAck.value = { action: 'activate', ack: await candidateApi.activate(input) }
       const baseId = currentComparison.value?.header.basePlanVersionId
       await Promise.all([
         loadList(),
@@ -309,19 +275,19 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
 
   function reset(): void {
     currentComparison.value = null
-    lastConfirmResult.value = null
+    lastAck.value = null
     error.value = null
   }
 
   return {
     list,
+    pendingCount,
     currentComparison,
-    lastConfirmResult,
-    lastActivateResult,
     loading,
     listLoading,
     confirming,
     activating,
+    lastAck,
     error,
     currentCandidateId,
     currentHeader,
@@ -332,11 +298,7 @@ export const useCandidateStore = defineStore('aps.candidate', () => {
     cannotActivateReason,
     roleAllowedToConfirm,
     roleAllowedToActivate,
-    // Pkg-4：v1.2 §10/§11/§13 共享资源/切片渲染辅助
     humanLabel,
-    currentSharedResourceOccupancies,
-    currentQuantityTimeSlices,
-    resourceCodeByRefId,
     loadList,
     loadComparison,
     confirm,

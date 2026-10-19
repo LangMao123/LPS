@@ -28,6 +28,12 @@ internal class PhaseOneConstraintBuilder
     {
         var context = new ConstraintContext();
 
+        // R-2 设备口径白名单（1号位 2026-10-16 回执 §四）：**原样透传**、**不改一字**。
+        //   本号位不做资源身份判别、不硬编码阈值 —— 判据（`ManualSlotResourceOffset`）在 2号位 装载侧。
+        //   ⚠ 三态（`null` 未投影／非 null 纯设备白名单／**空集 ≠ null**）由 `ConstraintContext` 属性承载；
+        //     本处**不得**做 `?? Array.Empty<int>()` 之类的归一化（会把「未投影」与「无纯设备」抹平）。
+        context.DeviceResourceIds = request.DeviceResourceIds;
+
         // ═══════════════════════════════════════════════
         // 0.0 StageSeq 全序校验（B-1，0号位 2026-09-29 裁决 §二）
         //     冲突物料记入 context.StageSequenceConflictMaterialIds ⇒ 下游不生成正式计划
@@ -62,6 +68,13 @@ internal class PhaseOneConstraintBuilder
         // 2.5 解析资源编码（ResourceId → ResourceCode）
         // ═══════════════════════════════════════════════
         BuildResourceCodes(request, context);
+
+        // ═══════════════════════════════════════════════
+        // 2.6 工序资源模式合法性（R2-F）——**分层**处置：
+        //     · 值域损坏（模式越域）⇒ 整域 Fail Closed（①/④）；
+        //     · 候选 Path 无合法资源候选 ⇒ **仅该候选不成立** + 留痕（②/③），**不**传播为整域失败。
+        // ═══════════════════════════════════════════════
+        ValidateOperationPlanningModes(request, context);
 
         // ═══════════════════════════════════════════════
         // 3. 解析资源日历（Resource → 可用时间窗列表）
@@ -99,6 +112,254 @@ internal class PhaseOneConstraintBuilder
         BuildExecutionBatchPolicies(request, context);
 
         return context;
+    }
+
+    /// <summary>
+    /// R2-F（0号位 2026-10-14《致1号位第五轮代码审核正式复核回复 v1.0》§三 R2-F）：**`ResourceId == null`
+    ///   的合法性必须在 Solver 的「生产入口」校验** —— 判词逐字：「仅在评分诊断处增加计数并不足以关闭错误路径」。
+    ///
+    ///   冻结判别器 = **工序的资源模式**（`UNCONSTRAINED`/`WAIT_ONLY` ⇒ 非资源工序；0号位 2026-09-22 裁决），
+    ///   而 `FinalTaskDraft` **不携带**该模式 ⇒ 模式一旦**越域**，下游**无法**判定
+    ///   `ResourceId == null` 是「合法非生产」还是「契约违背」——后者会被资源效率层**静默排除**（少算占用）。
+    ///
+    ///   ── **R2-F1 整改（0号位 2026-10-14《致1号位第六轮代码审核正式复核意见 v1.0》§四 R2-F1，`CONFIRMED`）** ──
+    ///   判词逐字：「**要求停止无差别传播失败**」「是否对整域 Fail Closed 应由对应已冻结硬合同和事实影响范围判定，
+    ///   而不是把『单个路径没有资源资格』一律升级成『整个 Domain 失效』」。
+    ///   ⇒ 本入口按同文 §四 的**四分层**处置，**不再**把所有异常都升级为整域失败：
+    ///     ① **输入值域损坏（工序资源模式越域）** ⇒ **该候选 Path 整条排除**（不产 Task）+ 登记输入契约 Issue，
+    ///        **不**传播为整域失败（**2026-10-14 第七轮 §八.2a 口径变更**，理由见下文专段）；
+    ///     ② **某一合法候选 Path 缺可用资格/无可用设备** ⇒ **仅该候选 Path 不成立**（**不抛**，见下）；
+    ///     ③ **一个需求全部 Path 均无法合法排下** ⇒ 既有未排语义（**不抛**，保留净量/身份/诊断）；
+    ///     ④ **整个运行契约不可组装** ⇒ 同 ①。
+    ///
+    ///   **为什么 ② 不抛**（冻结依据 + 读码实测，非本函数自造注释）：
+    ///     · 冻结依据 = 0号位 同文 §四 引《03有限产能》逐字：「资格不满足或资源/Calendar 无窗口，
+    ///       **不伪造批次，保留未排净量、身份及诊断**」⇒ 缺资格的正确出口是「该候选不成立 / 该需求未排」；
+    ///     · 读码实测：`PhaseTwoInitialScheduler.GetEligibleResources`（`:2650-2667`）无资格行 ⇒ 返回**空表**
+    ///       ⇒ `eligibleResources.Count == 0` ⇒ 该候选**产不出任何 Task**（`:2287-2290` / `:2506-2509`）；
+    ///       `GetCapacityFactor`（`:4520-4534`）缺系数 ⇒ 返回 `null` ⇒ 该资源**被跳过**
+    ///       （`:2300` / `:2519`，**不静默回落 1.0**）
+    ///       ⇒ 5th 轮 R2-F 要关闭的「真实 Operation Task 带 `ResourceId == null` 被静默排除」这一错误路径
+    ///         **在这两种情形下结构上产不出**，已由 Phase2 自身关闭；入口再抛异常只会**多杀**合法兄弟 Path
+    ///         与无关需求（0号位 判词逐字：「**合法的A也没有机会被排程**」）。
+    ///     · **不静默**：改为经 `ConstraintContext.TraceNotes`（B.2 决策说明层，
+    ///       `DomainSolveResult.SolveTraceNotes` 出口）逐需求登记「该候选 Path 无合法资源候选」。
+    ///
+    ///   ── **R2-F2 整改（同文 §四 R2-F2，`RISK_UNVERIFIED`）** ──
+    ///   判词逐字：旧判据「并未验证同一 `ResourceId` 同时存在于两个集合」；要求「以资源身份**交集**检查
+    ///   `resourceIds` 所指具体合法资源是否拥有**同 ID、同工序、正数**产能系数」。⇒ 本入口改为
+    ///   `resourceIds` 中**存在**某个 `resourceId` 使 `ResourceCapacityFactors[key][resourceId] > 0`；
+    ///   「资格 `{R1}` / 系数只有 `{R2}`」不再被放过（旧式 `factors.Values.Any(cf > 0m)` 会放过）。
+    ///
+    ///   ⚠ 本校验**只**判定「模式与资格是否可判定」，**不**改变「无合格资源 ⇒ 该需求不排程」
+    ///     （<see cref="PhaseTwoInitialScheduler"/> 的既有出口语义）；也**不**把「非资源工序」判为非法。
+    ///   ⚠ `OperationPlanningMode` 缺失已在 `BuildRoutingGraphs`（`:658`）收敛为 `"FINITE_RESOURCE"`
+    ///     ⇒ ① 分支只会被**真实的、未登记的**非空值触发。
+    ///
+    ///   ── **① 的 2026-10-14 第七轮口径变更（0号位 §八.2a）** ──
+    ///   判词逐字：「『任意一个候选 Path 的一个非法枚举值都必然使整个 Domain 失败』**不是**本次证据能推出的结论」
+    ///   「若能**可靠识别该 Path/Demand**，**禁止此非法 Path 产生 Task、登记输入契约 Issue**，其他完整合法 Path
+    ///   及无关 Demand 仍应被求解」「若整个请求所必需的**全局类型/结构**确实无法解释和安全组装，再走整域 Fail Closed」。
+    ///   ⇒ 本入口改为 **整条排除该 (MaterialId, RouteCode, PathId) 候选 Path**
+    ///     （置 <see cref="RoutingGraph.IsOperationPlanningModeInvalid"/>）+ 登记 **Error 级**输入契约 Issue，
+    ///     **不抛异常**。理由（读码实测，非自造）：模式是**逐节点**事实，而节点自带
+    ///     `RouteCode/PathId/StageCode/OperationCode` ⇒ 损害面**可可靠定位**到单条候选 Path，
+    ///     不构成「整个请求所必需的全局类型/结构无法解释」；旧行为的代价则是**同需求合法 Path
+    ///     与无关需求一并被拒**（与 ② 类同款副作用，即 0号位 点名的「合法的A也没有机会被排程」）。
+    ///   ⚠ **本入口此后不再有任何整域 Fail Closed 分支**；④「整个运行契约不可组装」仍由**既有**出口承载
+    ///     （<see cref="SolverInputContractException"/>：`FiniteCapacitySolver.cs:75`/`:102` 捕获，
+    ///     本文件同类的既有抛点见 `:1040` 的越界校验）。
+    ///
+    ///   ── **为什么是 `internal` 而非 `private`（0号位 第六轮 §四 R2-F2 的可证性要求）** ──
+    ///   R2-F2 要求「增加资格 `R1`／系数只有 `R2`…等**三组差异反例**」。但读码实测
+    ///   `BuildOperationResourceEligibility`（`:925-949`）中 `OperationResourceEligibility` 与
+    ///   `ResourceCapacityFactors` 是**同一 `eligibilities` 列表、同一 `GroupBy` 键**的两个投影
+    ///   ⇒ 两键集**恒等**，「资格 `{R1}` / 系数只有 `{R2}`」经 `DomainSolveRequest` **结构上不可达**。
+    ///   若只留 Solver 级用例，则 R2-F2 的整改（区间式 vs 旧的 `Values.Any(cf > 0m)`）
+    ///   在**所有可达输入上取值相同** ⇒ **无鉴别性反例**。故放宽本方法可见性至 `internal`，
+    ///   由 `LPS.APS.Tests`（`InternalsVisibleTo`，`LPS.APS.Scheduling.csproj:23`）**直调谓词**构造
+    ///   该不可达输入。**仅可见性放宽，签名与行为不变**（先例：`PhaseFiveCompression.cs:2230`）。
+    /// </summary>
+    internal static void ValidateOperationPlanningModes(DomainSolveRequest request, ConstraintContext context)
+    {
+        foreach (var materialGraphs in context.RoutingGraphs)
+        {
+            foreach (var pathEntry in materialGraphs.Value)
+            {
+                var pathKey = pathEntry.Key;
+                var graph = pathEntry.Value;
+
+                foreach (var node in graph.Operations.Values)
+                {
+                    var mode = node.OperationPlanningMode;
+
+                    // ── ①（2026-10-14 第七轮 §八.2a）：模式**越域** ⇒ **该候选 Path 整条排除** ──
+                    //   处置：置图标记（Phase2 据此不产 Task）+ 登记 Error 级输入契约 Issue；
+                    //   **不抛** ⇒ 不牵连同需求其余合法 Path、也不牵连无关需求。
+                    if (!IsLegalOperationPlanningMode(mode))
+                    {
+                        if (!graph.IsOperationPlanningModeInvalid)
+                        {
+                            graph.IsOperationPlanningModeInvalid = true;
+                            RegisterOperationPlanningModeExclusion(
+                                request, context, materialGraphs.Key, pathKey, node, mode);
+                        }
+
+                        // 该 Path 已整条排除 ⇒ **不再**对其工序做 ② 类缺项登记：
+                        //   否则「模式越域（输入契约违背）」会被下游读成「无资源资格（业务不可行）」，把 Error 降级成 Warning。
+                        continue;
+                    }
+
+                    if (mode != "FINITE_RESOURCE")
+                    {
+                        continue;   // 非资源工序：**合法地**不占资源（Task.ResourceId == null）
+                    }
+
+                    var identity = $"MaterialId={materialGraphs.Key}, RouteCode={node.RouteCode}, " +
+                                   $"PathId={node.PathId}, StageCode={node.StageCode ?? "(null)"}, " +
+                                   $"OperationCode={node.OperationCode}";
+
+                    var key = new EligibilityLookupKey(
+                        materialGraphs.Key, node.ProductionDepartmentId,
+                        node.RouteCode, node.PathId, node.OperationCode);
+
+                    // ── ② 资格缺项（**不再抛**）──
+                    var hasEligibilityRows =
+                        context.OperationResourceEligibility.TryGetValue(key, out var resourceIds)
+                        && resourceIds is { Count: > 0 };
+
+                    // ── R2-F2：资格资源与产能系数必须**同 ID**对上（交集，不是「两边各自非空」）──
+                    var hasSameIdLegalFactor = false;
+                    if (hasEligibilityRows)
+                    {
+                        hasSameIdLegalFactor =
+                            context.ResourceCapacityFactors.TryGetValue(key, out var capacityFactors)
+                            && resourceIds!.Any(
+                                resourceId => capacityFactors.TryGetValue(resourceId, out var cf) && cf > 0m);
+                    }
+
+                    if (!hasEligibilityRows || !hasSameIdLegalFactor)
+                    {
+                        RegisterResourceCandidateGap(
+                            request, context, materialGraphs.Key, identity,
+                            hasEligibilityRows
+                                ? "该候选 Path 该工序的资格资源**无同 ID 正产能系数**" +
+                                  "（CapacityFactor 缺项／≤ 0／与资格不同源）"
+                                : "该候选 Path 该工序**无任何资源资格行**（Eligibility 缺项／空集合）");
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 冻结值域判别器（唯一一处）：`FINITE_RESOURCE` 占资源；`UNCONSTRAINED` / `WAIT_ONLY` 非资源工序
+    ///   （**合法地**产出 `ResourceId == null`）。与 `PhaseTwoInitialScheduler.IsNonResourceMode`
+    ///   （`:2999`）**成对**：本方法判「合法非资源」，后者判「走非资源分支」——
+    ///   两者必须同源，改其一请同步另一处。
+    /// </summary>
+    private static bool IsLegalOperationPlanningMode(string? mode)
+        => string.Equals(mode, "FINITE_RESOURCE", StringComparison.Ordinal)
+           || string.Equals(mode, "UNCONSTRAINED", StringComparison.Ordinal)
+           || string.Equals(mode, "WAIT_ONLY", StringComparison.Ordinal);
+
+    /// <summary>
+    /// 追溯码（**决策说明层**，**非**冻结 `ReasonCode` 字典）：某候选 Path 因**工序资源模式越域**
+    ///   被**整条排除**（R2-F ①，0号位 2026-10-14 第七轮 §八.2a）。
+    /// ⚠ 与 ② 类的 <see cref="TraceResourceCandidateAbsent"/> **分列**（**不**同码、**不**同级别）：
+    ///   本码是**输入契约违背**（`Level = "Error"`，权威事实不可解释）；后者是**该候选业务上不可行**
+    ///   （`Level = "Warning"`）。两者根因、处置与下游告警都不同，合并会把 Error 降级成 Warning。
+    /// </summary>
+    internal const string TraceOperationPlanningModeOutOfDomain =
+        "OPERATION_PLANNING_MODE_OUT_OF_DOMAIN_PATH_EXCLUDED";
+
+    /// <summary>
+    /// R2-F ①（0号位 2026-10-14 第七轮 §八.2a）：登记「某候选 Path 因 `OperationPlanningMode` 越域
+    ///   被整条排除」这一**输入契约 Issue**。
+    ///
+    ///   ⚠ **不抛异常**（该候选 Path 不产 Task 由 Phase2 的候选剔除/Fail Closed 落实）。
+    ///   ⚠ **不静默**：`Level = "Error"` 经 B.2 决策说明层出口（`DomainSolveResult.SolveTraceNotes`）留痕。
+    ///   ⚠ 追溯键 = **`LogicalDemandKey`**（与 Phase2/3 留痕**同键域**，不在本层自造键域）；
+    ///     一个物料可承载多个逻辑需求 ⇒ 逐个登记。
+    ///   ⚠ 只登记**事实**，不自造业务裁决：若该需求**全部**候选 Path 均被排除，走既有未排语义
+    ///     （Phase2/3 已按 15 码值域给出未排原因），本层不额外编造原因码。
+    /// </summary>
+    private static void RegisterOperationPlanningModeExclusion(
+        DomainSolveRequest request,
+        ConstraintContext context,
+        int materialId,
+        RoutePathKey pathKey,
+        OperationNode node,
+        string? mode)
+    {
+        var identity = $"MaterialId={materialId}, RouteCode={pathKey.RouteCode}, PathId={pathKey.PathId}, " +
+                       $"StageCode={node.StageCode ?? "(null)"}, OperationCode={node.OperationCode}";
+
+        foreach (var demand in request.LogicalProductionDemands)
+        {
+            if (demand.MaterialId != materialId)
+            {
+                continue;
+            }
+
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demand.LogicalDemandKey,
+                ReasonCode = TraceOperationPlanningModeOutOfDomain,
+                Message = "候选 Path 的工序资源模式**越域**（R2-F ①）：`OperationPlanningMode` 不在冻结值域 " +
+                          "{FINITE_RESOURCE, UNCONSTRAINED, WAIT_ONLY} ⇒ 该工序产出的 Task 若 `ResourceId == null`，" +
+                          "无法判定是「合法非资源工序」还是「契约违背」（会被静默排除出资源占用口径）。" +
+                          "已**整条排除该候选 Path**（不得产出任何 FinalTask）—— 同需求的其余完整合法 Path " +
+                          "与无关 Demand 仍应被求解，**不**升级为整域输入失败。" +
+                          $"{identity}, OperationPlanningMode={mode ?? "(null)"}。",
+                Level = "Error"
+            });
+        }
+    }
+
+    /// <summary>
+    /// 追溯码（**决策说明层**，**非**冻结 `ReasonCode` 字典；与 `STAGE_TIMING_PATH_UNDETERMINED`
+    ///   同一先例）：某候选 Path 的 `FINITE_RESOURCE` 工序**无合法资源候选**。
+    /// ⚠ 刻意**不**用 `RESOURCE_EFFICIENCY_` 前缀 —— 那是 ④.6 资源效率层的专属码族，
+    ///   下游按该前缀筛选「④.6 是否留痕」，两者不得混淆。
+    /// </summary>
+    internal const string TraceResourceCandidateAbsent = "FINITE_RESOURCE_CANDIDATE_ABSENT";
+
+    /// <summary>
+    /// R2-F1：登记「某候选 Path 的某 `FINITE_RESOURCE` 工序无合法资源候选」这一**非阻塞**事实。
+    ///
+    ///   ⚠ **不抛异常**（② 类：该候选 Path 不成立，由 Phase2 逐候选试排自然淘汰）。
+    ///   ⚠ **不静默**：经 B.2 决策说明层出口留痕。
+    ///   ⚠ 追溯键 = **`LogicalDemandKey`**（与 Phase2/3 留痕**同键域**，不在本层自造键域）；
+    ///     一个物料可承载多个逻辑需求 ⇒ 逐个登记（夹具内通常 1:1）。
+    ///   ⚠ 只登记**事实**，不自造业务裁决：该需求若全部候选 Path 均如此，走既有未排语义
+    ///     （Phase2/3 已按 15 码值域给出未排原因），本层不额外编造原因码。
+    /// </summary>
+    private static void RegisterResourceCandidateGap(
+        DomainSolveRequest request,
+        ConstraintContext context,
+        int materialId,
+        string operationIdentity,
+        string detail)
+    {
+        foreach (var demand in request.LogicalProductionDemands)
+        {
+            if (demand.MaterialId != materialId)
+            {
+                continue;
+            }
+
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demand.LogicalDemandKey,
+                ReasonCode = TraceResourceCandidateAbsent,
+                Message = "候选 Path 的 `FINITE_RESOURCE` 工序**无合法资源候选** —— " + detail
+                          + $"；{operationIdentity}。该候选 Path **不成立**（Phase2 逐候选试排自然淘汰），"
+                          + "**不**升级为整域输入失败；若该需求全部候选 Path 均如此，按既有未排语义出口"
+                          + "（保留净量/身份/诊断，**不伪造批次**，**不补** 8h/7×24 日历）。",
+                Level = "Warning"
+            });
+        }
     }
 
     /// <summary>
@@ -254,12 +515,21 @@ internal class PhaseOneConstraintBuilder
     }
 
     /// <summary>
-    /// P1-06修复：按需求计算「本次求解在范围」的工序 Stage 集合。
-    /// 续排（有 StartOperationCode/StartStageCode）时，起点之前的已完成 Stage 不在本次求解范围，
-    /// 即使其缺 Department Context 也不应把整条 Routing 误判为 MISSING_PRODUCTION_DEPARTMENT_CONTEXT。
-    /// 无 Start 信息的需求（新单从首工序起）仍校验全量 Stage（BFS 自根工序覆盖整图）。
+    /// 按需求计算「本次求解在范围」的 Stage 集合。**两个取源取并集**：
+    ///   ① <b>BOM/Stage 权威链</b>（`request.StageSequenceChains`，按起点裁剪）—— N8-01；
+    ///   ② <b>Routing 可达集</b>（BFS 自起点工序，P1-06）。
     ///
-    /// 返回：MaterialId → 该物料在范围内（= 所有相关需求可达 Stage 的并集）的 StageCode 集合。
+    /// 【① 为什么必须进范围】0号位 2026-10-15 第九轮 §3.2/§3.3 + 冻结规则 S-006 +《04》场景7：
+    ///   无 RoutingOperation 的 Stage 也要形成 StageTimingNode（只传播时间，不排 Task）。
+    ///   原实现唯一取源是 `RoutingOperations`，无 Routing 的物料在下面直接 `continue`
+    ///   ⇒ 这类 Stage 永远进不了范围 ⇒ `ResolveRoutelessStages` 恒返回空 ⇒ 时间链结构性不可达。
+    ///
+    /// 【P1-06 为什么仍要按起点裁剪】续排（有 StartOperationCode/StartStageCode）时，起点之前的
+    ///   已完成 Stage 不在本次求解范围：既不该因此把整条 Routing 误判为
+    ///   MISSING_PRODUCTION_DEPARTMENT_CONTEXT，也不该凭空多出提前期。
+    ///   无 Start 信息的需求（新单从首工序起）⇒ 整条链都在范围内。
+    ///
+    /// 返回：MaterialId → 该物料在范围内的 StageCode 集合（①②并集，多个需求再取并集）。
     /// </summary>
     private Dictionary<int, HashSet<string>> BuildReachableStages(DomainSolveRequest request)
     {
@@ -274,17 +544,35 @@ internal class PhaseOneConstraintBuilder
             .GroupBy(dep => dep.MaterialId)
             .ToDictionary(g => g.Key, g => g.ToList());
 
+        // N8-01（0号位 2026-10-15 第九轮 §3.2/§3.3）：BOM/Stage 权威链也是 Stage 范围的取源。
+        var chainByMaterial = BuildStageChainIndex(request);
+
         foreach (var demand in request.LogicalProductionDemands)
         {
-            if (!opsByMaterial.TryGetValue(demand.MaterialId, out var ops))
+            opsByMaterial.TryGetValue(demand.MaterialId, out var ops);
+
+            // ① N8-01：BOM/Stage 权威链里、按起点裁剪后仍在范围内的 Stage（含零 Routing 的 Stage）。
+            var chainStages = ResolveChainStagesInScope(request, demand, chainByMaterial);
+
+            if (ops == null && chainStages.Count == 0)
             {
-                continue; // 该物料无 Routing，无 Stage 可校验
+                continue; // 既无 Routing、又无 Stage 链 ⇒ 本次求解范围内没有 Stage
             }
 
             if (!result.TryGetValue(demand.MaterialId, out var stageSet))
             {
                 stageSet = new HashSet<string>();
                 result[demand.MaterialId] = stageSet;
+            }
+
+            foreach (var stageCode in chainStages)
+            {
+                stageSet.Add(stageCode);
+            }
+
+            if (ops == null)
+            {
+                continue; // 该物料无 Routing：上面已并入 Stage 链，没有 BFS 可跑
             }
 
             var depsForMaterial = depsByMaterial.TryGetValue(demand.MaterialId, out var dl)
@@ -439,6 +727,131 @@ internal class PhaseOneConstraintBuilder
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// N8-01：把 <see cref="DomainSolveRequest.StageSequenceChains"/> 收敛成「物料 → 去重后的 Stage 步」。
+    /// 同 StageCode 取最小 StageSeq（DTO 契约本就如此，此处再收敛一次是防御，与
+    /// <see cref="ValidateStageSequences"/> 同口径）。
+    /// </summary>
+    private static Dictionary<int, List<StageSequenceStep>> BuildStageChainIndex(DomainSolveRequest request)
+    {
+        var index = new Dictionary<int, List<StageSequenceStep>>();
+
+        foreach (var chain in request.StageSequenceChains)
+        {
+            if (chain?.Stages == null || chain.Stages.Count == 0)
+            {
+                continue;
+            }
+
+            index[chain.MaterialId] = chain.Stages
+                .Where(s => !string.IsNullOrWhiteSpace(s.StageCode))
+                .GroupBy(s => s.StageCode, StringComparer.Ordinal)
+                .Select(g => g.OrderBy(s => s.StageSeq).First())
+                .ToList();
+        }
+
+        return index;
+    }
+
+    /// <summary>
+    /// N8-01：取「该需求在本次求解范围内」的 BOM/Stage 权威链 Stage 集合。
+    ///
+    /// 取源 = <see cref="DomainSolveRequest.StageSequenceChains"/>（2号位 按
+    /// `APS_BOM_STAGE_PATH_RAW WHERE BatchNo = @BatchNo` 装载，已限定在本次 Run 的 BOM 批次内），
+    /// **不是**全量历史 BOM StagePath。仍须按起点裁剪：续排（`StartOperationCode` / `StartStageCode`）
+    /// 时起点之前的已完成 Stage 不属于本次求解范围 —— 否则会凭空多出提前期
+    /// （见 <see cref="ConstraintContext.EffectiveStages"/> 注释里的禁令）。
+    /// 无起点信息（新单从首工序起）⇒ 整条链都在范围内。
+    /// </summary>
+    private static List<string> ResolveChainStagesInScope(
+        DomainSolveRequest request,
+        LogicalProductionDemand demand,
+        Dictionary<int, List<StageSequenceStep>> chainByMaterial)
+    {
+        if (!chainByMaterial.TryGetValue(demand.MaterialId, out var steps) || steps.Count == 0)
+        {
+            return new List<string>();
+        }
+
+        var startSeq = ResolveStartStageSeq(request, demand, steps);
+
+        var stages = new List<string>();
+        foreach (var step in steps)
+        {
+            if (startSeq.HasValue && step.StageSeq < startSeq.Value)
+            {
+                continue; // 起点之前已完成
+            }
+
+            stages.Add(step.StageCode);
+        }
+
+        return stages;
+    }
+
+    /// <summary>
+    /// 起点 Stage 在链内的 StageSeq（裁剪下界）。
+    ///
+    /// 与 <c>CollectReachableStagesForPath</c> 的 BFS 起点**同口径**：
+    ///   · 有 `StartOperationCode` ⇒ 用该工序所属 Stage（同码跨 Stage 时再用 `StartStageCode` 收窄）；
+    ///   · 否则有 `StartStageCode` ⇒ 就用该 Stage；
+    ///   · 都没有 ⇒ `null`（新单，整条链都在范围内）。
+    /// 有起点信息但链内定位不到 ⇒ 返回 <see cref="int.MaxValue"/>（= 不放行任何 Stage），
+    /// 与「BFS 起点集为空 ⇒ 可达集为空」保持一致，避免退化成「整条历史链无条件当范围」。
+    /// </summary>
+    private static int? ResolveStartStageSeq(
+        DomainSolveRequest request,
+        LogicalProductionDemand demand,
+        List<StageSequenceStep> chainSteps)
+    {
+        var hasStartOperation = !string.IsNullOrWhiteSpace(demand.StartOperationCode);
+        var hasStartStage = !string.IsNullOrWhiteSpace(demand.StartStageCode);
+
+        if (!hasStartOperation && !hasStartStage)
+        {
+            return null;
+        }
+
+        string? boundaryStage;
+
+        if (hasStartOperation)
+        {
+            var candidates = request.RoutingOperations
+                .Where(op => op.MaterialId == demand.MaterialId
+                          && string.Equals(op.OperationCode, demand.StartOperationCode, StringComparison.Ordinal)
+                          && !string.IsNullOrWhiteSpace(op.StageCode))
+                .Select(op => op.StageCode!)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(c => c, StringComparer.Ordinal)
+                .ToList();
+
+            if (hasStartStage)
+            {
+                candidates = candidates
+                    .Where(c => string.Equals(c, demand.StartStageCode, StringComparison.Ordinal))
+                    .ToList();
+            }
+
+            boundaryStage = candidates.Count > 0 ? candidates[0] : null;
+        }
+        else
+        {
+            boundaryStage = demand.StartStageCode;
+        }
+
+        if (string.IsNullOrWhiteSpace(boundaryStage))
+        {
+            return int.MaxValue;
+        }
+
+        var seqs = chainSteps
+            .Where(s => string.Equals(s.StageCode, boundaryStage, StringComparison.Ordinal))
+            .Select(s => s.StageSeq)
+            .ToList();
+
+        return seqs.Count > 0 ? seqs.Min() : int.MaxValue;
     }
 
     /// <summary>
@@ -1300,14 +1713,18 @@ internal class ConstraintContext
     public HashSet<int> AmbiguousRoutingPathMaterialIds { get; set; } = new();
 
     /// <summary>
-    /// 本次求解范围内的可达 Stage：MaterialId → StageCode 集合（Phase1 <c>BuildReachableStages</c> 产出）。
+    /// 本次求解范围内的 Stage：MaterialId → StageCode 集合（Phase1 <c>BuildReachableStages</c> 产出）。
     ///
-    /// 【为什么需要】0号位 2026-09-29 裁决 §十四第4项：无 Routing 的 Stage 要建纯内存时间节点。
-    ///   判定「哪些 Stage 在本需求范围内、但没有任何 RoutingOperation」必须用**本求解范围**，
-    ///   不能用全量 BOM StagePath —— 否则会把 StartOperation/StartStage 之前已完成、
-    ///   本次根本不求解的 Stage 也算进来，凭空多出提前期。
-    ///   （该集合原为 <c>BuildReachableStages</c> 的局部变量，P1-06 起只用于部门缺失判定；
-    ///   此处挂到 Context 上供 Phase5 复用，**语义不变、不改任何既有判定**。）
+    /// 【取源 = 两个取源取并集】（N8-01，2026-10-15）：
+    ///   ① BOM/Stage 权威链 `request.StageSequenceChains`（按起点裁剪）；
+    ///   ② Routing 可达集（BFS 自起点工序）。
+    ///   ⇒ **含零 RoutingOperation 的 Stage**。这是 S-006／《04》场景7 要求的：
+    ///     无 Routing 的 Stage 要形成 StageTimingNode（只传播时间，不排 Task）。
+    ///
+    /// 【为什么不能直接用全量 BOM StagePath】0号位 2026-09-29 裁决 §十四第4项 + P1-06：
+    ///   会把 StartOperation/StartStage 之前已完成、本次根本不求解的 Stage 也算进来，凭空多出提前期，
+    ///   并可能把整条 Routing 误判为 MISSING_PRODUCTION_DEPARTMENT_CONTEXT。
+    ///   故取源虽含 BOM/Stage 链，但**必须按起点裁剪**（见 `ResolveChainStagesInScope`）。
     /// </summary>
     public Dictionary<int, HashSet<string>> EffectiveStages { get; set; } = new();
 
@@ -1338,6 +1755,18 @@ internal class ConstraintContext
     /// 空编码（string.Empty）不纳入，避免无效键。
     /// </summary>
     public Dictionary<string, int> ResourceIdsByCode { get; set; } = new();
+
+    /// <summary>
+    /// **R-2 设备口径白名单**（原样透传 `DomainSolveRequest.DeviceResourceIds`；1号位 2026-10-16 回执 §四）。
+    /// **三态**（与契约逐字对齐）：
+    ///   · `null` ⇒ **未投影** ⇒ ④.6 留痕**不产**设备口径段，行为与改造前**逐字一致**（零回归）；
+    ///   · 非 `null` ⇒ 只列**纯设备** `ResourceId`（升序去重、结果确定性）；
+    ///   · **空集 ≠ `null`** ⇒ **已投影、但本 Run 无任何纯设备**（本身有信息量，**不得**回落成 `null` 语义）。
+    /// ⚠ 键域与 `ResourceDefinition.ResourceId` **同域**、**原样透传**；本号位**不做任何资源身份判别、
+    ///   不硬编码任何阈值**（合成键规则归 2号位 `SolverResourceProjection`）。
+    /// ⚠ **只作留痕**，**不参与**择优（默认仍取「含人工槽」那个排序键）。
+    /// </summary>
+    public IReadOnlyList<int>? DeviceResourceIds { get; set; }
 
     /// <summary>
     /// Setup EXACT 换型规则（P1-02 item1 接线）：(当前工序, 当前设备, 前产品, 后产品) → 换型分钟。
@@ -1548,6 +1977,23 @@ internal class RoutingGraph
     /// 根工序（无前驱的工序）
     /// </summary>
     public List<OperationNodeKey> RootOperations { get; set; } = new();
+
+    /// <summary>
+    /// R2-F ①（0号位 2026-10-14 第七轮正式复核 §八.2a）：本候选 Path 因**工序资源模式越域**
+    ///   （`OperationPlanningMode` 不在冻结值域 `{FINITE_RESOURCE, UNCONSTRAINED, WAIT_ONLY}`）
+    ///   被**整条排除** —— 该 Path **不得产出任何 FinalTask**。
+    ///
+    /// 置位点：<see cref="PhaseOneConstraintBuilder.ValidateOperationPlanningModes"/>（Phase1 步骤 2.6）。
+    /// 消费点（<see cref="PhaseTwoInitialScheduler"/>）：自由候选枚举处**剔除**（`:477`）、
+    ///   需求固定路径处 **Fail Closed 转未排**（`:462`）、锁定任务继承处 **Fail Closed 转未排**（`:141`）。
+    ///
+    /// ⚠ 为什么是**整条 Path** 而不是**单个节点**：抽掉一个节点会在依赖图上留断口
+    ///   （后继节点失去前驱 ⇒ 顺序错），与 Q-3「禁止跨 Path 找替代节点 / 禁止半升级」冲突。
+    /// ⚠ 为什么**不**沿用旧的「抛 <see cref="SolverInputContractException"/>」整域 Fail Closed：见
+    ///   <see cref="PhaseOneConstraintBuilder.ValidateOperationPlanningModes"/> 文档的 ① 变更专段 ——
+    ///   损害面可可靠定位到单条候选 Path，按 0号位 §八.2a 逐字「禁止此非法 Path 产生 Task、登记输入契约 Issue」处置。
+    /// </summary>
+    public bool IsOperationPlanningModeInvalid { get; set; }
 }
 
 /// <summary>

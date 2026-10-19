@@ -1,5 +1,5 @@
 /**
- * APS V1 4号位 — Setup 版本 Diff Pinia store（v1.5 Setup 专项 §6）
+ * APS V1 4号位 — 规则版本 Diff Pinia store（Setup 专项指导 v1.2 §19.2「规则版本/Diff/发布状态」）
  *
  * 状态：
  *  - diff：版本 Diff 结果（含 setupRuleChanges）
@@ -12,13 +12,13 @@
  *  - aps.setup.view    → 查看 Diff
  *  - aps.setup.publish → 发布（POST /rule-set-versions/{id}/publish）
  *
- * 红线（§6.4）：
+ * Diff 边界：
  *  - 不展示非 Setup 维度的 Diff（ParameterSet/StrategyProfile 仍走原 v1.4 §十八 规则参数维护页）
  *  - 不允许跨 RuleSet 直接编辑（必须发布 DRAFT 后再编辑）
  *
  * 复用：
  *  - RuleSetVersion Diff 机制（v1.4 §十八）
- *  - 3号位 需补 setupRuleChanges 字段（§6.3）
+ *  - 3号位 需补 setupRuleChanges 字段
  */
 
 import { defineStore } from 'pinia'
@@ -132,7 +132,7 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
       return false
     }
     if (!canPublishAction.value) {
-      error.value = '只能发布 DRAFT 状态的 RuleSetVersion（§7.2 业务红线）'
+      error.value = '只能发布 DRAFT 状态的 RuleSetVersion'
       return false
     }
     actionRunning.value = true

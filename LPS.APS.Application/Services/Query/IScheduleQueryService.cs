@@ -31,10 +31,20 @@ public interface IScheduleQueryService
         int take = 30,
         CancellationToken cancellationToken = default);
 
-    /// <summary>获取指定计划版本的甘特图数据（越权返回空）</summary>
+    /// <summary>
+    /// 获取指定计划版本的甘特图数据（越权返回空，ScopeDenied=true）。
+    /// 冻结 05:1013 要求「Gantt按时间窗/资源加载」，故支持可选时间窗与资源过滤；
+    /// 不传则保持全量（向后兼容）。
+    /// </summary>
+    /// <param name="from">时间窗起（含）。按任务区间相交过滤：PlannedEndTime ≥ from；无计划时间的任务始终保留。</param>
+    /// <param name="to">时间窗止（含）。PlannedStartTime ≤ to；无计划时间的任务始终保留。</param>
+    /// <param name="resourceIds">资源过滤（可选）。空/ null = 不过滤。</param>
     Task<GanttDataDto> GetGanttAsync(
         int userId,
         int planVersionId,
+        DateTime? from = null,
+        DateTime? to = null,
+        IReadOnlyList<int>? resourceIds = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>获取排程概要 KPI（已排 / 未排 / 延期数；越权返回空）</summary>

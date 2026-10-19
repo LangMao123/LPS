@@ -38,23 +38,35 @@ public class DomainStatusController : ControllerBase
 
     /// <summary>
     /// 查询排程域状态（G8）
+    ///
+    /// 【异常→HTTP 语义修正 2026-10-16（4号位 R4 联调回执）】
+    ///   原实现 catch Exception → ApiResponse.Fail(500)。但 Fail 只改 body.code、HTTP 状态恒 200，
+    ///   前端无法区分「查询失败」与「该 Run 无域状态记录」。现与 GovernanceController 同逻辑端点对齐：
+    ///     · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404
+    ///     · 其他异常 → 500
+    ///     · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []
     /// </summary>
     /// <param name="scheduleRunId">排程运行ID</param>
     /// <param name="cancellationToken">取消令牌</param>
     [HttpGet("{scheduleRunId:int}")]
-    public async Task<ApiResponse<IReadOnlyList<RunDomainStatusDto>>> GetRunDomainStatus(
+    public async Task<IActionResult> GetRunDomainStatus(
         int scheduleRunId,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var result = await _runLifecycleService.GetRunDomainStatusAsync(scheduleRunId, cancellationToken);
-            return ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Success(result);
+            return Ok(ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Success(result));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "Run 域级状态查询失败：{ScheduleRunId}", scheduleRunId);
+            return NotFound(ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Fail(404, ex.Message));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get domain status for ScheduleRun {ScheduleRunId}", scheduleRunId);
-            return ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Fail(500, $"Query failed: {ex.Message}");
+            _logger.LogError(ex, "Run 域级状态查询异常：{ScheduleRunId}", scheduleRunId);
+            return StatusCode(500, ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Fail(500, $"查询失败：{ex.Message}"));
         }
     }
 }

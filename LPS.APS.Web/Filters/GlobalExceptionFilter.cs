@@ -6,17 +6,18 @@ namespace LPS.APS.Web.Filters;
 
 /// <summary>
 /// 全局异常过滤器
-/// 捕获所有 Controller 未处理的异常，统一包装为 ApiResponse 格式返回
+/// 捕获所有 Controller 未处理的异常，统一包装为 ApiResponse 格式返回。
+/// 对外只回 message + traceId；异常类型/明细/堆栈**一律不出服务端**（含开发环境）——
+/// 堆栈已由 <c>LogError</c> 完整落日志，响应体带栈帧仅利于排查、无功能价值（4号位 10-17 报障，
+/// Owner 2026-10-19 裁定本文件 5号位 可改后恢复 10-17 曾被回滚的同一收紧）。
 /// </summary>
 public class GlobalExceptionFilter : IExceptionFilter
 {
     private readonly ILogger<GlobalExceptionFilter> _logger;
-    private readonly IHostEnvironment _env;
 
-    public GlobalExceptionFilter(ILogger<GlobalExceptionFilter> logger, IHostEnvironment env)
+    public GlobalExceptionFilter(ILogger<GlobalExceptionFilter> logger)
     {
         _logger = logger;
-        _env = env;
     }
 
     public void OnException(ExceptionContext context)
@@ -37,17 +38,8 @@ public class GlobalExceptionFilter : IExceptionFilter
 
         var response = ApiResponse.Fail(code, message);
         response.TraceId = context.HttpContext.TraceIdentifier;
-
-        // 开发环境附加异常详情
-        if (_env.IsDevelopment())
-        {
-            response.Data = new
-            {
-                exception = context.Exception.GetType().Name,
-                detail = context.Exception.Message,
-                stackTrace = context.Exception.StackTrace
-            };
-        }
+        // 不再向任何环境（含 dev）回传 exception/detail/stackTrace——完整异常已由上方 LogError 落日志，
+        // 排障用 traceId 关联即可；响应体携栈帧会把内部实现（Dapper/线程栈/SQL 片段）泄给客户端。
 
         context.Result = new ObjectResult(response) { StatusCode = code };
         context.ExceptionHandled = true;

@@ -414,7 +414,7 @@ onMounted(async () => {
   await overviewStore.load().catch(() => {
     /* 静默：loadList 校验会兜底提示 */
   })
-  const activeVersions = overviewStore.data?.activeVersions ?? []
+  const activeVersions = overviewStore.activeVersions ?? []
   const fallbackId = activeVersions.length > 0 ? activeVersions[0].planVersionId : null
   orderStore.setDefaultPlanVersionId(fallbackId)
   // 2) 同步到 UI 输入框（仅当用户未手填）

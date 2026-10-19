@@ -1,22 +1,18 @@
 <!--
-  APS V1 4号位 — Setup 规则版本 Diff（v1.5 Setup 专项 §6，页面 2.4）
+  APS V1 4号位 — 规则版本对比
+  依据：frontNew/docs/APS_V1_Setup换型规则与有限产能优化_冻结文档修改指导_v1.2_20260916.md
+   - §19.2 4号位「规则版本/Diff/发布状态」
 
-  职责：对比两个 RuleSetVersion 的 SetupRule 差异（EXACT/DEFAULT 规则的 added/modified/removed）
-  复用：RuleSetVersion Diff 机制（v1.4 §十八），扩展 Setup 维度（§6.3 setupRuleChanges）
-
-  列表字段（§6.2）：RuleSetVersionId/OtherVersionId/AddedCount/ModifiedCount/RemovedCount/PublishStatus
-  Diff 操作（§6.3）：选定两个 RuleSetVersion → 调 GET /rule-set-versions/{id}/diff?otherVersionId=...
-  红线（§6.4）：不展示非 Setup 维度的 Diff / 不允许跨 RuleSet 直接编辑
+  职责：对比两个规则集版本的换型规则差异（EXACT/DEFAULT 规则的 added/modified/removed）
+  Diff 操作：选定两个规则集版本 → 调 GET /rule-set-versions/{id}/diff?otherVersionId=...
+  边界：只读对比，不在此页直接编辑规则；发布入口在对比结果确认之后
 
   权限：aps.setup.view（查看 Diff）+ aps.setup.publish（发布）
-
-  架构：复用 StrategyProfiles.vue 五段式（加载 / 过滤 / 表格 / Diff 展示 / 红线注释）
 -->
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import dayjs from 'dayjs'
 import {
   ElAlert,
   ElButton,
@@ -45,7 +41,7 @@ import {
   roleLabelOf,
   type SetupRuleChangeDto
 } from '@/api/aps-v1'
-import SetupRedlineAlert from './components/SetupRedlineAlert.vue'
+import { formatUtcDateTimeSec } from '@/utils/datetime'
 
 defineOptions({ name: 'ApsSetupDiff' })
 
@@ -149,10 +145,6 @@ async function confirmPublish() {
 }
 
 // ===== 格式化 =====
-function formatDateTime(iso?: string) {
-  return iso ? dayjs(iso).format('YYYY-MM-DD HH:mm:ss') : '—'
-}
-
 function getStatusTag(status: string) {
   // 版本选择器/publishStatus 传治理六态、规则变更行传派生三态；两表 DRAFT 同义，合并回退安全
   const meta =
@@ -163,7 +155,7 @@ function getStatusTag(status: string) {
 
 /** 规则类型中文标签（枚举值 → 中文） */
 function ruleTypeLabel(ruleType: string): string {
-  return ruleType === 'EXACT' ? '明确转换规则（EXACT）' : '默认换型规则（DEFAULT）'
+  return ruleType === 'EXACT' ? '明确产品转换' : '默认换型规则'
 }
 
 function formatRuleChange(change: SetupRuleChangeDto) {
@@ -191,7 +183,7 @@ function formatRuleChange(change: SetupRuleChangeDto) {
     <!-- 页面头部 -->
     <div class="page-header">
       <div class="header-left">
-        <h2>换型规则版本对比</h2>
+        <h2>规则版本对比</h2>
         <p class="subtitle">对比两个规则版本的换型规则差异</p>
       </div>
       <div class="header-right">
@@ -202,9 +194,6 @@ function formatRuleChange(change: SetupRuleChangeDto) {
         </ElTooltip>
       </div>
     </div>
-
-    <!-- 红线 Alert（§6.4） -->
-    <SetupRedlineAlert page-type="diff" />
 
     <!-- 错误提示 -->
     <ElAlert
@@ -393,7 +382,7 @@ function formatRuleChange(change: SetupRuleChangeDto) {
       <ElEmpty v-if="totalChanges === 0" description="无变更（源版本 = 目标版本）" />
 
       <div v-if="diff?.comparedAt" class="compared-at">
-        对比时间：{{ formatDateTime(diff.comparedAt) }}
+        对比时间：{{ formatUtcDateTimeSec(diff.comparedAt) }}
       </div>
     </ElCard>
 

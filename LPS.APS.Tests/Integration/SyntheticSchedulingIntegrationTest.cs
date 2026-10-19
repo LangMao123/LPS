@@ -303,7 +303,7 @@ public class SyntheticSchedulingIntegrationTest
                 (VersionCode, VersionCategory, BatchNo, SourceScheduleRunId, DomainKey, PlanHorizonStart, PlanHorizonEnd, ComputeMode, Status, CreatedBy, CreatedAt)
               OUTPUT INSERTED.Id
               VALUES
-                (@VersionCode, 'TEST', @BatchNo, @SourceScheduleRunId, 'SYN-DOMAIN', GETDATE(), DATEADD(DAY, 30, GETDATE()), 'SIMULATION', 'Created', 'TEST_SYN', GETDATE())",
+                (@VersionCode, 'TEST', @BatchNo, @SourceScheduleRunId, 'SYN-DOMAIN', GETDATE(), DATEADD(DAY, 30, GETDATE()), 'SIMULATION', 'BUILDING', 'TEST_SYN', GETDATE())",
             new { VersionCode = versionCode, BatchNo = TEST_BATCH_NO, SourceScheduleRunId = scheduleRunId },
             db: DatabaseId.APS);
 
